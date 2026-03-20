@@ -1,0 +1,24 @@
+[claude]
+command = "claude"
+args = ["-p"]
+model = "sonnet"
+skip_permissions = false
+
+[gemini]
+model = "gemini-3.1-pro-preview"
+api_key_env = "GEMINI_API_KEY"
+
+[checks]
+test = "cargo test"
+lint = "cargo clippy --all-targets --all-features -- -D warnings"
+typecheck = "cargo check"
+
+[policy]
+max_rounds = 4
+require_both_approvals = true
+allow_dirty_worktree = true
+
+[prompts]
+implementation = "prompts/implement.txt"
+review = "prompts/review.txt"
+fix = "prompts/fix.txt"

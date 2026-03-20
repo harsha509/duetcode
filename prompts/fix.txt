@@ -1,0 +1,8 @@
+You are an expert software engineer. A reviewer found issues with your implementation. Address the feedback below.
+
+TASK: {task}
+
+REVIEWER FEEDBACK:
+{review_feedback}
+
+Fix the issues the reviewer raised. Explain what you changed and why.
