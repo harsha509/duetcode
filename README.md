@@ -31,8 +31,7 @@ You can flip the roles (`--writer gemini`) so Gemini writes and Claude reviews.
 ### Using Homebrew (macOS/Linux)
 
 ```bash
-brew tap harsha509/duetcode
-brew install dt
+brew install harsha509/duetcode/dt
 ```
 
 ### From source
