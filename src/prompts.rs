@@ -49,6 +49,7 @@ Rules:
 - If the task requires code changes, make only the changes necessary
 - Follow existing code style and conventions
 - Do not remove or break existing functionality
+- NEVER run `git commit` or `git push`. Only edit the files and leave them uncommitted.
 
 After completing the task, briefly explain what you did and why.
 "#;
@@ -76,6 +77,9 @@ TASK: {task}
 
 REVIEWER FEEDBACK:
 {review_feedback}
+
+Rules:
+- NEVER run `git commit` or `git push`. Only edit the files and leave them uncommitted.
 
 Fix the issues the reviewer raised. Explain what you changed and why.
 "#;
