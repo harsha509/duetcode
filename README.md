@@ -51,6 +51,8 @@ dt --version
 
 ## Quick start
 
+For a complete list of commands, flags, and configuration options, please see the [**Usage Guide (USAGE.md)**](USAGE.md).
+
 ### 1. Initialize in your project
 
 ```bash
