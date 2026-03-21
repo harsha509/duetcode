@@ -109,6 +109,9 @@ pub enum Commands {
         #[arg(long, short)]
         verbose: bool,
     },
+
+    /// Clear all past session logs
+    Clear,
 }
 
 pub fn run() -> Result<()> {
@@ -134,6 +137,7 @@ pub fn run() -> Result<()> {
             verbose: v,
         }) => cmd_plan(&cwd, &task, &writer, &images, continue_session, verbose || v),
         Some(Commands::Review { reviewer, verbose: v }) => cmd_review(&cwd, &reviewer, verbose || v),
+        Some(Commands::Clear) => cmd_clear(&cwd),
 
         None => {
             if let Some(task) = cli.task {
@@ -164,6 +168,7 @@ fn print_usage() {
     println!("  {} init                            set up .duet/config.toml in current repo", "dt".green());
     println!("  {} doctor                          check dependencies", "dt".green());
     println!("  {} review                          review uncommitted changes", "dt".green());
+    println!("  {} clear                           clear all past session logs", "dt".green());
     println!("\nRun {} for all options.", "dt --help".cyan());
 }
 
@@ -484,6 +489,20 @@ fn cmd_review(dir: &std::path::Path, reviewer_name: &str, verbose: bool) -> Resu
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+fn cmd_clear(dir: &std::path::Path) -> Result<()> {
+    let sessions_dir = dir.join(".duet").join("sessions");
+    
+    if sessions_dir.exists() {
+        std::fs::remove_dir_all(&sessions_dir)
+            .with_context(|| format!("failed to remove {}", sessions_dir.display()))?;
+        println!("{} Cleared all past sessions.", "✓".green());
+    } else {
+        println!("{} No sessions found to clear.", "ℹ".cyan());
+    }
+    
     Ok(())
 }
 
