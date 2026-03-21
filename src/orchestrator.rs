@@ -102,8 +102,9 @@ pub fn run(
 
         let diff_after = git::git_diff(repo_dir)?;
         let writer_changed_code = diff_after != diff_before;
+        let has_uncommitted_changes = !diff_after.trim().is_empty();
 
-        if writer_changed_code {
+        if writer_changed_code || has_uncommitted_changes {
             session_log.write_diff(round, &diff_after)?;
 
             let stat = git::git_diff_stat(repo_dir).unwrap_or_default();
@@ -127,6 +128,8 @@ pub fn run(
             }
         } else {
             println!("  {} {} answered without making code changes", "ℹ".cyan(), writer.name());
+            
+            // If there are no uncommitted changes and Claude didn't make any, we exit.
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
@@ -389,8 +392,9 @@ pub fn run_plan_flow(
 
         let diff_after = git::git_diff(repo_dir)?;
         let writer_changed_code = diff_after != diff_before;
+        let has_uncommitted_changes = !diff_after.trim().is_empty();
 
-        if writer_changed_code {
+        if writer_changed_code || has_uncommitted_changes {
             session_log.write_diff(round, &diff_after)?;
 
             let stat = git::git_diff_stat(repo_dir).unwrap_or_default();
