@@ -22,6 +22,7 @@ pub fn run(
     reviewer: &dyn ModelAdapter,
     images: &[ImageInput],
     repo_dir: &Path,
+    continue_session: bool,
     verbose: bool,
 ) -> Result<OrchestratorResult> {
     println!(
@@ -52,7 +53,17 @@ pub fn run(
         session_log.dir.display()
     );
 
-    let repo_context = build_repo_context(repo_dir)?;
+    let mut repo_context = build_repo_context(repo_dir)?;
+    
+    if continue_session {
+        if let Some(last_session) = SessionLog::get_last_session(repo_dir)? {
+            let previous_context = SessionLog::read_session_context(&last_session)?;
+            if !previous_context.is_empty() {
+                println!("  {} Continuing from previous session", "ℹ".cyan());
+                repo_context = format!("{}\n\n{}", repo_context, previous_context);
+            }
+        }
+    }
 
     let mut last_verdict = None;
     let mut last_checks = Vec::new();
@@ -68,7 +79,7 @@ pub fn run(
         );
 
         let writer_prompt = if round == 1 {
-            prompts::build_implement_prompt(&impl_template, task, &repo_context)
+            prompts::build_implement_prompt(&impl_template, task, &repo_context, "")
         } else {
             let feedback = last_verdict
                 .as_ref()
@@ -237,6 +248,7 @@ pub fn run_plan_flow(
     reviewer: &dyn ModelAdapter,
     images: &[ImageInput],
     repo_dir: &Path,
+    continue_session: bool,
     verbose: bool,
 ) -> Result<OrchestratorResult> {
     println!(
@@ -257,7 +269,17 @@ pub fn run_plan_flow(
     let fix_template = load_prompt_template(&config.prompts.fix, prompts::DEFAULT_FIX_TEMPLATE, repo_dir)?;
 
     let session_log = SessionLog::create(repo_dir, task)?;
-    let repo_context = build_repo_context(repo_dir)?;
+    let mut repo_context = build_repo_context(repo_dir)?;
+    
+    if continue_session {
+        if let Some(last_session) = SessionLog::get_last_session(repo_dir)? {
+            let previous_context = SessionLog::read_session_context(&last_session)?;
+            if !previous_context.is_empty() {
+                println!("  {} Continuing from previous session", "ℹ".cyan());
+                repo_context = format!("{}\n\n{}", repo_context, previous_context);
+            }
+        }
+    }
 
     // ── Step 1: Claude creates a plan ──
     println!("{}", "━━━ Planning ━━━".cyan().bold());
@@ -265,6 +287,7 @@ pub fn run_plan_flow(
         prompts::DEFAULT_PLAN_TEMPLATE,
         task,
         &repo_context,
+        "",
     );
 
     println!("  {} Asking {} to plan...", ">>".yellow(), writer.name());

@@ -14,8 +14,13 @@ pub fn render(template: &str, vars: &[(&str, &str)]) -> String {
     result
 }
 
-pub fn build_implement_prompt(template: &str, task: &str, context: &str) -> String {
-    render(template, &[("task", task), ("context", context)])
+pub fn build_implement_prompt(template: &str, task: &str, context: &str, previous_session: &str) -> String {
+    let full_context = if previous_session.is_empty() {
+        context.to_string()
+    } else {
+        format!("{}\n\nPREVIOUS SESSION CONTEXT:\n{}", context, previous_session)
+    };
+    render(template, &[("task", task), ("context", &full_context)])
 }
 
 pub fn build_review_prompt(template: &str, task: &str, diff: &str, checks: &str) -> String {
@@ -103,8 +108,13 @@ VERDICT: APPROVED
 VERDICT: CHANGES_REQUESTED
 "#;
 
-pub fn build_plan_prompt(template: &str, task: &str, context: &str) -> String {
-    render(template, &[("task", task), ("context", context)])
+pub fn build_plan_prompt(template: &str, task: &str, context: &str, previous_session: &str) -> String {
+    let full_context = if previous_session.is_empty() {
+        context.to_string()
+    } else {
+        format!("{}\n\nPREVIOUS SESSION CONTEXT:\n{}", context, previous_session)
+    };
+    render(template, &[("task", task), ("context", &full_context)])
 }
 
 pub fn build_plan_review_prompt(template: &str, task: &str, plan: &str) -> String {

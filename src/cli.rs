@@ -35,6 +35,10 @@ pub struct Cli {
     #[arg(long)]
     pub plan: bool,
 
+    /// Continue from the previous session's context
+    #[arg(long, short = 'c')]
+    pub continue_session: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -64,6 +68,10 @@ pub enum Commands {
         #[arg(long = "image")]
         images: Vec<PathBuf>,
 
+        /// Continue from the previous session's context
+        #[arg(long, short = 'c')]
+        continue_session: bool,
+
         /// Show detailed output
         #[arg(long, short)]
         verbose: bool,
@@ -81,6 +89,10 @@ pub enum Commands {
         /// Path(s) to screenshot/image files to include as context
         #[arg(long = "image")]
         images: Vec<PathBuf>,
+
+        /// Continue from the previous session's context
+        #[arg(long, short = 'c')]
+        continue_session: bool,
 
         /// Show detailed output
         #[arg(long, short)]
@@ -111,22 +123,24 @@ pub fn run() -> Result<()> {
             task,
             writer,
             images,
+            continue_session,
             verbose: v,
-        }) => cmd_run(&cwd, &task, &writer, &images, verbose || v),
+        }) => cmd_run(&cwd, &task, &writer, &images, continue_session, verbose || v),
         Some(Commands::Plan {
             task,
             writer,
             images,
+            continue_session,
             verbose: v,
-        }) => cmd_plan(&cwd, &task, &writer, &images, verbose || v),
+        }) => cmd_plan(&cwd, &task, &writer, &images, continue_session, verbose || v),
         Some(Commands::Review { reviewer, verbose: v }) => cmd_review(&cwd, &reviewer, verbose || v),
 
         None => {
             if let Some(task) = cli.task {
                 if cli.plan {
-                    cmd_plan(&cwd, &task, &cli.writer, &cli.images, verbose)
+                    cmd_plan(&cwd, &task, &cli.writer, &cli.images, cli.continue_session, verbose)
                 } else {
-                    cmd_run(&cwd, &task, &cli.writer, &cli.images, verbose)
+                    cmd_run(&cwd, &task, &cli.writer, &cli.images, cli.continue_session, verbose)
                 }
             } else {
                 print_usage();
@@ -332,6 +346,7 @@ fn cmd_run(
     task: &str,
     writer_name: &str,
     image_paths: &[PathBuf],
+    continue_session: bool,
     verbose: bool,
 ) -> Result<()> {
     if !git::is_git_repo(dir) {
@@ -368,7 +383,7 @@ fn cmd_run(
             _ => unreachable!(),
         };
 
-    let result = orchestrator::run(&config, task, writer, reviewer, &images, dir, verbose)?;
+    let result = orchestrator::run(&config, task, writer, reviewer, &images, dir, continue_session, verbose)?;
 
     println!(
         "\n{} rounds={}, writer={}, reviewer={}",
@@ -395,6 +410,7 @@ fn cmd_plan(
     task: &str,
     writer_name: &str,
     image_paths: &[PathBuf],
+    continue_session: bool,
     verbose: bool,
 ) -> Result<()> {
     if !git::is_git_repo(dir) {
@@ -424,7 +440,7 @@ fn cmd_plan(
             _ => unreachable!(),
         };
 
-    let result = orchestrator::run_plan_flow(&config, task, writer, reviewer, &images, dir, verbose)?;
+    let result = orchestrator::run_plan_flow(&config, task, writer, reviewer, &images, dir, continue_session, verbose)?;
 
     println!(
         "\n{} rounds={}, writer={}, reviewer={}",

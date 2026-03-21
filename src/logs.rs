@@ -87,6 +87,51 @@ impl SessionLog {
         std::fs::write(&path, json)
             .with_context(|| format!("failed to write {}", path.display()))
     }
+
+    pub fn get_last_session(base_dir: &Path) -> Result<Option<PathBuf>> {
+        let sessions_dir = base_dir.join(".duet").join("sessions");
+        if !sessions_dir.exists() {
+            return Ok(None);
+        }
+
+        let mut entries: Vec<_> = std::fs::read_dir(&sessions_dir)?
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_dir())
+            .collect();
+
+        // Sort by directory name (which starts with timestamp %Y%m%d-%H%M%S)
+        entries.sort_by_key(|e| e.file_name());
+
+        Ok(entries.last().map(|e| e.path()))
+    }
+
+    pub fn read_session_context(session_dir: &Path) -> Result<String> {
+        let prompt_path = session_dir.join("prompt.md");
+        let prompt = if prompt_path.exists() {
+            std::fs::read_to_string(&prompt_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Find the last round's claude output
+        let mut last_response = String::new();
+        for round in (1..=10).rev() {
+            let response_path = session_dir.join(format!("round-{}", round)).join("claude_out.md");
+            if response_path.exists() {
+                last_response = std::fs::read_to_string(&response_path).unwrap_or_default();
+                break;
+            }
+        }
+
+        if prompt.is_empty() && last_response.is_empty() {
+            return Ok(String::new());
+        }
+
+        Ok(format!(
+            "PREVIOUS TASK:\n{}\n\nPREVIOUS AI RESPONSE:\n{}",
+            prompt, last_response
+        ))
+    }
 }
 
 fn slugify(text: &str) -> String {
