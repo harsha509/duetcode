@@ -464,11 +464,7 @@ fn cmd_review(dir: &std::path::Path, reviewer_name: &str, verbose: bool) -> Resu
     if result.success {
         println!("\n{}", "Final Result: APPROVED".green().bold());
     } else {
-        if result.message == "checks failed" {
-            println!("\n{}", "Final Result: FAILED (Checks did not pass)".red().bold());
-        } else {
-            println!("\n{}", "Final Result: CHANGES NEEDED".red().bold());
-        }
+        println!("\n{}", "Final Result: CHANGES NEEDED".red().bold());
         std::process::exit(1);
     }
 

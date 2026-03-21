@@ -481,19 +481,11 @@ pub fn review_only(
         repo_dir,
     )?;
 
-    println!("{}", "Running checks...".cyan());
-    let check_results = checks::run_checks(&config.checks, repo_dir);
-    for cr in &check_results {
-        let icon = if cr.passed { "PASS".green() } else { "FAIL".red() };
-        println!("  [{}] {}", icon, cr.name);
-    }
-    let checks_summary = checks::format_check_results(&check_results);
-
     let review_prompt = prompts::build_review_prompt(
         &review_template,
         "Review the current uncommitted changes",
         &diff,
-        &checks_summary,
+        "", // No checks summary in pure review mode
     );
 
     println!("Calling {}...", reviewer.name().green());
@@ -502,20 +494,13 @@ pub fn review_only(
     let verdict = policy::parse_verdict(&response);
     print_verdict(&verdict);
 
-    let checks_passed = checks::all_passed(&check_results);
-    if verdict.verdict == Verdict::Approved && !checks_passed {
-        println!("  {} AI approved the changes, but local checks failed.", "⚠".yellow());
-    }
-
-    let success = verdict.verdict == Verdict::Approved && checks_passed;
+    let success = verdict.verdict == Verdict::Approved;
 
     Ok(OrchestratorResult {
         success,
         rounds: 1,
         message: if success {
             "approved".to_string()
-        } else if !checks_passed {
-            "checks failed".to_string()
         } else {
             "changes requested by AI".to_string()
         },
