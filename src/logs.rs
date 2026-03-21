@@ -113,13 +113,26 @@ impl SessionLog {
             String::new()
         };
 
-        // Find the last round's claude output
+        // Find the last round's claude output (or gemini if it was the writer)
         let mut last_response = String::new();
         for round in (1..=10).rev() {
-            let response_path = session_dir.join(format!("round-{}", round)).join("claude_out.md");
-            if response_path.exists() {
-                last_response = std::fs::read_to_string(&response_path).unwrap_or_default();
+            let claude_path = session_dir.join(format!("round-{}", round)).join("claude_out.md");
+            let gemini_path = session_dir.join(format!("round-{}", round)).join("gemini_out.md");
+            
+            if claude_path.exists() {
+                last_response = std::fs::read_to_string(&claude_path).unwrap_or_default();
                 break;
+            } else if gemini_path.exists() {
+                last_response = std::fs::read_to_string(&gemini_path).unwrap_or_default();
+                break;
+            }
+        }
+
+        // If no rounds exist, maybe it was a plan mode session, check round-0
+        if last_response.is_empty() {
+            let plan_path = session_dir.join("round-0").join("claude_out.md");
+            if plan_path.exists() {
+                last_response = std::fs::read_to_string(&plan_path).unwrap_or_default();
             }
         }
 
