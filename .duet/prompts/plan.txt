@@ -1,0 +1,12 @@
+You are an expert software engineer. Create a detailed plan for the following task. Do NOT make any code changes yet — just describe your approach.
+
+TASK: {task}
+
+REPOSITORY CONTEXT:
+{context}
+
+Cover:
+- Which files you'd create or modify
+- What approach you'd take and why
+- Any risks or trade-offs
+- Rough order of operations

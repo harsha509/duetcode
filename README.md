@@ -61,8 +61,8 @@ dt init
 ```
 
 This creates:
-- `duet.toml` — configuration file
-- `prompts/` — editable prompt templates (implement, review, fix, plan)
+- `.duet/config.toml` — configuration file
+- `.duet/prompts/` — editable prompt templates (implement, review, fix, plan)
 
 ### 2. Check your setup
 
@@ -117,7 +117,7 @@ dt review --reviewer claude
 
 ## Configuration
 
-`duet.toml` (created by `duetcode init`):
+`.duet/config.toml` (created by `dt init`):
 
 ```toml
 [claude]
@@ -127,7 +127,7 @@ model = "sonnet"
 skip_permissions = false
 
 [gemini]
-model = "gemini-2.5-pro"
+model = "gemini-3.1-pro-preview"
 api_key_env = "GEMINI_API_KEY"
 
 [checks]
@@ -141,9 +141,9 @@ require_both_approvals = true
 allow_dirty_worktree = false
 
 [prompts]
-implementation = "prompts/implement.txt"
-review = "prompts/review.txt"
-fix = "prompts/fix.txt"
+implementation = ".duet/prompts/implement.txt"
+review = ".duet/prompts/review.txt"
+fix = ".duet/prompts/fix.txt"
 ```
 
 ### Configuration reference
@@ -161,13 +161,13 @@ fix = "prompts/fix.txt"
 | `policy` | `max_rounds` | Maximum write/review rounds before failure | `4` |
 | `policy` | `require_both_approvals` | Require reviewer approval + passing checks | `true` |
 | `policy` | `allow_dirty_worktree` | Allow running with uncommitted changes | `false` |
-| `prompts` | `implementation` | Path to the implement prompt template | `"prompts/implement.txt"` |
-| `prompts` | `review` | Path to the review prompt template | `"prompts/review.txt"` |
-| `prompts` | `fix` | Path to the fix prompt template | `"prompts/fix.txt"` |
+| `prompts` | `implementation` | Path to the implement prompt template | `".duet/prompts/implement.txt"` |
+| `prompts` | `review` | Path to the review prompt template | `".duet/prompts/review.txt"` |
+| `prompts` | `fix` | Path to the fix prompt template | `".duet/prompts/fix.txt"` |
 
 ### Adapting for non-Rust projects
 
-Edit `duet.toml` to match your project's toolchain:
+Edit `.duet/config.toml` to match your project's toolchain:
 
 ```toml
 # Python

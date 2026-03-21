@@ -110,9 +110,9 @@ These flags can be applied to `dt <task>`, `dt plan`, and `dt review`.
 
 ---
 
-## Configuration (`duet.toml`)
+## Configuration (`.duet/config.toml`)
 
-When you run `dt init`, a `duet.toml` file is created. Here is how to configure it:
+When you run `dt init`, a `.duet/config.toml` file is created. Here is how to configure it:
 
 ### Quality Checks
 The most important section. `dt` runs these commands before asking the Reviewer to look at the code. If a check fails, the Reviewer is given the error output so it can suggest a fix.
@@ -139,11 +139,11 @@ max_rounds = 3
 ```
 
 ### Customizing Prompts
-If you want the agents to follow specific coding guidelines (e.g., "Always use Tailwind utility classes"), you can edit the files in the `prompts/` directory created by `dt init`. The `duet.toml` file maps to these templates:
+If you want the agents to follow specific coding guidelines (e.g., "Always use Tailwind utility classes"), you can edit the files in the `.duet/prompts/` directory created by `dt init`. The `.duet/config.toml` file maps to these templates:
 
 ```toml
 [prompts]
-implementation = "prompts/implement.txt"
-review = "prompts/review.txt"
-fix = "prompts/fix.txt"
+implementation = ".duet/prompts/implement.txt"
+review = ".duet/prompts/review.txt"
+fix = ".duet/prompts/fix.txt"
 ```

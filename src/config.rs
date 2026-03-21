@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-const CONFIG_FILENAME: &str = "duet.toml";
+const CONFIG_FILENAME: &str = ".duet/config.toml";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
@@ -104,13 +104,13 @@ fn default_true() -> bool {
     true
 }
 fn default_implement_prompt() -> PathBuf {
-    PathBuf::from("prompts/implement.txt")
+    PathBuf::from(".duet/prompts/implement.txt")
 }
 fn default_review_prompt() -> PathBuf {
-    PathBuf::from("prompts/review.txt")
+    PathBuf::from(".duet/prompts/review.txt")
 }
 fn default_fix_prompt() -> PathBuf {
-    PathBuf::from("prompts/fix.txt")
+    PathBuf::from(".duet/prompts/fix.txt")
 }
 
 impl Default for ClaudeConfig {
@@ -184,6 +184,11 @@ impl Config {
         let content = toml::to_string_pretty(&config)
             .context("failed to serialize default config")?;
         let path = Self::config_path(dir);
+        
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
         std::fs::write(&path, content)
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)

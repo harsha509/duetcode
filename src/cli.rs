@@ -147,7 +147,7 @@ fn print_usage() {
     println!("  {} \"task\" --plan                   same as dt plan", "dt".green());
     println!("  {} \"task\" --writer gemini           flip: Gemini writes, Claude reviews", "dt".green());
     println!("  {} \"task\" --image mock.png          include screenshots", "dt".green());
-    println!("  {} init                            set up duet.toml in current repo", "dt".green());
+    println!("  {} init                            set up .duet/config.toml in current repo", "dt".green());
     println!("  {} doctor                          check dependencies", "dt".green());
     println!("  {} review                          review uncommitted changes", "dt".green());
     println!("\nRun {} for all options.", "dt --help".cyan());
@@ -162,15 +162,15 @@ fn cmd_init(dir: &std::path::Path) -> Result<()> {
 
     let config_path = Config::config_path(dir);
     if config_path.exists() {
-        println!("  {} duet.toml already exists", "✓".green());
+        println!("  {} .duet/config.toml already exists", "✓".green());
     } else {
         Config::write_default(dir)?;
-        println!("  {} created duet.toml", "✓".green());
+        println!("  {} created .duet/config.toml", "✓".green());
     }
 
-    let prompts_dir = dir.join("prompts");
+    let prompts_dir = dir.join(".duet").join("prompts");
     if !prompts_dir.exists() {
-        std::fs::create_dir_all(&prompts_dir).context("failed to create prompts/")?;
+        std::fs::create_dir_all(&prompts_dir).context("failed to create .duet/prompts/")?;
     }
 
     write_default_prompt(&prompts_dir, "implement.txt", crate::prompts::DEFAULT_IMPLEMENT_TEMPLATE)?;
@@ -178,7 +178,23 @@ fn cmd_init(dir: &std::path::Path) -> Result<()> {
     write_default_prompt(&prompts_dir, "fix.txt", crate::prompts::DEFAULT_FIX_TEMPLATE)?;
     write_default_prompt(&prompts_dir, "plan.txt", crate::prompts::DEFAULT_PLAN_TEMPLATE)?;
 
-    println!("\n{}", "dt initialized! Edit duet.toml to customize.".green().bold());
+    // Add .duet/sessions to .gitignore
+    let gitignore_path = dir.join(".gitignore");
+    let ignore_entry = "\n# duetcode sessions\n.duet/sessions/\n";
+    
+    if gitignore_path.exists() {
+        let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+        if !content.contains(".duet/sessions/") {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&gitignore_path) {
+                let _ = file.write_all(ignore_entry.as_bytes());
+            }
+        }
+    } else {
+        std::fs::write(&gitignore_path, ignore_entry.trim_start()).unwrap_or(());
+    }
+
+    println!("\n{}", "dt initialized! Edit .duet/config.toml to customize.".green().bold());
     println!("Run {} to verify your setup.", "dt doctor".cyan());
 
     Ok(())
@@ -197,20 +213,20 @@ fn cmd_doctor(dir: &std::path::Path, verbose: bool) -> Result<()> {
 
     let config_path = Config::config_path(dir);
     let config = if config_path.exists() {
-        println!("  {} duet.toml", "✓".green());
+        println!("  {} .duet/config.toml", "✓".green());
         match Config::load(dir) {
             Ok(c) => {
-                println!("  {} duet.toml parses correctly", "✓".green());
+                println!("  {} .duet/config.toml parses correctly", "✓".green());
                 Some(c)
             }
             Err(e) => {
-                println!("  {} duet.toml parse error: {}", "✗".red(), e);
+                println!("  {} .duet/config.toml parse error: {}", "✗".red(), e);
                 all_ok = false;
                 None
             }
         }
     } else {
-        println!("  {} duet.toml — not found (run `dt init`)", "✗".red());
+        println!("  {} .duet/config.toml — not found (run `dt init`)", "✗".red());
         all_ok = false;
         None
     };

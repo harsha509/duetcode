@@ -3,10 +3,15 @@ command = "claude"
 args = ["-p"]
 model = "sonnet"
 skip_permissions = false
+mode = "auto"
+api_key_env = "ANTHROPIC_API_KEY"
+api_model = "claude-sonnet-4-20250514"
+timeout_secs = 300
 
 [gemini]
 model = "gemini-3.1-pro-preview"
 api_key_env = "GEMINI_API_KEY"
+timeout_secs = 300
 
 [checks]
 test = "cargo test"
@@ -19,6 +24,6 @@ require_both_approvals = true
 allow_dirty_worktree = true
 
 [prompts]
-implementation = "prompts/implement.txt"
-review = "prompts/review.txt"
-fix = "prompts/fix.txt"
+implementation = ".duet/prompts/implement.txt"
+review = ".duet/prompts/review.txt"
+fix = ".duet/prompts/fix.txt"
