@@ -28,10 +28,12 @@ You can flip the roles (`--writer gemini`) so Gemini writes and Claude reviews.
 - A [Gemini API key](https://aistudio.google.com/apikey) exported as `GEMINI_API_KEY`
 - Git
 
-### Using Homebrew (macOS/Linux)
+### Using Cargo (Recommended)
+
+You can install `dt` directly from the GitHub repository using Cargo:
 
 ```bash
-brew install https://raw.githubusercontent.com/harsha509/duetcode/main/Formula/dt.rb
+cargo install --git https://github.com/harsha509/duetcode.git
 ```
 
 ### From source
