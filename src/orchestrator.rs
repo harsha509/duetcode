@@ -192,11 +192,13 @@ pub fn run(
 
         last_verdict = Some(verdict.clone());
 
-        let answer = ask_user(&format!(
-            "  {} Let {} fix the issues? (y/n): ",
-            "?".cyan().bold(),
-            writer.name()
-        ));
+        let prompt_msg = if verdict.verdict == Verdict::Approved && !checks::all_passed(&last_checks) {
+            format!("  {} AI approved, but checks failed. Let {} try to fix the checks? (y/n): ", "?".cyan().bold(), writer.name())
+        } else {
+            format!("  {} Let {} fix the issues? (y/n): ", "?".cyan().bold(), writer.name())
+        };
+
+        let answer = ask_user(&prompt_msg);
 
         if answer != "y" && answer != "yes" {
             println!("\n{}", "Stopping. Review feedback saved in logs.".yellow());
@@ -474,12 +476,14 @@ pub fn run_plan_flow(
             });
         }
 
-        // Changes requested — ask user
-        let answer = ask_user(&format!(
-            "  {} Let {} fix the issues? (y/n): ",
-            "?".cyan().bold(),
-            writer.name()
-        ));
+        // If approved but checks failed, or if changes requested, ask user
+        let prompt_msg = if verdict.verdict == Verdict::Approved && !checks_passed {
+            format!("  {} AI approved, but checks failed. Let {} try to fix the checks? (y/n): ", "?".cyan().bold(), writer.name())
+        } else {
+            format!("  {} Let {} fix the issues? (y/n): ", "?".cyan().bold(), writer.name())
+        };
+
+        let answer = ask_user(&prompt_msg);
 
         if answer != "y" && answer != "yes" {
             println!("\n{}", "Stopping. Review feedback saved in logs.".yellow());
