@@ -421,6 +421,8 @@ pub fn run_plan_flow(
             }
         } else {
             println!("  {} {} answered without making code changes", "ℹ".cyan(), writer.name());
+            
+            // If there are no uncommitted changes and Claude didn't make any, we exit.
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
@@ -464,7 +466,7 @@ pub fn run_plan_flow(
 
         let checks_passed = checks::all_passed(&check_results);
         if verdict.verdict == Verdict::Approved && !checks_passed {
-            println!("  {} Verdict was APPROVED, but checks failed.", "⚠".yellow());
+            println!("  {} AI approved, but checks failed.", "⚠".yellow());
         }
 
         if verdict.verdict == Verdict::Approved && checks_passed {
