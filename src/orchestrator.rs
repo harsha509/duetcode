@@ -504,7 +504,7 @@ pub fn review_only(
 
     let checks_passed = checks::all_passed(&check_results);
     if verdict.verdict == Verdict::Approved && !checks_passed {
-        println!("  {} Verdict was APPROVED, but checks failed.", "⚠".yellow());
+        println!("  {} AI approved the changes, but local checks failed.", "⚠".yellow());
     }
 
     let success = verdict.verdict == Verdict::Approved && checks_passed;
@@ -514,8 +514,10 @@ pub fn review_only(
         rounds: 1,
         message: if success {
             "approved".to_string()
+        } else if !checks_passed {
+            "checks failed".to_string()
         } else {
-            "changes requested or checks failed".to_string()
+            "changes requested by AI".to_string()
         },
     })
 }
@@ -551,7 +553,7 @@ fn print_verdict(verdict: &policy::ReviewVerdict) {
         Verdict::Approved => "APPROVED".green().bold(),
         Verdict::ChangesRequested => "CHANGES REQUESTED".red().bold(),
     };
-    println!("  {} Verdict: {}", "⚖".cyan(), verdict_str);
+    println!("  {} AI Verdict: {}", "⚖".cyan(), verdict_str);
 
     if !verdict.blockers.is_empty() {
         println!("  {} Blockers:", "✗".red());

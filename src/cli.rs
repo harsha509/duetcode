@@ -462,9 +462,13 @@ fn cmd_review(dir: &std::path::Path, reviewer_name: &str, verbose: bool) -> Resu
     let result = orchestrator::review_only(&config, reviewer.as_ref(), dir)?;
 
     if result.success {
-        println!("\n{}", "Review: APPROVED".green().bold());
+        println!("\n{}", "Final Result: APPROVED".green().bold());
     } else {
-        println!("\n{}", "Review: CHANGES NEEDED".red().bold());
+        if result.message == "checks failed" {
+            println!("\n{}", "Final Result: FAILED (Checks did not pass)".red().bold());
+        } else {
+            println!("\n{}", "Final Result: CHANGES NEEDED".red().bold());
+        }
         std::process::exit(1);
     }
 
