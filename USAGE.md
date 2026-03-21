@@ -77,8 +77,8 @@ dt init
 ```
 
 This creates:
-- `duet.toml`: The configuration file where you define your linters and model preferences.
-- `prompts/`: A directory containing the default system prompts. You can edit these to customize how the agents behave in your specific project.
+- `.duet/config.toml`: The configuration file where you define your linters and model preferences.
+- `.duet/prompts/`: A directory containing the default system prompts. You can edit these to customize how the agents behave in your specific project.
 
 ### `dt doctor`
 
@@ -93,7 +93,7 @@ Checks for:
 - Git repository presence
 - Claude CLI installation and authentication
 - `GEMINI_API_KEY` environment variable
-- Valid `duet.toml` configuration
+- Valid `.duet/config.toml` configuration
 
 ---
 
