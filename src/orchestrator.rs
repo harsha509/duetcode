@@ -433,7 +433,12 @@ pub fn run_plan_flow(
         let verdict = policy::parse_verdict(&reviewer_response);
         print_verdict(&verdict);
 
-        if verdict.verdict == Verdict::Approved && checks::all_passed(&check_results) {
+        let checks_passed = checks::all_passed(&check_results);
+        if verdict.verdict == Verdict::Approved && !checks_passed {
+            println!("  {} Verdict was APPROVED, but checks failed.", "⚠".yellow());
+        }
+
+        if verdict.verdict == Verdict::Approved && checks_passed {
             println!("\n{}", "Task completed. Approved!".green().bold());
             return Ok(OrchestratorResult {
                 success: true,
@@ -478,6 +483,10 @@ pub fn review_only(
 
     println!("{}", "Running checks...".cyan());
     let check_results = checks::run_checks(&config.checks, repo_dir);
+    for cr in &check_results {
+        let icon = if cr.passed { "PASS".green() } else { "FAIL".red() };
+        println!("  [{}] {}", icon, cr.name);
+    }
     let checks_summary = checks::format_check_results(&check_results);
 
     let review_prompt = prompts::build_review_prompt(
@@ -493,7 +502,12 @@ pub fn review_only(
     let verdict = policy::parse_verdict(&response);
     print_verdict(&verdict);
 
-    let success = verdict.verdict == Verdict::Approved && checks::all_passed(&check_results);
+    let checks_passed = checks::all_passed(&check_results);
+    if verdict.verdict == Verdict::Approved && !checks_passed {
+        println!("  {} Verdict was APPROVED, but checks failed.", "⚠".yellow());
+    }
+
+    let success = verdict.verdict == Verdict::Approved && checks_passed;
 
     Ok(OrchestratorResult {
         success,
