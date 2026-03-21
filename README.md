@@ -1,8 +1,8 @@
-# duetcode
+# duetcode (dt)
 
-AI pair programming CLI — one model writes code, another reviews it, in a loop until approval.
+AI pair programming CLI — one model writes code, another reviews it, with you in control.
 
-`duetcode` orchestrates Claude and Gemini in a structured write/review cycle. One model implements a task, the other reviews the diff. The loop continues until the reviewer approves and all quality checks pass — or the round limit is reached.
+`dt` orchestrates Claude and Gemini in a structured write/review cycle. One model implements a task, then you decide if you want the other model to review the diff. The loop continues until the reviewer approves and all quality checks pass — or until you decide it's done.
 
 ## How it works
 
@@ -10,10 +10,11 @@ AI pair programming CLI — one model writes code, another reviews it, in a loop
 You give a task
     → Claude (writer) implements it
     → git diff captured
+    → You are asked: "Review changes with gemini? (y/n)"
     → cargo test / clippy / check run
     → Gemini (reviewer) reviews the diff + check results
     → APPROVED? → done
-    → CHANGES_REQUESTED? → feedback goes back to Claude → repeat
+    → CHANGES_REQUESTED? → You are asked: "Let claude fix? (y/n)" → repeat
 ```
 
 You can flip the roles (`--writer gemini`) so Gemini writes and Claude reviews.
@@ -27,10 +28,17 @@ You can flip the roles (`--writer gemini`) so Gemini writes and Claude reviews.
 - A [Gemini API key](https://aistudio.google.com/apikey) exported as `GEMINI_API_KEY`
 - Git
 
+### Using Homebrew (macOS/Linux)
+
+```bash
+brew tap harsha509/duetcode
+brew install dt
+```
+
 ### From source
 
 ```bash
-git clone https://github.com/sriharsha/duetcode.git
+git clone https://github.com/harsha509/duetcode.git
 cd duetcode
 cargo install --path .
 ```
@@ -38,7 +46,7 @@ cargo install --path .
 ### Verify
 
 ```bash
-duetcode --version
+dt --version
 ```
 
 ## Quick start
@@ -47,17 +55,17 @@ duetcode --version
 
 ```bash
 cd your-project
-duetcode init
+dt init
 ```
 
 This creates:
 - `duet.toml` — configuration file
-- `prompts/` — editable prompt templates (implement, review, fix)
+- `prompts/` — editable prompt templates (implement, review, fix, plan)
 
 ### 2. Check your setup
 
 ```bash
-duetcode doctor
+dt doctor
 ```
 
 Verifies: git repo, claude CLI, GEMINI_API_KEY, config file, prompt templates.
@@ -65,31 +73,44 @@ Verifies: git repo, claude CLI, GEMINI_API_KEY, config file, prompt templates.
 ### 3. Run a task
 
 ```bash
-duetcode run "add input validation to the signup form"
+dt "add input validation to the signup form"
 ```
 
 Default: Claude writes, Gemini reviews. To flip:
 
 ```bash
-duetcode run "add input validation" --writer gemini
+dt "add input validation" --writer gemini
 ```
 
-### 4. Pass screenshots
+### 4. Plan before executing
+
+For larger tasks, ask the AI to create a plan first:
 
 ```bash
-duetcode run "match this design" --image ./mockup.png
-duetcode run "fix layout bug" --image ./before.png --image ./expected.png
+dt plan "refactor the authentication flow"
+```
+
+This will:
+1. Generate a plan without modifying code
+2. Ask if you want Gemini to review the plan
+3. Ask if you want to execute the approved plan
+
+### 5. Pass screenshots
+
+```bash
+dt "match this design" --image ./mockup.png
+dt "fix layout bug" --image ./before.png --image ./expected.png
 ```
 
 Images are base64-encoded and sent to both Claude (via stream-json stdin) and Gemini (via inlineData API).
 
-### 5. Review existing changes
+### 6. Review existing changes
 
 Review uncommitted changes without running the full write loop:
 
 ```bash
-duetcode review
-duetcode review --reviewer claude
+dt review
+dt review --reviewer claude
 ```
 
 ## Configuration
