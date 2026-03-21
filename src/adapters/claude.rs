@@ -62,6 +62,11 @@ impl ClaudeAdapter {
         }
     }
 
+    fn is_real_api_key(key: &str) -> bool {
+        let k = key.trim();
+        !k.is_empty() && k != "sk-ant-xxx" && k.starts_with("sk-ant-")
+    }
+
     fn check_cli_available(command: &str) -> bool {
         Command::new("which")
             .arg(command)
@@ -220,14 +225,13 @@ impl ClaudeAdapter {
         let mut collected = String::new();
         let mut header_printed = false;
         let separator = "─".repeat(60);
+        let start = std::time::Instant::now();
 
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
-                    if self.verbose {
-                        eprintln!("  {} SSE read error: {}", "[verbose]".dimmed(), e);
-                    }
+                    eprintln!("  {} SSE read error: {}", "✗".red(), e);
                     break;
                 }
             };
@@ -265,16 +269,20 @@ impl ClaudeAdapter {
                     }
                 }
                 "message_start" => {
-                    if self.verbose {
-                        let model = event.pointer("/message/model").and_then(|v| v.as_str()).unwrap_or("?");
-                        eprintln!("  {} streaming from {}", "●".green(), model);
+                    let model = event.pointer("/message/model").and_then(|v| v.as_str()).unwrap_or("?");
+                    eprintln!("  {} streaming from {}", "●".green(), model);
+                    eprintln!("  {} thinking...", "◌".cyan());
+                }
+                "content_block_start" => {
+                    let block_type = event.pointer("/content_block/type").and_then(|v| v.as_str()).unwrap_or("");
+                    if block_type == "thinking" {
+                        eprintln!("  {} reasoning...", "◌".cyan());
                     }
                 }
                 "message_delta" => {
-                    if self.verbose {
-                        if let Some(reason) = event.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
-                            eprintln!("  {} stop: {}", "[verbose]".dimmed(), reason);
-                        }
+                    if let Some(reason) = event.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        eprintln!("  {} finished ({:.1}s, reason: {})", "●".green(), elapsed, reason);
                     }
                 }
                 "message_stop" => {}
@@ -283,9 +291,7 @@ impl ClaudeAdapter {
                     eprintln!("  {} API error: {}", "✗".red(), msg);
                 }
                 _ => {
-                    if self.verbose {
-                        eprintln!("  {} SSE event: {}", "[verbose]".dimmed(), event_type);
-                    }
+                    eprintln!("  {} {} ({:.0}s)", "·".dimmed(), event_type, start.elapsed().as_secs_f64());
                 }
             }
         }
@@ -432,6 +438,77 @@ impl ClaudeAdapter {
         Ok(stdout)
     }
 
+    fn describe_tool_action(tool: &str, input: Option<&serde_json::Value>) -> String {
+        let get_str = |key: &str| -> Option<&str> {
+            input.and_then(|v| v.get(key)).and_then(|v| v.as_str())
+        };
+        let truncate = |s: &str, max: usize| -> String {
+            if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+        };
+
+        match tool {
+            "Read" => {
+                if let Some(path) = get_str("file_path") {
+                    format!("reading {}", path)
+                } else {
+                    "reading file".to_string()
+                }
+            }
+            "Write" | "Edit" => {
+                if let Some(path) = get_str("file_path") {
+                    format!("editing {}", path)
+                } else {
+                    "editing file".to_string()
+                }
+            }
+            "Bash" => {
+                if let Some(cmd) = get_str("command") {
+                    format!("running `{}`", truncate(cmd.trim(), 60))
+                } else {
+                    "running command".to_string()
+                }
+            }
+            "Grep" => {
+                let pattern = get_str("pattern").unwrap_or("?");
+                if let Some(path) = get_str("path") {
+                    format!("searching '{}' in {}", truncate(pattern, 30), path)
+                } else {
+                    format!("searching '{}'", truncate(pattern, 40))
+                }
+            }
+            "Glob" => {
+                if let Some(pattern) = get_str("pattern") {
+                    format!("finding files matching '{}'", truncate(pattern, 40))
+                } else {
+                    "finding files".to_string()
+                }
+            }
+            "WebSearch" => {
+                if let Some(query) = get_str("query").or_else(|| get_str("search_term")) {
+                    format!("searching web: {}", truncate(query, 50))
+                } else {
+                    "searching the web".to_string()
+                }
+            }
+            "WebFetch" => {
+                if let Some(url) = get_str("url") {
+                    format!("fetching {}", truncate(url, 60))
+                } else {
+                    "fetching URL".to_string()
+                }
+            }
+            "Agent" | "Task" => {
+                if let Some(desc) = get_str("prompt").or_else(|| get_str("description")) {
+                    let first_line = desc.lines().next().unwrap_or(desc);
+                    format!("subtask: {}", truncate(first_line, 60))
+                } else {
+                    "running subtask".to_string()
+                }
+            }
+            _ => format!("using {}", tool),
+        }
+    }
+
     fn stream_cli_json(&self, child: &mut std::process::Child) -> Result<String> {
         let stdout_pipe = child.stdout.take().context("failed to capture claude stdout")?;
         let reader = BufReader::new(stdout_pipe);
@@ -439,14 +516,13 @@ impl ClaudeAdapter {
         let mut delta_text = String::new();
         let mut streaming_text = false;
         let separator = "─".repeat(60);
+        let start = std::time::Instant::now();
 
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
-                    if self.verbose {
-                        eprintln!("  {} read error: {}", "[verbose]".dimmed(), e);
-                    }
+                    eprintln!("  {} stream read error: {}", "✗".red(), e);
                     break;
                 }
             };
@@ -466,11 +542,14 @@ impl ClaudeAdapter {
                 ("system", "init") => {
                     let model = event.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
                     eprintln!("  {} connected (model: {})", "●".green(), model);
+                    eprintln!("  {} thinking...", "◌".cyan());
                 }
                 ("system", "api_retry") => {
                     let attempt = event.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let max = event.get("max_retries").and_then(|v| v.as_u64()).unwrap_or(10);
                     let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    eprintln!("  {} API retry #{} ({})", "↻".yellow(), attempt, error);
+                    eprintln!("  {} API retry {}/{} — {} ({:.0}s elapsed)",
+                        "↻".yellow(), attempt, max, error, start.elapsed().as_secs_f64());
                 }
                 ("assistant", "chunk") | ("content_block_delta", _) => {
                     if let Some(text) = event.pointer("/delta/text").and_then(|v| v.as_str()) {
@@ -485,15 +564,25 @@ impl ClaudeAdapter {
                         delta_text.push_str(text);
                     }
                 }
+                ("assistant", "thinking") => {
+                    if streaming_text { eprintln!(); streaming_text = false; }
+                    eprintln!("  {} reasoning...", "◌".cyan());
+                }
                 ("assistant", "tool_use") | ("tool_use", _) => {
                     let tool = event.get("tool").and_then(|v| v.as_str())
                         .or_else(|| event.pointer("/content_block/name").and_then(|v| v.as_str()))
                         .unwrap_or("tool");
+                    let input = event.get("input")
+                        .or_else(|| event.pointer("/content_block/input"));
                     if streaming_text { eprintln!(); streaming_text = false; }
-                    eprintln!("  {} using: {}", "⚡".cyan(), tool);
+                    let desc = Self::describe_tool_action(tool, input);
+                    eprintln!("  {} {}", "⚡".cyan(), desc);
                 }
                 ("assistant", "tool_result") | ("tool_result", _) => {
-                    eprintln!("  {} tool done", "✓".green());
+                    let is_error = event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if is_error {
+                        eprintln!("  {} tool failed", "✗".red());
+                    }
                 }
                 ("result", _) => {
                     if let Some(result) = event.get("result").and_then(|v| v.as_str()) {
@@ -504,9 +593,52 @@ impl ClaudeAdapter {
                         eprintln!("  {} done ({:.1}s, ${:.4})", "●".green(), duration as f64 / 1000.0, cost);
                     }
                 }
+                ("system", "task_started") => {}
+                ("system", "task_progress") => {}
+                ("system", "task_notification") => {
+                    if let Some(msg) = event.get("message").and_then(|v| v.as_str()) {
+                        eprintln!("  {} {}", "ℹ".cyan(), msg);
+                    }
+                }
+                ("assistant", _) => {
+                    if let Some(blocks) = event.get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_array())
+                    {
+                        for block in blocks {
+                            match block.get("type").and_then(|t| t.as_str()) {
+                                Some("text") => {
+                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                        if !text.is_empty() {
+                                            if !streaming_text {
+                                                eprintln!("\n  {}", separator.dimmed());
+                                                eprintln!("  {}", "claude:".cyan().bold());
+                                                eprintln!("  {}", separator.dimmed());
+                                                streaming_text = true;
+                                            }
+                                            eprint!("{}", text);
+                                            let _ = std::io::stderr().lock().flush();
+                                            delta_text.push_str(text);
+                                        }
+                                    }
+                                }
+                                Some("tool_use") => {
+                                    let tool = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                                    let input = block.get("input");
+                                    if streaming_text { eprintln!(); streaming_text = false; }
+                                    let desc = Self::describe_tool_action(tool, input);
+                                    eprintln!("  {} {}", "⚡".cyan(), desc);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                ("user", _) => {}
                 _ => {
                     if self.verbose {
-                        eprintln!("  {} event: {} {}", "[verbose]".dimmed(), event_type, subtype);
+                        let elapsed = start.elapsed().as_secs_f64();
+                        eprintln!("  {} {} {} ({:.0}s)", "·".dimmed(), event_type, subtype, elapsed);
                     }
                 }
             }

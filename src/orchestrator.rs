@@ -3,7 +3,7 @@ use crate::checks;
 use crate::config::Config;
 use crate::git;
 use crate::logs::SessionLog;
-use crate::policy::{self, PolicyResult, Verdict};
+use crate::policy::{self, Verdict};
 use crate::prompts;
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -61,13 +61,12 @@ pub fn run(
     for round in 1..=config.policy.max_rounds {
         total_rounds = round;
         println!(
-            "{}",
+            "\n{}",
             format!("━━━ Round {}/{} ━━━", round, config.policy.max_rounds)
                 .cyan()
                 .bold()
         );
 
-        // Step 1: Call writer
         let writer_prompt = if round == 1 {
             prompts::build_implement_prompt(&impl_template, task, &repo_context)
         } else {
@@ -78,36 +77,52 @@ pub fn run(
             prompts::build_fix_prompt(&fix_template, task, &feedback)
         };
 
+        let diff_before = git::git_diff(repo_dir).unwrap_or_default();
+
         println!("  {} Calling {}...", ">>".yellow(), writer.name());
         let writer_response = writer
             .generate(&writer_prompt, "", images)
             .with_context(|| format!("writer ({}) failed in round {}", writer.name(), round))?;
 
         session_log.write_writer_response(round, &writer_response)?;
-        println!("  {} {} responded ({} chars)", "<<".green(), writer.name(), writer_response.len());
         if !writer.streams_output() {
             print_response(writer.name(), &writer_response, verbose);
         }
 
-        // Step 2: Capture diff
-        let diff = git::git_diff(repo_dir)?;
-        session_log.write_diff(round, &diff)?;
+        let diff_after = git::git_diff(repo_dir)?;
+        let writer_changed_code = diff_after != diff_before;
 
-        if diff.trim().is_empty() && !git::has_changes(repo_dir)? {
-            println!("  {} No changes produced", "!!".red().bold());
+        if writer_changed_code {
+            session_log.write_diff(round, &diff_after)?;
+
+            let stat = git::git_diff_stat(repo_dir).unwrap_or_default();
+            if !stat.trim().is_empty() {
+                println!("  {} Changes:\n{}", "~~".blue(), indent(&stat, "     "));
+            }
+
+            let answer = ask_user(&format!(
+                "  {} Review changes with {}? (y/n): ",
+                "?".cyan().bold(),
+                reviewer.name()
+            ));
+
+            if answer != "y" && answer != "yes" {
+                println!("\n{}", "Task completed.".green().bold());
+                return Ok(OrchestratorResult {
+                    success: true,
+                    rounds: round,
+                    message: "completed, user accepted without review".to_string(),
+                });
+            }
+        } else {
+            println!("  {} {} answered without making code changes", "ℹ".cyan(), writer.name());
             return Ok(OrchestratorResult {
-                success: false,
+                success: true,
                 rounds: round,
-                message: format!("{} produced no changes in round {}", writer.name(), round),
+                message: "completed, no changes needed".to_string(),
             });
         }
 
-        let stat = git::git_diff_stat(repo_dir).unwrap_or_default();
-        if !stat.trim().is_empty() {
-            println!("  {} Changes:\n{}", "~~".blue(), indent(&stat, "     "));
-        }
-
-        // Step 3: Run checks
         println!("  {} Running checks...", ">>".yellow());
         let check_results = checks::run_checks(&config.checks, repo_dir);
         session_log.write_checks(round, &check_results)?;
@@ -119,11 +134,10 @@ pub fn run(
 
         let checks_summary = checks::format_check_results(&check_results);
 
-        // Step 4: Call reviewer
         let review_prompt = prompts::build_review_prompt(
             &review_template,
             task,
-            &diff,
+            &diff_after,
             &checks_summary,
         );
 
@@ -133,70 +147,61 @@ pub fn run(
             .with_context(|| format!("reviewer ({}) failed in round {}", reviewer.name(), round))?;
 
         session_log.write_reviewer_response(round, &reviewer_response)?;
-        println!("  {} {} responded ({} chars)", "<<".green(), reviewer.name(), reviewer_response.len());
         if !reviewer.streams_output() {
             print_response(reviewer.name(), &reviewer_response, verbose);
         }
 
-        // Step 5: Parse verdict
         let verdict = policy::parse_verdict(&reviewer_response);
         print_verdict(&verdict);
 
-        // Step 6: Evaluate policy
-        let policy_result = policy::evaluate(&verdict, &check_results, round, &config.policy);
-
-        last_verdict = Some(verdict.clone());
         last_checks = check_results;
 
-        match policy_result {
-            PolicyResult::Pass => {
-                println!(
-                    "\n{}\n",
-                    "All checks passed and reviewer approved!".green().bold()
-                );
+        if verdict.verdict == Verdict::Approved && checks::all_passed(&last_checks) {
+            println!("\n{}", "Approved!".green().bold());
 
-                session_log.write_summary(
-                    task,
-                    writer.name(),
-                    reviewer.name(),
-                    round,
-                    &verdict,
-                    true,
-                    true,
-                )?;
+            session_log.write_summary(
+                task,
+                writer.name(),
+                reviewer.name(),
+                round,
+                &verdict,
+                true,
+                true,
+            )?;
 
-                return Ok(OrchestratorResult {
-                    success: true,
-                    rounds: round,
-                    message: "approved with all checks passing".to_string(),
-                });
-            }
-            PolicyResult::Continue(reason) => {
-                println!("  {} {}\n", "→".yellow().bold(), reason);
-            }
-            PolicyResult::Fail(reason) => {
-                println!(
-                    "\n{} {}\n",
-                    "FAILED:".red().bold(),
-                    reason
-                );
+            return Ok(OrchestratorResult {
+                success: true,
+                rounds: round,
+                message: "approved with all checks passing".to_string(),
+            });
+        }
 
-                session_log.write_summary(
-                    task,
-                    writer.name(),
-                    reviewer.name(),
-                    round,
-                    &verdict,
-                    checks::all_passed(&last_checks),
-                    false,
-                )?;
+        last_verdict = Some(verdict.clone());
 
-                return Ok(OrchestratorResult {
-                    success: false,
-                    rounds: round,
-                    message: reason,
-                });
-            }
+        let answer = ask_user(&format!(
+            "  {} Let {} fix the issues? (y/n): ",
+            "?".cyan().bold(),
+            writer.name()
+        ));
+
+        if answer != "y" && answer != "yes" {
+            println!("\n{}", "Stopping. Review feedback saved in logs.".yellow());
+
+            session_log.write_summary(
+                task,
+                writer.name(),
+                reviewer.name(),
+                round,
+                &verdict,
+                checks::all_passed(&last_checks),
+                false,
+            )?;
+
+            return Ok(OrchestratorResult {
+                success: false,
+                rounds: round,
+                message: "user stopped after review".to_string(),
+            });
         }
     }
 
@@ -347,6 +352,8 @@ pub fn run_plan_flow(
             prompts::build_fix_prompt(&fix_template, task, &last_review_text)
         };
 
+        let diff_before = git::git_diff(repo_dir).unwrap_or_default();
+
         println!("  {} Calling {}...", ">>".yellow(), writer.name());
         let writer_response = writer
             .generate(&writer_prompt, "", if round == 1 { images } else { &[] })
@@ -357,28 +364,38 @@ pub fn run_plan_flow(
         }
         session_log.write_writer_response(round, &writer_response)?;
 
-        // Show diff
-        let diff = git::git_diff(repo_dir)?;
-        session_log.write_diff(round, &diff)?;
+        let diff_after = git::git_diff(repo_dir)?;
+        let writer_changed_code = diff_after != diff_before;
 
-        let stat = git::git_diff_stat(repo_dir).unwrap_or_default();
-        if !stat.trim().is_empty() {
-            println!("  {} Changes:\n{}", "~~".blue(), indent(&stat, "     "));
-        }
+        if writer_changed_code {
+            session_log.write_diff(round, &diff_after)?;
 
-        // ── Step 5: Ask user if they want to review ──
-        let answer = ask_user(&format!(
-            "  {} Review changes with {}? (y/n): ",
-            "?".cyan().bold(),
-            reviewer.name()
-        ));
+            let stat = git::git_diff_stat(repo_dir).unwrap_or_default();
+            if !stat.trim().is_empty() {
+                println!("  {} Changes:\n{}", "~~".blue(), indent(&stat, "     "));
+            }
 
-        if answer != "y" && answer != "yes" {
-            println!("\n{}", "Task completed.".green().bold());
+            // ── Step 5: Ask user if they want to review ──
+            let answer = ask_user(&format!(
+                "  {} Review changes with {}? (y/n): ",
+                "?".cyan().bold(),
+                reviewer.name()
+            ));
+
+            if answer != "y" && answer != "yes" {
+                println!("\n{}", "Task completed.".green().bold());
+                return Ok(OrchestratorResult {
+                    success: true,
+                    rounds: round,
+                    message: "executed, user skipped review".to_string(),
+                });
+            }
+        } else {
+            println!("  {} {} answered without making code changes", "ℹ".cyan(), writer.name());
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
-                message: "executed, user skipped review".to_string(),
+                message: "completed, no changes needed".to_string(),
             });
         }
 
@@ -398,7 +415,7 @@ pub fn run_plan_flow(
         let review_prompt = prompts::build_review_prompt(
             &review_template,
             task,
-            &diff,
+            &diff_after,
             &checks_summary,
         );
 

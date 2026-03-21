@@ -32,7 +32,7 @@ pub fn build_fix_prompt(template: &str, task: &str, review_feedback: &str) -> St
     )
 }
 
-pub const DEFAULT_IMPLEMENT_TEMPLATE: &str = r#"You are an expert software engineer. Implement the following task in the current repository.
+pub const DEFAULT_IMPLEMENT_TEMPLATE: &str = r#"You are an expert software engineer working in the current repository.
 
 TASK: {task}
 
@@ -40,11 +40,12 @@ REPOSITORY CONTEXT:
 {context}
 
 Rules:
-- Make only the changes necessary to complete the task
+- If the task is a question, answer it directly — do NOT make code changes
+- If the task requires code changes, make only the changes necessary
 - Follow existing code style and conventions
 - Do not remove or break existing functionality
 
-Explain what you did and why after making changes.
+After completing the task, briefly explain what you did and why.
 "#;
 
 pub const DEFAULT_REVIEW_TEMPLATE: &str = r#"You are a senior code reviewer. Review the following diff for the given task.

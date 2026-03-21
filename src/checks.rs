@@ -78,19 +78,23 @@ fn run_single_check(name: &str, cmd: &str, dir: &Path) -> CheckResult {
 
 pub fn format_check_results(results: &[CheckResult]) -> String {
     if results.is_empty() {
-        return "No checks configured.".to_string();
+        return "No checks configured or run.".to_string();
     }
 
     results
         .iter()
         .map(|r| {
             let status = if r.passed { "PASSED" } else { "FAILED" };
-            let snippet = if r.output.len() > 500 {
-                format!("{}... (truncated)", &r.output[..500])
+            let output = if r.output.trim().is_empty() {
+                "(no output)".to_string()
+            } else if r.output.len() > 1000 {
+                // Give Gemini more context for failures
+                format!("{}... (truncated)", &r.output[..1000])
             } else {
                 r.output.clone()
             };
-            format!("{}: {}\n{}", r.name, status, snippet)
+            
+            format!("CHECK: {}\nSTATUS: {}\nOUTPUT:\n```\n{}\n```", r.name, status, output)
         })
         .collect::<Vec<_>>()
         .join("\n\n")
