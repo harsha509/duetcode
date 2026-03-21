@@ -31,7 +31,7 @@ You can flip the roles (`--writer gemini`) so Gemini writes and Claude reviews.
 ### Using Homebrew (macOS/Linux)
 
 ```bash
-brew install harsha509/duetcode/dt
+brew install https://raw.githubusercontent.com/harsha509/duetcode/main/Formula/dt.rb
 ```
 
 ### From source
