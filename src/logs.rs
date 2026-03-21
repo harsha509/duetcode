@@ -102,7 +102,13 @@ impl SessionLog {
         // Sort by directory name (which starts with timestamp %Y%m%d-%H%M%S)
         entries.sort_by_key(|e| e.file_name());
 
-        Ok(entries.last().map(|e| e.path()))
+        // Skip the CURRENT session we just created!
+        // We want the SECOND to last session.
+        if entries.len() >= 2 {
+            Ok(Some(entries[entries.len() - 2].path()))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn read_session_context(session_dir: &Path) -> Result<String> {
