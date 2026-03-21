@@ -459,7 +459,7 @@ fn cmd_review(dir: &std::path::Path, reviewer_name: &str, verbose: bool) -> Resu
         other => anyhow::bail!("unknown reviewer '{}' — use 'claude' or 'gemini'", other),
     };
 
-    let result = orchestrator::review_only(&config, reviewer.as_ref(), dir)?;
+    let result = orchestrator::review_only(&config, reviewer.as_ref(), dir, verbose)?;
 
     if result.success {
         println!("\n{}", "Final Result: APPROVED".green().bold());

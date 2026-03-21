@@ -469,6 +469,7 @@ pub fn review_only(
     config: &Config,
     reviewer: &dyn ModelAdapter,
     repo_dir: &Path,
+    verbose: bool,
 ) -> Result<OrchestratorResult> {
     let diff = git::git_diff(repo_dir)?;
     if diff.trim().is_empty() {
@@ -490,6 +491,10 @@ pub fn review_only(
 
     println!("Calling {}...", reviewer.name().green());
     let response = reviewer.generate(&review_prompt, "", &[])?;
+
+    if !reviewer.streams_output() {
+        print_response(reviewer.name(), &response, verbose);
+    }
 
     let verdict = policy::parse_verdict(&response);
     print_verdict(&verdict);
