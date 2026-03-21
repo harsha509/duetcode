@@ -17,6 +17,7 @@ pub struct ReviewVerdict {
     pub raw: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum PolicyResult {
     Pass,
@@ -24,6 +25,7 @@ pub enum PolicyResult {
     Fail(String),
 }
 
+#[allow(dead_code)]
 pub fn evaluate(
     verdict: &ReviewVerdict,
     checks: &[CheckResult],
