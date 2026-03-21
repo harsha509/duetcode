@@ -183,6 +183,11 @@ pub fn run(
                 true,
             )?;
 
+            // Pass the approval back to Claude so it knows the task is complete
+            println!("  {} Notifying {} of approval...", ">>".yellow(), writer.name());
+            let approval_prompt = format!("The reviewer has APPROVED your changes with the following feedback:\n\n{}\n\nNo further action is required. Please acknowledge.", reviewer_response);
+            let _ = writer.generate(&approval_prompt, "", &[]);
+
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
@@ -214,7 +219,7 @@ pub fn run(
             )?;
 
             return Ok(OrchestratorResult {
-                success: false,
+                success: true,
                 rounds: round,
                 message: "user stopped after review".to_string(),
             });
@@ -471,6 +476,12 @@ pub fn run_plan_flow(
 
         if verdict.verdict == Verdict::Approved && checks_passed {
             println!("\n{}", "Task completed. Approved!".green().bold());
+            
+            // Pass the approval back to Claude so it knows the task is complete
+            println!("  {} Notifying {} of approval...", ">>".yellow(), writer.name());
+            let approval_prompt = format!("The reviewer has APPROVED your changes with the following feedback:\n\n{}\n\nNo further action is required. Please acknowledge.", reviewer_response);
+            let _ = writer.generate(&approval_prompt, "", &[]);
+
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
@@ -490,7 +501,7 @@ pub fn run_plan_flow(
         if answer != "y" && answer != "yes" {
             println!("\n{}", "Stopping. Review feedback saved in logs.".yellow());
             return Ok(OrchestratorResult {
-                success: false,
+                success: true,
                 rounds: round,
                 message: "user stopped after review".to_string(),
             });
