@@ -616,19 +616,23 @@ fn print_response(model: &str, response: &str, verbose: bool) {
     println!("  {}", format!("{}:", model).cyan().bold());
     println!("  {}", separator.dimmed());
 
-    let lines: Vec<&str> = trimmed.lines().collect();
+    // Use termimad to render markdown cleanly
+    let mut skin = termimad::MadSkin::default();
+    skin.set_headers_fg(termimad::crossterm::style::Color::Cyan);
+    skin.bold.set_fg(termimad::crossterm::style::Color::Yellow);
+    skin.italic.set_fg(termimad::crossterm::style::Color::Magenta);
+    
+    // Indent the markdown output so it aligns with the rest of the UI
+    let indented_response = trimmed.lines().map(|l| format!("  {}", l)).collect::<Vec<_>>().join("\n");
 
-    if verbose || lines.len() <= 40 {
-        for line in &lines {
-            println!("  {}", line);
-        }
+    if verbose || trimmed.lines().count() <= 40 {
+        skin.print_text(&indented_response);
     } else {
-        for line in &lines[..40] {
-            println!("  {}", line);
-        }
+        let truncated = trimmed.lines().take(40).map(|l| format!("  {}", l)).collect::<Vec<_>>().join("\n");
+        skin.print_text(&truncated);
         println!(
             "\n  {}",
-            format!("... +{} more lines (use -v to see all)", lines.len() - 40).dimmed()
+            format!("... +{} more lines (use -v to see all)", trimmed.lines().count() - 40).dimmed()
         );
     }
 

@@ -17,3 +17,4 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 base64 = "0.22"
 colored = "3"
 chrono = "0.4"
+termimad = "0.34.1"

@@ -553,6 +553,9 @@ impl ClaudeAdapter {
                             eprintln!("  {}", separator.dimmed());
                             streaming_text = true;
                         }
+                        
+                        // If it's the first chunk, we might want to indent it, but streaming markdown is hard.
+                        // We'll just print it directly for now, but ensure we keep the text for the final result.
                         eprint!("{}", text);
                         let _ = std::io::stderr().lock().flush();
                         delta_text.push_str(text);
