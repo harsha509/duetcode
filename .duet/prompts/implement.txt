@@ -10,5 +10,6 @@ Rules:
 - If the task requires code changes, make only the changes necessary
 - Follow existing code style and conventions
 - Do not remove or break existing functionality
+- NEVER run `git add`, `git commit`, or `git push`. Only edit the files and leave them uncommitted.
 
 After completing the task, briefly explain what you did and why.

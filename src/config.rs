@@ -160,11 +160,9 @@ impl Config {
                 timeout_secs: default_timeout_secs(),
             },
             checks: ChecksConfig {
-                test: Some("cargo test".to_string()),
-                lint: Some(
-                    "cargo clippy --all-targets --all-features -- -D warnings".to_string(),
-                ),
-                typecheck: Some("cargo check".to_string()),
+                test: None,
+                lint: None,
+                typecheck: None,
             },
             policy: PolicyConfig {
                 max_rounds: default_max_rounds(),

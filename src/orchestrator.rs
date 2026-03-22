@@ -513,6 +513,7 @@ pub fn review_only(
     config: &Config,
     reviewer: &dyn ModelAdapter,
     repo_dir: &Path,
+    task: Option<&str>,
     verbose: bool,
 ) -> Result<OrchestratorResult> {
     let diff = git::git_diff(repo_dir)?;
@@ -526,11 +527,13 @@ pub fn review_only(
         repo_dir,
     )?;
 
+    let task_context = task.unwrap_or("Review the current uncommitted changes for bugs, edge cases, and best practices.");
+
     let review_prompt = prompts::build_review_prompt(
         &review_template,
-        "Review the current uncommitted changes",
+        task_context,
         &diff,
-        "", // No checks summary in pure review mode
+        "",
     );
 
     println!("Calling {}...", reviewer.name().green());

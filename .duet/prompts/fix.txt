@@ -5,4 +5,7 @@ TASK: {task}
 REVIEWER FEEDBACK:
 {review_feedback}
 
+Rules:
+- NEVER run `git add`, `git commit`, or `git push`. Only edit the files and leave them uncommitted.
+
 Fix the issues the reviewer raised. Explain what you changed and why.

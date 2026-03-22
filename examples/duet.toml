@@ -9,9 +9,9 @@ model = "gemini-3.1-pro-preview"
 api_key_env = "GEMINI_API_KEY"
 
 [checks]
-test = "cargo test"
-lint = "cargo clippy --all-targets --all-features -- -D warnings"
-typecheck = "cargo check"
+# test = "npm test"
+# lint = "npm run lint"
+# typecheck = "npx tsc --noEmit"
 
 [policy]
 max_rounds = 4

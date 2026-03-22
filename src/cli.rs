@@ -105,6 +105,10 @@ pub enum Commands {
         #[arg(long, default_value = "gemini")]
         reviewer: String,
 
+        /// Describe the task so the reviewer can verify changes against it
+        #[arg(long, short)]
+        task: Option<String>,
+
         /// Show detailed output
         #[arg(long, short)]
         verbose: bool,
@@ -136,7 +140,7 @@ pub fn run() -> Result<()> {
             continue_session,
             verbose: v,
         }) => cmd_plan(&cwd, &task, &writer, &images, continue_session, verbose || v),
-        Some(Commands::Review { reviewer, verbose: v }) => cmd_review(&cwd, &reviewer, verbose || v),
+        Some(Commands::Review { reviewer, task, verbose: v }) => cmd_review(&cwd, &reviewer, task.as_deref(), verbose || v),
         Some(Commands::Clear) => cmd_clear(&cwd),
 
         None => {
@@ -168,6 +172,7 @@ fn print_usage() {
     println!("  {} init                            set up .duet/config.toml in current repo", "dt".green());
     println!("  {} doctor                          check dependencies", "dt".green());
     println!("  {} review                          review uncommitted changes", "dt".green());
+    println!("  {} review --task \"add login\"       review changes against a specific task", "dt".green());
     println!("  {} clear                           clear all past session logs", "dt".green());
     println!("\nRun {} for all options.", "dt --help".cyan());
 }
@@ -467,7 +472,7 @@ fn cmd_plan(
     }
 }
 
-fn cmd_review(dir: &std::path::Path, reviewer_name: &str, verbose: bool) -> Result<()> {
+fn cmd_review(dir: &std::path::Path, reviewer_name: &str, task: Option<&str>, verbose: bool) -> Result<()> {
     if !git::is_git_repo(dir) {
         anyhow::bail!("not a git repository");
     }
@@ -480,7 +485,7 @@ fn cmd_review(dir: &std::path::Path, reviewer_name: &str, verbose: bool) -> Resu
         other => anyhow::bail!("unknown reviewer '{}' — use 'claude' or 'gemini'", other),
     };
 
-    let result = orchestrator::review_only(&config, reviewer.as_ref(), dir, verbose)?;
+    let result = orchestrator::review_only(&config, reviewer.as_ref(), dir, task, verbose)?;
 
     if result.success {
         println!("\n{}", "Final Result: APPROVED".green().bold());

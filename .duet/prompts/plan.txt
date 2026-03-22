@@ -10,3 +10,6 @@ Cover:
 - What approach you'd take and why
 - Any risks or trade-offs
 - Rough order of operations
+
+Rules:
+- NEVER run `git add`, `git commit`, or `git push`. This is a planning phase only.

@@ -49,18 +49,23 @@ dt plan "refactor the database connection logic"
 
 ### 3. `dt review`
 
-If you have already written some code yourself and just want Gemini to review your uncommitted changes, use the review command.
+If you have already written some code yourself and just want Gemini to review your uncommitted changes, use the review command. The reviewer analyzes the diff to understand what was changed and why, checks for correctness, edge cases, and potential issues — even without a task description.
 
 **Usage:**
 ```bash
 dt review
 ```
 
+**With a task description** (helps the reviewer verify changes against your intent):
+```bash
+dt review --task "add OAuth login flow"
+```
+
 This will:
 1. Capture your current `git diff`.
-2. Run your configured checks (`cargo test`, `npm run lint`, etc.).
-3. Send the diff and check results to the Reviewer.
-4. Output the Reviewer's feedback.
+2. Send the diff to the Reviewer.
+3. The Reviewer analyzes the changes: understands intent, verifies correctness, checks edge cases, assesses impact.
+4. Output the Reviewer's structured feedback and verdict.
 
 ---
 
@@ -99,14 +104,14 @@ Checks for:
 
 ## Global Flags
 
-These flags can be applied to `dt <task>`, `dt plan`, and `dt review`.
-
-| Flag | Description | Example |
-|---|---|---|
-| `--writer <model>` | Override the default writer model. | `dt "fix bug" --writer gemini` |
-| `--reviewer <model>` | Override the default reviewer model. | `dt "fix bug" --reviewer claude` |
-| `-i, --image <path>` | Attach one or more images to the prompt. | `dt "fix UI" -i bug.png` |
-| `-v, --verbose` | Show raw API events and full un-truncated outputs. | `dt "fix bug" -v` |
+| Flag | Applies to | Description | Example |
+|---|---|---|---|
+| `--writer <model>` | `dt <task>`, `dt plan` | Override the default writer model. | `dt "fix bug" --writer gemini` |
+| `--reviewer <model>` | `dt review` | Override the default reviewer model. | `dt review --reviewer claude` |
+| `-t, --task <desc>` | `dt review` | Describe the task for the reviewer to verify against. | `dt review --task "add login"` |
+| `-i, --image <path>` | `dt <task>`, `dt plan` | Attach one or more images to the prompt. | `dt "fix UI" -i bug.png` |
+| `-c` | `dt <task>`, `dt plan` | Continue from the previous session's context. | `dt "fix the test" -c` |
+| `-v, --verbose` | All commands | Show raw API events and full un-truncated outputs. | `dt "fix bug" -v` |
 
 ---
 
@@ -115,19 +120,33 @@ These flags can be applied to `dt <task>`, `dt plan`, and `dt review`.
 When you run `dt init`, a `.duet/config.toml` file is created. Here is how to configure it:
 
 ### Quality Checks
-The most important section. `dt` runs these commands before asking the Reviewer to look at the code. If a check fails, the Reviewer is given the error output so it can suggest a fix.
+`dt` runs these commands before asking the Reviewer to look at the code. If a check fails, the Reviewer is given the error output so it can suggest a fix. Checks are optional — if not configured, the write/review loop still works but without automated verification.
 
 ```toml
 [checks]
-# Example for Rust
-typecheck = "cargo check"
-lint = "cargo clippy -- -D warnings"
-test = "cargo test"
-
-# Example for TypeScript/Node
-# typecheck = "npx tsc --noEmit"
-# lint = "npm run lint"
+# Configure these for your project's toolchain:
 # test = "npm test"
+# lint = "npm run lint"
+# typecheck = "npx tsc --noEmit"
+```
+
+Examples for common stacks:
+
+```toml
+# Python
+test = "pytest"
+lint = "ruff check ."
+typecheck = "mypy ."
+
+# Rust
+test = "cargo test"
+lint = "cargo clippy -- -D warnings"
+typecheck = "cargo check"
+
+# Go
+test = "go test ./..."
+lint = "golangci-lint run"
+typecheck = "go vet ./..."
 ```
 
 ### Policy

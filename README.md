@@ -11,7 +11,7 @@ You give a task
     → Claude (writer) implements it
     → git diff captured
     → You are asked: "Review changes with gemini? (y/n)"
-    → cargo test / clippy / check run
+    → Your configured checks run (test / lint / typecheck)
     → Gemini (reviewer) reviews the diff + check results
     → APPROVED? → done
     → CHANGES_REQUESTED? → You are asked: "Let claude fix? (y/n)" → repeat
@@ -109,11 +109,17 @@ Images are base64-encoded and sent to both Claude (via stream-json stdin) and Ge
 
 ### 6. Review existing changes
 
-Review uncommitted changes without running the full write loop:
+Review uncommitted changes without running the full write loop. The reviewer analyzes the diff to understand what was changed and why, checks for correctness, edge cases, and potential issues:
 
 ```bash
 dt review
 dt review --reviewer claude
+```
+
+Optionally, tell the reviewer what task to verify against:
+
+```bash
+dt review --task "add OAuth login flow"
 ```
 
 ## Configuration
@@ -132,14 +138,15 @@ model = "gemini-3.1-pro-preview"
 api_key_env = "GEMINI_API_KEY"
 
 [checks]
-test = "cargo test"
-lint = "cargo clippy --all-targets --all-features -- -D warnings"
-typecheck = "cargo check"
+# Configure these for your project's toolchain
+# test = "npm test"
+# lint = "npm run lint"
+# typecheck = "npx tsc --noEmit"
 
 [policy]
 max_rounds = 4
 require_both_approvals = true
-allow_dirty_worktree = false
+allow_dirty_worktree = true
 
 [prompts]
 implementation = ".duet/prompts/implement.txt"
@@ -154,21 +161,21 @@ fix = ".duet/prompts/fix.txt"
 | `claude` | `command` | Path to the Claude CLI binary | `"claude"` |
 | `claude` | `model` | Claude model to use | `"sonnet"` |
 | `claude` | `skip_permissions` | Pass `--dangerously-skip-permissions` to Claude | `false` |
-| `gemini` | `model` | Gemini model name | `"gemini-2.5-pro"` |
+| `gemini` | `model` | Gemini model name | `"gemini-3.1-pro-preview"` |
 | `gemini` | `api_key_env` | Environment variable holding the API key | `"GEMINI_API_KEY"` |
-| `checks` | `test` | Test command to run | `"cargo test"` |
-| `checks` | `lint` | Lint command to run | `"cargo clippy ..."` |
-| `checks` | `typecheck` | Typecheck command to run | `"cargo check"` |
+| `checks` | `test` | Test command to run | *none* (configure for your stack) |
+| `checks` | `lint` | Lint command to run | *none* (configure for your stack) |
+| `checks` | `typecheck` | Typecheck command to run | *none* (configure for your stack) |
 | `policy` | `max_rounds` | Maximum write/review rounds before failure | `4` |
 | `policy` | `require_both_approvals` | Require reviewer approval + passing checks | `true` |
-| `policy` | `allow_dirty_worktree` | Allow running with uncommitted changes | `false` |
+| `policy` | `allow_dirty_worktree` | Allow running with uncommitted changes | `true` |
 | `prompts` | `implementation` | Path to the implement prompt template | `".duet/prompts/implement.txt"` |
 | `prompts` | `review` | Path to the review prompt template | `".duet/prompts/review.txt"` |
 | `prompts` | `fix` | Path to the fix prompt template | `".duet/prompts/fix.txt"` |
 
-### Adapting for non-Rust projects
+### Setting up checks for your project
 
-Edit `.duet/config.toml` to match your project's toolchain:
+Edit `.duet/config.toml` to match your project's toolchain. Checks are optional — if not configured, the write/review loop still works but without automated verification.
 
 ```toml
 # Python
@@ -177,7 +184,7 @@ test = "pytest"
 lint = "ruff check ."
 typecheck = "mypy ."
 
-# Node.js
+# Node.js / TypeScript
 [checks]
 test = "npm test"
 lint = "eslint ."
@@ -188,17 +195,26 @@ typecheck = "tsc --noEmit"
 test = "go test ./..."
 lint = "golangci-lint run"
 typecheck = "go vet ./..."
+
+# Rust
+[checks]
+test = "cargo test"
+lint = "cargo clippy -- -D warnings"
+typecheck = "cargo check"
 ```
 
 ## Prompt templates
 
-The `prompts/` directory contains three editable templates:
+The `.duet/prompts/` directory contains editable templates:
 
 - **`implement.txt`** — Sent to the writer on the first round. Variables: `{task}`, `{context}`
 - **`review.txt`** — Sent to the reviewer each round. Variables: `{task}`, `{diff}`, `{checks}`
 - **`fix.txt`** — Sent to the writer on rounds 2+ with review feedback. Variables: `{task}`, `{review_feedback}`
+- **`plan.txt`** — Sent to the writer during plan mode. Variables: `{task}`, `{context}`
 
 If a template file is missing, built-in defaults are used.
+
+All prompts include a safety rule: models are prohibited from running `git add`, `git commit`, or `git push`. They can only edit files and leave them uncommitted.
 
 ### Reviewer output contract
 
@@ -234,27 +250,34 @@ UNRESOLVED:
 
 ## Session logs
 
-Each run creates a log folder at `.duet-logs/{timestamp}-{task-slug}/` containing:
+Each run creates a log folder at `.duet/sessions/{timestamp}-{task-slug}/` containing:
 
 | File | Content |
 |------|---------|
-| `round-{n}-writer.md` | Writer's full response |
-| `round-{n}-reviewer.md` | Reviewer's full response |
-| `round-{n}-diff.patch` | Git diff for that round |
-| `round-{n}-checks.json` | Check results (pass/fail + output) |
-| `summary.json` | Final outcome with metadata |
+| `prompt.md` | Original task description |
+| `state.json` | Final outcome with metadata |
+| `round-{n}/claude_out.md` | Writer's full response |
+| `round-{n}/gemini_out.md` | Reviewer's full response |
+| `round-{n}/claude.patch` | Git diff for that round |
+| `round-{n}/checks.json` | Check results (pass/fail + output) |
+
+Clear all sessions with `dt clear`.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `duetcode init` | Create `duet.toml` and `prompts/` in the current repo |
-| `duetcode doctor` | Verify all dependencies and configuration |
-| `duetcode run <task>` | Run the full write/review loop |
-| `duetcode run <task> --writer gemini` | Use Gemini as writer, Claude as reviewer |
-| `duetcode run <task> --image <path>` | Include screenshot(s) as context |
-| `duetcode review` | Review current uncommitted changes |
-| `duetcode review --reviewer claude` | Use Claude as the reviewer |
+| `dt init` | Create `.duet/config.toml` and `.duet/prompts/` in the current repo |
+| `dt doctor` | Verify all dependencies and configuration |
+| `dt <task>` | Run the full write/review loop (shorthand for `dt run`) |
+| `dt run <task>` | Run the full write/review loop |
+| `dt run <task> --writer gemini` | Use Gemini as writer, Claude as reviewer |
+| `dt run <task> --image <path>` | Include screenshot(s) as context |
+| `dt plan <task>` | Plan first, then execute after approval |
+| `dt review` | Review current uncommitted changes |
+| `dt review --task "description"` | Review changes against a specific task |
+| `dt review --reviewer claude` | Use Claude as the reviewer |
+| `dt clear` | Clear all past session logs |
 
 ## Exit codes
 
