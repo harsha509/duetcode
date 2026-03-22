@@ -1,5 +1,4 @@
 use crate::config::ChecksConfig;
-use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
@@ -10,14 +9,6 @@ pub struct CheckResult {
     pub passed: bool,
     pub output: String,
     pub exit_code: Option<i32>,
-}
-
-impl CheckResult {
-    #[allow(dead_code)]
-    pub fn summary_line(&self) -> String {
-        let icon = if self.passed { "PASS" } else { "FAIL" };
-        format!("[{}] {}", icon, self.name)
-    }
 }
 
 pub fn run_checks(config: &ChecksConfig, dir: &Path) -> Vec<CheckResult> {
@@ -88,12 +79,12 @@ pub fn format_check_results(results: &[CheckResult]) -> String {
             let output = if r.output.trim().is_empty() {
                 "(no output)".to_string()
             } else if r.output.len() > 1000 {
-                // Give Gemini more context for failures
-                format!("{}... (truncated)", &r.output[..1000])
+                let truncated: String = r.output.chars().take(1000).collect();
+                format!("{}... (truncated)", truncated)
             } else {
                 r.output.clone()
             };
-            
+
             format!("CHECK: {}\nSTATUS: {}\nOUTPUT:\n```\n{}\n```", r.name, status, output)
         })
         .collect::<Vec<_>>()
@@ -102,18 +93,4 @@ pub fn format_check_results(results: &[CheckResult]) -> String {
 
 pub fn all_passed(results: &[CheckResult]) -> bool {
     results.iter().all(|r| r.passed)
-}
-
-#[allow(dead_code)]
-pub fn failed_check_names(results: &[CheckResult]) -> Vec<String> {
-    results
-        .iter()
-        .filter(|r| !r.passed)
-        .map(|r| r.name.clone())
-        .collect()
-}
-
-#[allow(dead_code)]
-pub fn run_checks_if_configured(config: &ChecksConfig, dir: &Path) -> Result<Vec<CheckResult>> {
-    Ok(run_checks(config, dir))
 }

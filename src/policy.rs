@@ -1,6 +1,3 @@
-use crate::checks::CheckResult;
-use crate::config::PolicyConfig;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Approved,
@@ -12,86 +9,16 @@ pub struct ReviewVerdict {
     pub verdict: Verdict,
     pub blockers: Vec<String>,
     pub suggestions: Vec<String>,
-    #[allow(dead_code)]
-    pub tests_to_add: Vec<String>,
     pub raw: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub enum PolicyResult {
-    Pass,
-    Continue(String),
-    Fail(String),
-}
-
-#[allow(dead_code)]
-pub fn evaluate(
-    verdict: &ReviewVerdict,
-    checks: &[CheckResult],
-    round: usize,
-    config: &PolicyConfig,
-) -> PolicyResult {
-    let checks_pass = checks.iter().all(|c| c.passed);
-
-    if verdict.verdict == Verdict::Approved && checks_pass {
-        return PolicyResult::Pass;
-    }
-
-    if round >= config.max_rounds {
-        let reason = if !checks_pass {
-            let failed: Vec<_> = checks
-                .iter()
-                .filter(|c| !c.passed)
-                .map(|c| c.name.as_str())
-                .collect();
-            format!(
-                "max rounds ({}) reached — checks still failing: {}",
-                config.max_rounds,
-                failed.join(", ")
-            )
-        } else {
-            format!(
-                "max rounds ({}) reached — reviewer has not approved",
-                config.max_rounds
-            )
-        };
-        return PolicyResult::Fail(reason);
-    }
-
-    if verdict.verdict == Verdict::ChangesRequested {
-        let reason = format_review_feedback(verdict);
-        return PolicyResult::Continue(reason);
-    }
-
-    if !checks_pass {
-        let failed: Vec<_> = checks
-            .iter()
-            .filter(|c| !c.passed)
-            .map(|c| c.name.as_str())
-            .collect();
-        return PolicyResult::Continue(format!(
-            "reviewer approved but checks failing: {}",
-            failed.join(", ")
-        ));
-    }
-
-    PolicyResult::Pass
 }
 
 pub fn parse_verdict(raw: &str) -> ReviewVerdict {
     let lines: Vec<&str> = raw.lines().collect();
 
-    let verdict = parse_verdict_line(&lines);
-    let blockers = parse_list_section(&lines, "BLOCKERS:");
-    let suggestions = parse_list_section(&lines, "SUGGESTIONS:");
-    let tests_to_add = parse_list_section(&lines, "TESTS_TO_ADD:");
-
     ReviewVerdict {
-        verdict,
-        blockers,
-        suggestions,
-        tests_to_add,
+        verdict: parse_verdict_line(&lines),
+        blockers: parse_list_section(&lines, "BLOCKERS:"),
+        suggestions: parse_list_section(&lines, "SUGGESTIONS:"),
         raw: raw.to_string(),
     }
 }

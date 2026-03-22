@@ -3,7 +3,7 @@ use super::pricing;
 use crate::config::ClaudeConfig;
 use anyhow::{Context, Result};
 use colored::Colorize;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -17,7 +17,7 @@ pub struct ClaudeAdapter {
     verbose: bool,
     use_api: bool,
     api_key: Option<String>,
-    client: Option<reqwest::blocking::Client>,
+    agent: Option<ureq::Agent>,
 }
 
 impl ClaudeAdapter {
@@ -33,14 +33,14 @@ impl ClaudeAdapter {
         let use_api = match mode.as_str() {
             "api" => true,
             "cli" => false,
-            _ => !cli_available && has_api_key, // "auto": prefer CLI, fall back to API
+            _ => !cli_available && has_api_key,
         };
 
-        let client = if use_api || mode == "auto" {
-            reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(config.timeout_secs))
-                .build()
-                .ok()
+        let agent = if use_api || mode == "auto" {
+            Some(ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(30))
+                .timeout_read(Duration::from_secs(config.timeout_secs))
+                .build())
         } else {
             None
         };
@@ -59,7 +59,7 @@ impl ClaudeAdapter {
             verbose,
             use_api,
             api_key,
-            client,
+            agent,
         }
     }
 
@@ -101,47 +101,6 @@ impl ClaudeAdapter {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn check_works(&self) -> Result<String> {
-        use std::time::Instant;
-
-        let start = Instant::now();
-        let mut child = Command::new(&self.config.command)
-            .args(["-p", "say ok", "--output-format", "text", "--max-turns", "1"])
-            .current_dir(&self.working_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to run '{} -p'", self.config.command))?;
-
-        let timeout = Duration::from_secs(15);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let output = child.wait_with_output()?;
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-                    if status.success() {
-                        return Ok(format!("responded in {:.1}s", start.elapsed().as_secs_f64()));
-                    } else {
-                        let msg = if !stderr.trim().is_empty() { stderr } else { stdout };
-                        anyhow::bail!("{}", msg.trim());
-                    }
-                }
-                Ok(None) => {
-                    if start.elapsed() > timeout {
-                        let _ = child.kill();
-                        anyhow::bail!("timed out after {}s", timeout.as_secs());
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                Err(e) => anyhow::bail!("failed to check process: {}", e),
-            }
-        }
-    }
-
     // ── API mode (direct Anthropic REST API with SSE streaming) ──
 
     fn run_api(&self, prompt: &str, context: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
@@ -151,7 +110,7 @@ impl ClaudeAdapter {
                 self.config.api_key_env
             ))?;
 
-        let client = self.client.as_ref()
+        let agent = self.agent.as_ref()
             .ok_or_else(|| anyhow::anyhow!("HTTP client not initialized"))?;
 
         let full_text = if context.is_empty() {
@@ -191,38 +150,35 @@ impl ClaudeAdapter {
             eprintln!("  {} POST {} (model: {})", "[verbose]".dimmed(), ANTHROPIC_API_URL, self.config.api_model);
         }
 
-        let response = client
+        let response = agent
             .post(ANTHROPIC_API_URL)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .map_err(|e| {
-                if e.is_timeout() {
+            .set("x-api-key", api_key)
+            .set("anthropic-version", ANTHROPIC_VERSION)
+            .set("content-type", "application/json")
+            .send_json(&body)
+            .map_err(|e| match e {
+                ureq::Error::Status(code, response) => {
+                    let error_body = response.into_string().unwrap_or_default();
+                    let error_msg = serde_json::from_str::<serde_json::Value>(&error_body)
+                        .ok()
+                        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
+                        .unwrap_or(error_body);
+                    anyhow::anyhow!("Anthropic API returned {}: {}", code, error_msg)
+                }
+                ureq::Error::Transport(t) => {
                     anyhow::anyhow!(
-                        "Anthropic API timed out — increase timeout_secs in duet.toml [claude] section"
+                        "failed to reach Anthropic API: {} — \
+                         try increasing timeout_secs in duet.toml [claude] section",
+                        t
                     )
-                } else {
-                    anyhow::anyhow!("failed to send request to Anthropic API: {}", e)
                 }
             })?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_body = response.text().unwrap_or_default();
-            let error_msg = serde_json::from_str::<serde_json::Value>(&error_body)
-                .ok()
-                .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
-                .unwrap_or(error_body);
-            anyhow::bail!("Anthropic API returned {}: {}", status, error_msg);
-        }
-
-        self.parse_sse_stream(response)
+        self.parse_sse_stream(response.into_reader())
     }
 
-    fn parse_sse_stream(&self, response: reqwest::blocking::Response) -> Result<(String, UsageStats)> {
-        let reader = BufReader::new(response);
+    fn parse_sse_stream(&self, body: impl Read) -> Result<(String, UsageStats)> {
+        let reader = BufReader::new(body);
         let mut collected = String::new();
         let mut header_printed = false;
         let separator = "─".repeat(60);
@@ -418,7 +374,7 @@ impl ClaudeAdapter {
             .arg("--verbose")
             .arg("--model")
             .arg(&self.config.model)
-            .arg("--dangerously-skip-permissions") // Always skip permissions to allow auto-editing
+            .arg("--dangerously-skip-permissions")
             .current_dir(&self.working_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -577,9 +533,6 @@ impl ClaudeAdapter {
                             eprintln!("  {}", separator.dimmed());
                             streaming_text = true;
                         }
-                        
-                        // If it's the first chunk, we might want to indent it, but streaming markdown is hard.
-                        // We'll just print it directly for now, but ensure we keep the text for the final result.
                         eprint!("{}", text);
                         let _ = std::io::stderr().lock().flush();
                         delta_text.push_str(text);
@@ -597,8 +550,7 @@ impl ClaudeAdapter {
                         .or_else(|| event.pointer("/content_block/input"));
                     if streaming_text { eprintln!(); streaming_text = false; }
                     let desc = Self::describe_tool_action(tool, input);
-                    
-                    // Only show clean summaries, suppress raw tool calls
+
                     if tool != "Bash" || !desc.starts_with("running `cat >") && !desc.starts_with("running `python -c") {
                         eprintln!("  {} {}", "⚡".cyan(), desc);
                     }
@@ -628,8 +580,7 @@ impl ClaudeAdapter {
                         model_name = m.to_string();
                     }
                 }
-                ("system", "task_started") => {}
-                ("system", "task_progress") => {}
+                ("system", "task_started") | ("system", "task_progress") => {}
                 ("system", "task_notification") => {
                     if let Some(msg) = event.get("message").and_then(|v| v.as_str()) {
                         eprintln!("  {} {}", "ℹ".cyan(), msg);

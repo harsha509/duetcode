@@ -1,7 +1,7 @@
 use super::{ImageInput, ModelAdapter, UsageStats};
 use super::pricing;
 use crate::config::GeminiConfig;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use colored::Colorize;
 use std::io::{BufRead, BufReader, Write};
 use std::time::Duration;
@@ -11,7 +11,7 @@ const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/
 pub struct GeminiAdapter {
     model: String,
     api_key: String,
-    client: reqwest::blocking::Client,
+    agent: ureq::Agent,
 }
 
 impl GeminiAdapter {
@@ -23,15 +23,15 @@ impl GeminiAdapter {
             )
         })?;
 
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .build()
-            .context("failed to build HTTP client")?;
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_read(Duration::from_secs(config.timeout_secs))
+            .build();
 
         Ok(Self {
             model: config.model.clone(),
             api_key,
-            client,
+            agent,
         })
     }
 
@@ -94,33 +94,25 @@ impl GeminiAdapter {
 
         let start = std::time::Instant::now();
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .map_err(|e| {
-                if e.is_timeout() {
+        let response = self.agent.post(&url)
+            .send_json(&body)
+            .map_err(|e| match e {
+                ureq::Error::Status(code, response) => {
+                    let error_body = response.into_string().unwrap_or_default();
+                    let error_msg = extract_api_error(&error_body).unwrap_or(error_body);
+                    anyhow::anyhow!("Gemini API returned {}: {}", code, error_msg)
+                }
+                ureq::Error::Transport(t) => {
                     anyhow::anyhow!(
-                        "Gemini API timed out — the model '{}' may need more time. \
-                         Increase timeout_secs in duet.toml [gemini] section, \
+                        "failed to reach Gemini API: {} — \
+                         try increasing timeout_secs in duet.toml [gemini] section \
                          or try a faster model like 'gemini-2.0-flash'",
-                        self.model
+                        t
                     )
-                } else {
-                    anyhow::anyhow!("failed to send request to Gemini API: {}", e)
                 }
             })?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_body = response.text().unwrap_or_default();
-            let error_msg = extract_api_error(&error_body)
-                .unwrap_or_else(|| error_body.clone());
-            anyhow::bail!("Gemini API returned {}: {}", status, error_msg);
-        }
-
-        let reader = BufReader::new(response);
+        let reader = BufReader::new(response.into_reader());
         let mut collected = String::new();
         let mut header_printed = false;
         let separator = "─".repeat(60);

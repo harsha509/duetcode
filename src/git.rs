@@ -68,10 +68,3 @@ pub fn git_diff_stat(dir: &Path) -> Result<String> {
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
-
-#[allow(dead_code)]
-pub fn has_changes(dir: &Path) -> Result<bool> {
-    let diff = git_diff(dir)?;
-    let status = git_status(dir)?;
-    Ok(!diff.trim().is_empty() || !status.trim().is_empty())
-}

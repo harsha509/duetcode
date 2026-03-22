@@ -24,34 +24,32 @@ impl SessionLog {
         Ok(Self { dir })
     }
 
+    fn round_dir(&self, round: usize) -> Result<PathBuf> {
+        let dir = self.dir.join(format!("round-{}", round));
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
     pub fn write_writer_response(&self, round: usize, response: &str) -> Result<()> {
-        let round_dir = self.dir.join(format!("round-{}", round));
-        std::fs::create_dir_all(&round_dir)?;
-        let path = round_dir.join("claude_out.md");
+        let path = self.round_dir(round)?.join("claude_out.md");
         std::fs::write(&path, response)
             .with_context(|| format!("failed to write {}", path.display()))
     }
 
     pub fn write_reviewer_response(&self, round: usize, response: &str) -> Result<()> {
-        let round_dir = self.dir.join(format!("round-{}", round));
-        std::fs::create_dir_all(&round_dir)?;
-        let path = round_dir.join("gemini_out.md");
+        let path = self.round_dir(round)?.join("gemini_out.md");
         std::fs::write(&path, response)
             .with_context(|| format!("failed to write {}", path.display()))
     }
 
     pub fn write_diff(&self, round: usize, diff: &str) -> Result<()> {
-        let round_dir = self.dir.join(format!("round-{}", round));
-        std::fs::create_dir_all(&round_dir)?;
-        let path = round_dir.join("claude.patch");
+        let path = self.round_dir(round)?.join("claude.patch");
         std::fs::write(&path, diff)
             .with_context(|| format!("failed to write {}", path.display()))
     }
 
     pub fn write_checks(&self, round: usize, results: &[CheckResult]) -> Result<()> {
-        let round_dir = self.dir.join(format!("round-{}", round));
-        std::fs::create_dir_all(&round_dir)?;
-        let path = round_dir.join("checks.json");
+        let path = self.round_dir(round)?.join("checks.json");
         let json = serde_json::to_string_pretty(results)
             .context("failed to serialize check results")?;
         std::fs::write(&path, json)
@@ -99,11 +97,8 @@ impl SessionLog {
             .filter(|e| e.path().is_dir())
             .collect();
 
-        // Sort by directory name (which starts with timestamp %Y%m%d-%H%M%S)
         entries.sort_by_key(|e| e.file_name());
 
-        // Skip the CURRENT session we just created!
-        // We want the SECOND to last session.
         if entries.len() >= 2 {
             Ok(Some(entries[entries.len() - 2].path()))
         } else {
@@ -119,12 +114,11 @@ impl SessionLog {
             String::new()
         };
 
-        // Find the last round's claude output (or gemini if it was the writer)
         let mut last_response = String::new();
         for round in (1..=10).rev() {
             let claude_path = session_dir.join(format!("round-{}", round)).join("claude_out.md");
             let gemini_path = session_dir.join(format!("round-{}", round)).join("gemini_out.md");
-            
+
             if claude_path.exists() {
                 last_response = std::fs::read_to_string(&claude_path).unwrap_or_default();
                 break;
@@ -134,7 +128,6 @@ impl SessionLog {
             }
         }
 
-        // If no rounds exist, maybe it was a plan mode session, check round-0
         if last_response.is_empty() {
             let plan_path = session_dir.join("round-0").join("claude_out.md");
             if plan_path.exists() {
@@ -154,17 +147,21 @@ impl SessionLog {
 }
 
 fn slugify(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
+    let mut result = String::with_capacity(text.len());
+    let mut last_was_dash = true;
+
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            result.push(c.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            result.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    result.trim_end_matches('-')
         .split('-')
-        .filter(|s| !s.is_empty())
         .take(6)
         .collect::<Vec<_>>()
         .join("-")

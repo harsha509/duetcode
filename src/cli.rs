@@ -202,20 +202,23 @@ fn cmd_init(dir: &std::path::Path) -> Result<()> {
     write_default_prompt(&prompts_dir, "fix.txt", crate::prompts::DEFAULT_FIX_TEMPLATE)?;
     write_default_prompt(&prompts_dir, "plan.txt", crate::prompts::DEFAULT_PLAN_TEMPLATE)?;
 
-    // Add .duet/sessions to .gitignore
     let gitignore_path = dir.join(".gitignore");
     let ignore_entry = "\n# duetcode sessions\n.duet/sessions/\n";
-    
+
     if gitignore_path.exists() {
         let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
         if !content.contains(".duet/sessions/") {
             use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&gitignore_path) {
-                let _ = file.write_all(ignore_entry.as_bytes());
-            }
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&gitignore_path)
+                .context("failed to open .gitignore")?;
+            file.write_all(ignore_entry.as_bytes())
+                .context("failed to update .gitignore")?;
         }
     } else {
-        std::fs::write(&gitignore_path, ignore_entry.trim_start()).unwrap_or(());
+        std::fs::write(&gitignore_path, ignore_entry.trim_start())
+            .context("failed to create .gitignore")?;
     }
 
     println!("\n{}", "dt initialized! Edit .duet/config.toml to customize.".green().bold());
@@ -257,8 +260,7 @@ fn cmd_doctor(dir: &std::path::Path, verbose: bool) -> Result<()> {
 
     let claude_config = config
         .as_ref()
-        .map(|c| &c.claude)
-        .cloned()
+        .map(|c| c.claude.clone())
         .unwrap_or_default();
 
     let claude = ClaudeAdapter::new(&claude_config, dir, verbose);
@@ -297,21 +299,16 @@ fn cmd_doctor(dir: &std::path::Path, verbose: bool) -> Result<()> {
     println!("  {} claude mode: {} ({})", "ℹ".cyan(),
         mode,
         match mode.as_str() {
-            "api" => "always use API".to_string(),
-            "cli" => "always use CLI".to_string(),
-            _ => if cli_ok { "using CLI, API as fallback".to_string() } else { "using API directly".to_string() },
+            "api" => "always use API",
+            "cli" => "always use CLI",
+            _ => if cli_ok { "using CLI, API as fallback" } else { "using API directly" },
         }
     );
 
     let gemini_config = config
         .as_ref()
-        .map(|c| &c.gemini)
-        .cloned()
-        .unwrap_or_else(|| crate::config::GeminiConfig {
-            model: "gemini-3.1-pro-preview".to_string(),
-            api_key_env: "GEMINI_API_KEY".to_string(),
-            timeout_secs: 300,
-        });
+        .map(|c| c.gemini.clone())
+        .unwrap_or_default();
 
     if GeminiAdapter::is_key_available(&gemini_config) {
         println!("  {} {} is set", "✓".green(), gemini_config.api_key_env);
@@ -324,14 +321,14 @@ fn cmd_doctor(dir: &std::path::Path, verbose: bool) -> Result<()> {
         all_ok = false;
     }
 
-    let prompts_dir = dir.join("prompts");
+    let prompts_dir = dir.join(".duet").join("prompts");
     for name in &["implement.txt", "review.txt", "fix.txt"] {
         let path = prompts_dir.join(name);
         if path.exists() {
-            println!("  {} prompts/{}", "✓".green(), name);
+            println!("  {} .duet/prompts/{}", "✓".green(), name);
         } else {
             println!(
-                "  {} prompts/{} — not found (will use built-in defaults)",
+                "  {} .duet/prompts/{} — not found (will use built-in defaults)",
                 "~".yellow(),
                 name
             );
@@ -351,6 +348,50 @@ fn cmd_doctor(dir: &std::path::Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+/// Shared setup for cmd_run and cmd_plan: validates git repo, loads config, resolves adapters.
+fn setup_task(
+    dir: &std::path::Path,
+    writer_name: &str,
+    image_paths: &[PathBuf],
+    verbose: bool,
+) -> Result<(
+    Config,
+    Vec<ImageInput>,
+    Box<dyn crate::adapters::ModelAdapter>,
+    Box<dyn crate::adapters::ModelAdapter>,
+    &'static str,
+    &'static str,
+)> {
+    if !git::is_git_repo(dir) {
+        anyhow::bail!("not a git repository — run `git init` first");
+    }
+
+    let config = Config::load(dir).context("failed to load config")?;
+
+    let images: Vec<ImageInput> = image_paths
+        .iter()
+        .map(|p| ImageInput::load(p.clone()))
+        .collect::<Result<Vec<_>>>()?;
+
+    let (writer_label, reviewer_label): (&'static str, &'static str) = match writer_name.to_lowercase().as_str() {
+        "claude" => ("claude", "gemini"),
+        "gemini" => ("gemini", "claude"),
+        other => anyhow::bail!("unknown writer '{}' — use 'claude' or 'gemini'", other),
+    };
+
+    let claude = ClaudeAdapter::new(&config.claude, dir, verbose);
+    let gemini = GeminiAdapter::new(&config.gemini)?;
+
+    let (writer, reviewer): (Box<dyn crate::adapters::ModelAdapter>, Box<dyn crate::adapters::ModelAdapter>) =
+        if writer_label == "claude" {
+            (Box::new(claude), Box::new(gemini))
+        } else {
+            (Box::new(gemini), Box::new(claude))
+        };
+
+    Ok((config, images, writer, reviewer, writer_label, reviewer_label))
+}
+
 fn cmd_run(
     dir: &std::path::Path,
     task: &str,
@@ -359,11 +400,8 @@ fn cmd_run(
     continue_session: bool,
     verbose: bool,
 ) -> Result<()> {
-    if !git::is_git_repo(dir) {
-        anyhow::bail!("not a git repository — run `git init` first");
-    }
-
-    let config = Config::load(dir).context("failed to load config")?;
+    let (config, images, writer, reviewer, writer_label, reviewer_label) =
+        setup_task(dir, writer_name, image_paths, verbose)?;
 
     if !config.policy.allow_dirty_worktree && !git::is_worktree_clean(dir)? {
         anyhow::bail!(
@@ -372,47 +410,18 @@ fn cmd_run(
         );
     }
 
-    let images: Vec<ImageInput> = image_paths
-        .iter()
-        .map(|p| ImageInput::load(p.clone()))
-        .collect::<Result<Vec<_>>>()?;
-
-    let (writer_name_lower, reviewer_name) = match writer_name.to_lowercase().as_str() {
-        "claude" => ("claude", "gemini"),
-        "gemini" => ("gemini", "claude"),
-        other => anyhow::bail!("unknown writer '{}' — use 'claude' or 'gemini'", other),
-    };
-
-    let claude_adapter = ClaudeAdapter::new(&config.claude, dir, verbose);
-    let gemini_adapter = GeminiAdapter::new(&config.gemini)?;
-
-    let (writer, reviewer): (&dyn crate::adapters::ModelAdapter, &dyn crate::adapters::ModelAdapter) =
-        match writer_name_lower {
-            "claude" => (&claude_adapter, &gemini_adapter),
-            "gemini" => (&gemini_adapter, &claude_adapter),
-            _ => unreachable!(),
-        };
-
-    let result = orchestrator::run(&config, task, writer, reviewer, &images, dir, continue_session, verbose)?;
+    let result = orchestrator::run(&config, task, writer.as_ref(), reviewer.as_ref(), &images, dir, continue_session, verbose)?;
 
     println!(
         "\n{} rounds={}, writer={}, reviewer={}",
-        if result.success {
-            "SUCCESS".green().bold()
-        } else {
-            "FAILED".red().bold()
-        },
+        if result.success { "SUCCESS".green().bold() } else { "FAILED".red().bold() },
         result.rounds,
-        writer_name_lower,
-        reviewer_name,
+        writer_label,
+        reviewer_label,
     );
     println!("{}\n", result.message);
 
-    if result.success {
-        Ok(())
-    } else {
-        std::process::exit(1);
-    }
+    if result.success { Ok(()) } else { std::process::exit(1); }
 }
 
 fn cmd_plan(
@@ -423,53 +432,21 @@ fn cmd_plan(
     continue_session: bool,
     verbose: bool,
 ) -> Result<()> {
-    if !git::is_git_repo(dir) {
-        anyhow::bail!("not a git repository — run `git init` first");
-    }
+    let (config, images, writer, reviewer, writer_label, reviewer_label) =
+        setup_task(dir, writer_name, image_paths, verbose)?;
 
-    let config = Config::load(dir).context("failed to load config")?;
-
-    let images: Vec<ImageInput> = image_paths
-        .iter()
-        .map(|p| ImageInput::load(p.clone()))
-        .collect::<Result<Vec<_>>>()?;
-
-    let (writer_name_lower, reviewer_name) = match writer_name.to_lowercase().as_str() {
-        "claude" => ("claude", "gemini"),
-        "gemini" => ("gemini", "claude"),
-        other => anyhow::bail!("unknown writer '{}' — use 'claude' or 'gemini'", other),
-    };
-
-    let claude_adapter = ClaudeAdapter::new(&config.claude, dir, verbose);
-    let gemini_adapter = GeminiAdapter::new(&config.gemini)?;
-
-    let (writer, reviewer): (&dyn crate::adapters::ModelAdapter, &dyn crate::adapters::ModelAdapter) =
-        match writer_name_lower {
-            "claude" => (&claude_adapter, &gemini_adapter),
-            "gemini" => (&gemini_adapter, &claude_adapter),
-            _ => unreachable!(),
-        };
-
-    let result = orchestrator::run_plan_flow(&config, task, writer, reviewer, &images, dir, continue_session, verbose)?;
+    let result = orchestrator::run_plan_flow(&config, task, writer.as_ref(), reviewer.as_ref(), &images, dir, continue_session, verbose)?;
 
     println!(
         "\n{} rounds={}, writer={}, reviewer={}",
-        if result.success {
-            "SUCCESS".green().bold()
-        } else {
-            "STOPPED".yellow().bold()
-        },
+        if result.success { "SUCCESS".green().bold() } else { "STOPPED".yellow().bold() },
         result.rounds,
-        writer_name_lower,
-        reviewer_name,
+        writer_label,
+        reviewer_label,
     );
     println!("{}\n", result.message);
 
-    if result.success {
-        Ok(())
-    } else {
-        std::process::exit(1);
-    }
+    if result.success { Ok(()) } else { std::process::exit(1); }
 }
 
 fn cmd_review(dir: &std::path::Path, reviewer_name: &str, task: Option<&str>, verbose: bool) -> Result<()> {
@@ -499,7 +476,7 @@ fn cmd_review(dir: &std::path::Path, reviewer_name: &str, task: Option<&str>, ve
 
 fn cmd_clear(dir: &std::path::Path) -> Result<()> {
     let sessions_dir = dir.join(".duet").join("sessions");
-    
+
     if sessions_dir.exists() {
         std::fs::remove_dir_all(&sessions_dir)
             .with_context(|| format!("failed to remove {}", sessions_dir.display()))?;
@@ -507,7 +484,7 @@ fn cmd_clear(dir: &std::path::Path) -> Result<()> {
     } else {
         println!("{} No sessions found to clear.", "ℹ".cyan());
     }
-    
+
     Ok(())
 }
 

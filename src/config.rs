@@ -43,7 +43,7 @@ pub struct GeminiConfig {
     pub timeout_secs: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ChecksConfig {
     #[serde(default)]
     pub test: Option<String>,
@@ -73,50 +73,24 @@ pub struct PromptsConfig {
     pub fix: PathBuf,
 }
 
-fn default_claude_args() -> Vec<String> {
-    vec!["-p".to_string()]
-}
-fn default_claude_model() -> String {
-    "sonnet".to_string()
-}
-fn default_claude_mode() -> String {
-    "auto".to_string()
-}
-fn default_claude_api_key_env() -> String {
-    "ANTHROPIC_API_KEY".to_string()
-}
-fn default_claude_api_model() -> String {
-    "claude-sonnet-4-20250514".to_string()
-}
-fn default_gemini_model() -> String {
-    "gemini-3.1-pro-preview".to_string()
-}
-fn default_gemini_api_key_env() -> String {
-    "GEMINI_API_KEY".to_string()
-}
-fn default_timeout_secs() -> u64 {
-    300
-}
-fn default_max_rounds() -> usize {
-    4
-}
-fn default_true() -> bool {
-    true
-}
-fn default_implement_prompt() -> PathBuf {
-    PathBuf::from(".duet/prompts/implement.txt")
-}
-fn default_review_prompt() -> PathBuf {
-    PathBuf::from(".duet/prompts/review.txt")
-}
-fn default_fix_prompt() -> PathBuf {
-    PathBuf::from(".duet/prompts/fix.txt")
-}
+fn default_claude_args() -> Vec<String> { vec!["-p".into()] }
+fn default_claude_model() -> String { "sonnet".into() }
+fn default_claude_mode() -> String { "auto".into() }
+fn default_claude_api_key_env() -> String { "ANTHROPIC_API_KEY".into() }
+fn default_claude_api_model() -> String { "claude-sonnet-4-20250514".into() }
+fn default_gemini_model() -> String { "gemini-3.1-pro-preview".into() }
+fn default_gemini_api_key_env() -> String { "GEMINI_API_KEY".into() }
+fn default_timeout_secs() -> u64 { 300 }
+fn default_max_rounds() -> usize { 4 }
+fn default_true() -> bool { true }
+fn default_implement_prompt() -> PathBuf { PathBuf::from(".duet/prompts/implement.txt") }
+fn default_review_prompt() -> PathBuf { PathBuf::from(".duet/prompts/review.txt") }
+fn default_fix_prompt() -> PathBuf { PathBuf::from(".duet/prompts/fix.txt") }
 
 impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
-            command: "claude".to_string(),
+            command: "claude".into(),
             args: default_claude_args(),
             model: default_claude_model(),
             skip_permissions: false,
@@ -124,6 +98,48 @@ impl Default for ClaudeConfig {
             api_key_env: default_claude_api_key_env(),
             api_model: default_claude_api_model(),
             timeout_secs: default_timeout_secs(),
+        }
+    }
+}
+
+impl Default for GeminiConfig {
+    fn default() -> Self {
+        Self {
+            model: default_gemini_model(),
+            api_key_env: default_gemini_api_key_env(),
+            timeout_secs: default_timeout_secs(),
+        }
+    }
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_rounds: default_max_rounds(),
+            require_both_approvals: true,
+            allow_dirty_worktree: true,
+        }
+    }
+}
+
+impl Default for PromptsConfig {
+    fn default() -> Self {
+        Self {
+            implementation: default_implement_prompt(),
+            review: default_review_prompt(),
+            fix: default_fix_prompt(),
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            claude: ClaudeConfig::default(),
+            gemini: GeminiConfig::default(),
+            checks: ChecksConfig::default(),
+            policy: PolicyConfig::default(),
+            prompts: PromptsConfig::default(),
         }
     }
 }
@@ -142,51 +158,16 @@ impl Config {
         dir.join(CONFIG_FILENAME)
     }
 
-    pub fn default_config() -> Self {
-        Config {
-            claude: ClaudeConfig {
-                command: "claude".to_string(),
-                args: default_claude_args(),
-                model: default_claude_model(),
-                skip_permissions: false,
-                mode: default_claude_mode(),
-                api_key_env: default_claude_api_key_env(),
-                api_model: default_claude_api_model(),
-                timeout_secs: default_timeout_secs(),
-            },
-            gemini: GeminiConfig {
-                model: default_gemini_model(),
-                api_key_env: default_gemini_api_key_env(),
-                timeout_secs: default_timeout_secs(),
-            },
-            checks: ChecksConfig {
-                test: None,
-                lint: None,
-                typecheck: None,
-            },
-            policy: PolicyConfig {
-                max_rounds: default_max_rounds(),
-                require_both_approvals: true,
-                allow_dirty_worktree: true,
-            },
-            prompts: PromptsConfig {
-                implementation: default_implement_prompt(),
-                review: default_review_prompt(),
-                fix: default_fix_prompt(),
-            },
-        }
-    }
-
     pub fn write_default(dir: &Path) -> Result<PathBuf> {
-        let config = Self::default_config();
+        let config = Self::default();
         let content = toml::to_string_pretty(&config)
             .context("failed to serialize default config")?;
         let path = Self::config_path(dir);
-        
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         std::fs::write(&path, content)
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)

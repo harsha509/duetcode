@@ -13,13 +13,6 @@ pub struct UsageStats {
     pub model: String,
 }
 
-impl UsageStats {
-    #[allow(dead_code)]
-    pub fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens
-    }
-}
-
 impl std::fmt::Display for UsageStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "tokens: {}in / {}out", self.input_tokens, self.output_tokens)?;
@@ -32,8 +25,6 @@ impl std::fmt::Display for UsageStats {
 
 #[derive(Debug, Clone)]
 pub struct ImageInput {
-    #[allow(dead_code)]
-    pub path: PathBuf,
     pub media_type: String,
     pub data: Vec<u8>,
 }
@@ -63,11 +54,7 @@ impl ImageInput {
         let data =
             std::fs::read(&path).map_err(|e| anyhow::anyhow!("cannot read {}: {}", path.display(), e))?;
 
-        Ok(Self {
-            path,
-            media_type,
-            data,
-        })
+        Ok(Self { media_type, data })
     }
 
     pub fn base64_data(&self) -> String {
@@ -86,7 +73,6 @@ pub trait ModelAdapter {
 
     fn name(&self) -> &str;
 
-    /// Whether the adapter already streams output to the terminal during generate().
     fn streams_output(&self) -> bool {
         false
     }

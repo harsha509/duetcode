@@ -14,13 +14,16 @@ pub fn render(template: &str, vars: &[(&str, &str)]) -> String {
     result
 }
 
-pub fn build_implement_prompt(template: &str, task: &str, context: &str, previous_session: &str) -> String {
-    let full_context = if previous_session.is_empty() {
+fn context_with_session(context: &str, previous_session: &str) -> String {
+    if previous_session.is_empty() {
         context.to_string()
     } else {
         format!("{}\n\nPREVIOUS SESSION CONTEXT:\n{}", context, previous_session)
-    };
-    render(template, &[("task", task), ("context", &full_context)])
+    }
+}
+
+pub fn build_implement_prompt(template: &str, task: &str, context: &str, previous_session: &str) -> String {
+    render(template, &[("task", task), ("context", &context_with_session(context, previous_session))])
 }
 
 pub fn build_review_prompt(template: &str, task: &str, diff: &str, checks: &str) -> String {
@@ -35,6 +38,19 @@ pub fn build_fix_prompt(template: &str, task: &str, review_feedback: &str) -> St
         template,
         &[("task", task), ("review_feedback", review_feedback)],
     )
+}
+
+pub fn build_plan_prompt(template: &str, task: &str, context: &str, previous_session: &str) -> String {
+    render(template, &[("task", task), ("context", &context_with_session(context, previous_session))])
+}
+
+pub fn build_plan_review_prompt(template: &str, task: &str, plan: &str) -> String {
+    render(template, &[("task", task), ("plan", plan)])
+}
+
+pub fn build_implement_with_plan_prompt(template: &str, task: &str, context: &str, plan: &str) -> String {
+    let full_context = format!("{}\n\nAPPROVED PLAN:\n{}", context, plan);
+    render(template, &[("task", task), ("context", &full_context)])
 }
 
 pub const DEFAULT_IMPLEMENT_TEMPLATE: &str = r#"You are an expert software engineer working in the current repository.
@@ -139,21 +155,3 @@ At the end, write one of these on its own line:
 VERDICT: APPROVED
 VERDICT: CHANGES_REQUESTED
 "#;
-
-pub fn build_plan_prompt(template: &str, task: &str, context: &str, previous_session: &str) -> String {
-    let full_context = if previous_session.is_empty() {
-        context.to_string()
-    } else {
-        format!("{}\n\nPREVIOUS SESSION CONTEXT:\n{}", context, previous_session)
-    };
-    render(template, &[("task", task), ("context", &full_context)])
-}
-
-pub fn build_plan_review_prompt(template: &str, task: &str, plan: &str) -> String {
-    render(template, &[("task", task), ("plan", plan)])
-}
-
-pub fn build_implement_with_plan_prompt(template: &str, task: &str, context: &str, plan: &str) -> String {
-    let full_context = format!("{}\n\nAPPROVED PLAN:\n{}", context, plan);
-    render(template, &[("task", task), ("context", &full_context)])
-}

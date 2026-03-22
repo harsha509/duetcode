@@ -15,6 +15,8 @@ pub struct OrchestratorResult {
     pub message: String,
 }
 
+// ── Internal types ──
+
 struct CostTracker {
     entries: Vec<UsageStats>,
 }
@@ -53,46 +55,41 @@ impl CostTracker {
     }
 }
 
-pub fn run(
+struct SessionSetup {
+    session_log: SessionLog,
+    repo_context: String,
+    impl_template: String,
+    review_template: String,
+    fix_template: String,
+}
+
+struct ReviewResult {
+    verdict: policy::ReviewVerdict,
+    response: String,
+    checks_passed: bool,
+}
+
+enum DiffOutcome {
+    NoChanges,
+    UserSkippedReview,
+    ReadyForReview(String),
+}
+
+// ── Shared helpers (eliminate duplication between run & run_plan_flow) ──
+
+fn setup_session(
     config: &Config,
     task: &str,
-    writer: &dyn ModelAdapter,
-    reviewer: &dyn ModelAdapter,
-    images: &[ImageInput],
     repo_dir: &Path,
     continue_session: bool,
-    verbose: bool,
-) -> Result<OrchestratorResult> {
-    println!(
-        "\n{} {}",
-        "Task:".cyan().bold(),
-        task
-    );
-    println!(
-        "{} writer={}, reviewer={}",
-        "Models:".cyan().bold(),
-        writer.name().green(),
-        reviewer.name().green()
-    );
-    println!(
-        "{} {}\n",
-        "Max rounds:".cyan().bold(),
-        config.policy.max_rounds
-    );
-
+) -> Result<SessionSetup> {
     let impl_template = load_prompt_template(&config.prompts.implementation, prompts::DEFAULT_IMPLEMENT_TEMPLATE, repo_dir)?;
     let review_template = load_prompt_template(&config.prompts.review, prompts::DEFAULT_REVIEW_TEMPLATE, repo_dir)?;
     let fix_template = load_prompt_template(&config.prompts.fix, prompts::DEFAULT_FIX_TEMPLATE, repo_dir)?;
 
     let session_log = SessionLog::create(repo_dir, task)?;
-    println!(
-        "{} {}\n",
-        "Logs:".cyan().bold(),
-        session_log.dir.display()
-    );
-
     let mut repo_context = build_repo_context(repo_dir)?;
-    
+
     if continue_session {
         if let Some(last_session) = SessionLog::get_last_session(repo_dir)? {
             let previous_context = SessionLog::read_session_context(&last_session)?;
@@ -103,195 +100,218 @@ pub fn run(
         }
     }
 
+    Ok(SessionSetup { session_log, repo_context, impl_template, review_template, fix_template })
+}
+
+fn run_review(
+    config: &Config,
+    task: &str,
+    reviewer: &dyn ModelAdapter,
+    repo_dir: &Path,
+    session_log: &SessionLog,
+    costs: &mut CostTracker,
+    round: usize,
+    review_template: &str,
+    diff: &str,
+    verbose: bool,
+) -> Result<ReviewResult> {
+    println!("  {} Running checks...", ">>".yellow());
+    let check_results = checks::run_checks(&config.checks, repo_dir);
+    session_log.write_checks(round, &check_results)?;
+
+    for cr in &check_results {
+        let icon = if cr.passed { "PASS".green() } else { "FAIL".red() };
+        println!("  [{}] {}", icon, cr.name);
+    }
+
+    let checks_summary = checks::format_check_results(&check_results);
+    let review_prompt = prompts::build_review_prompt(review_template, task, diff, &checks_summary);
+
+    println!("  {} Calling {}...", ">>".yellow(), reviewer.name());
+    let (response, usage) = reviewer
+        .generate(&review_prompt, "", &[])
+        .with_context(|| format!("reviewer ({}) failed in round {}", reviewer.name(), round))?;
+    costs.add(usage);
+
+    session_log.write_reviewer_response(round, &response)?;
+    if !reviewer.streams_output() {
+        print_response(reviewer.name(), &response, verbose);
+    }
+
+    let verdict = policy::parse_verdict(&response);
+    print_verdict(&verdict);
+
+    Ok(ReviewResult {
+        checks_passed: checks::all_passed(&check_results),
+        verdict,
+        response,
+    })
+}
+
+fn handle_writer_diff(
+    writer_name: &str,
+    reviewer_name: &str,
+    repo_dir: &Path,
+    session_log: &SessionLog,
+    round: usize,
+    diff_before: &str,
+) -> Result<DiffOutcome> {
+    let diff_after = git::git_diff(repo_dir)?;
+    let changed = diff_after != diff_before;
+    let has_uncommitted = !diff_after.trim().is_empty();
+
+    if !changed && !has_uncommitted {
+        println!("  {} {} answered without making code changes", "ℹ".cyan(), writer_name);
+        return Ok(DiffOutcome::NoChanges);
+    }
+
+    session_log.write_diff(round, &diff_after)?;
+
+    let stat = git::git_diff_stat(repo_dir).unwrap_or_default();
+    if !stat.trim().is_empty() {
+        println!("  {} Changes:\n{}", "~~".blue(), indent(&stat, "     "));
+    }
+
+    let answer = ask_user(&format!(
+        "  {} Review changes with {}? (y/n): ",
+        "?".cyan().bold(),
+        reviewer_name
+    ));
+
+    if answer == "y" || answer == "yes" {
+        Ok(DiffOutcome::ReadyForReview(diff_after))
+    } else {
+        Ok(DiffOutcome::UserSkippedReview)
+    }
+}
+
+fn notify_approval(
+    writer: &dyn ModelAdapter,
+    reviewer_response: &str,
+    costs: &mut CostTracker,
+) {
+    println!("  {} Notifying {} of approval...", ">>".yellow(), writer.name());
+    let prompt = format!(
+        "The reviewer has APPROVED your changes with the following feedback:\n\n{}\n\n\
+         No further action is required. Please acknowledge.",
+        reviewer_response
+    );
+    if let Ok((_text, usage)) = writer.generate(&prompt, "", &[]) {
+        costs.add(usage);
+    }
+}
+
+fn ask_fix_or_stop(
+    verdict: &policy::ReviewVerdict,
+    checks_passed: bool,
+    writer_name: &str,
+) -> bool {
+    let prompt_msg = if verdict.verdict == Verdict::Approved && !checks_passed {
+        format!("  {} AI approved, but checks failed. Let {} try to fix the checks? (y/n): ", "?".cyan().bold(), writer_name)
+    } else {
+        format!("  {} Let {} fix the issues? (y/n): ", "?".cyan().bold(), writer_name)
+    };
+
+    let answer = ask_user(&prompt_msg);
+    answer == "y" || answer == "yes"
+}
+
+// ── Public API ──
+
+pub fn run(
+    config: &Config,
+    task: &str,
+    writer: &dyn ModelAdapter,
+    reviewer: &dyn ModelAdapter,
+    images: &[ImageInput],
+    repo_dir: &Path,
+    continue_session: bool,
+    verbose: bool,
+) -> Result<OrchestratorResult> {
+    println!("\n{} {}", "Task:".cyan().bold(), task);
+    println!("{} writer={}, reviewer={}", "Models:".cyan().bold(), writer.name().green(), reviewer.name().green());
+    println!("{} {}\n", "Max rounds:".cyan().bold(), config.policy.max_rounds);
+
+    let setup = setup_session(config, task, repo_dir, continue_session)?;
+    println!("{} {}\n", "Logs:".cyan().bold(), setup.session_log.dir.display());
+
     let mut last_verdict = None;
-    let mut last_checks = Vec::new();
-    let mut total_rounds = 0;
+    let mut last_checks_passed = false;
     let mut costs = CostTracker::new();
 
     for round in 1..=config.policy.max_rounds {
-        total_rounds = round;
         println!(
             "\n{}",
-            format!("━━━ Round {}/{} ━━━", round, config.policy.max_rounds)
-                .cyan()
-                .bold()
+            format!("━━━ Round {}/{} ━━━", round, config.policy.max_rounds).cyan().bold()
         );
 
         let writer_prompt = if round == 1 {
-            prompts::build_implement_prompt(&impl_template, task, &repo_context, "")
+            prompts::build_implement_prompt(&setup.impl_template, task, &setup.repo_context, "")
         } else {
-            let feedback = last_verdict
-                .as_ref()
-                .map(|v| policy::format_review_feedback(v))
-                .unwrap_or_default();
-            prompts::build_fix_prompt(&fix_template, task, &feedback)
+            let feedback = last_verdict.as_ref().map(policy::format_review_feedback).unwrap_or_default();
+            prompts::build_fix_prompt(&setup.fix_template, task, &feedback)
         };
 
         let diff_before = git::git_diff(repo_dir).unwrap_or_default();
 
         println!("  {} Calling {}...", ">>".yellow(), writer.name());
+        let current_images = if round == 1 { images } else { &[] };
         let (writer_response, writer_usage) = writer
-            .generate(&writer_prompt, "", images)
+            .generate(&writer_prompt, "", current_images)
             .with_context(|| format!("writer ({}) failed in round {}", writer.name(), round))?;
         costs.add(writer_usage);
 
-        session_log.write_writer_response(round, &writer_response)?;
+        setup.session_log.write_writer_response(round, &writer_response)?;
         if !writer.streams_output() {
             print_response(writer.name(), &writer_response, verbose);
         }
 
-        let diff_after = git::git_diff(repo_dir)?;
-        let writer_changed_code = diff_after != diff_before;
-        let has_uncommitted_changes = !diff_after.trim().is_empty();
-
-        if writer_changed_code || has_uncommitted_changes {
-            session_log.write_diff(round, &diff_after)?;
-
-            let stat = git::git_diff_stat(repo_dir).unwrap_or_default();
-            if !stat.trim().is_empty() {
-                println!("  {} Changes:\n{}", "~~".blue(), indent(&stat, "     "));
+        match handle_writer_diff(writer.name(), reviewer.name(), repo_dir, &setup.session_log, round, &diff_before)? {
+            DiffOutcome::NoChanges => {
+                costs.print_summary();
+                return Ok(OrchestratorResult { success: true, rounds: round, message: "completed, no changes needed".into() });
             }
-
-            let answer = ask_user(&format!(
-                "  {} Review changes with {}? (y/n): ",
-                "?".cyan().bold(),
-                reviewer.name()
-            ));
-
-            if answer != "y" && answer != "yes" {
+            DiffOutcome::UserSkippedReview => {
                 println!("\n{}", "Task completed.".green().bold());
                 costs.print_summary();
-                return Ok(OrchestratorResult {
-                    success: true,
-                    rounds: round,
-                    message: "completed, user accepted without review".to_string(),
-                });
+                return Ok(OrchestratorResult { success: true, rounds: round, message: "completed, user accepted without review".into() });
             }
-        } else {
-            println!("  {} {} answered without making code changes", "ℹ".cyan(), writer.name());
-            costs.print_summary();
-            return Ok(OrchestratorResult {
-                success: true,
-                rounds: round,
-                message: "completed, no changes needed".to_string(),
-            });
-        }
+            DiffOutcome::ReadyForReview(diff) => {
+                let review = run_review(config, task, reviewer, repo_dir, &setup.session_log, &mut costs, round, &setup.review_template, &diff, verbose)?;
 
-        println!("  {} Running checks...", ">>".yellow());
-        let check_results = checks::run_checks(&config.checks, repo_dir);
-        session_log.write_checks(round, &check_results)?;
+                if review.verdict.verdict == Verdict::Approved && review.checks_passed {
+                    println!("\n{}", "Approved!".green().bold());
+                    setup.session_log.write_summary(task, writer.name(), reviewer.name(), round, &review.verdict, true, true)?;
+                    notify_approval(writer, &review.response, &mut costs);
+                    costs.print_summary();
+                    return Ok(OrchestratorResult { success: true, rounds: round, message: "approved with all checks passing".into() });
+                }
 
-        for cr in &check_results {
-            let icon = if cr.passed { "PASS".green() } else { "FAIL".red() };
-            println!("  [{}] {}", icon, cr.name);
-        }
+                last_checks_passed = review.checks_passed;
+                last_verdict = Some(review.verdict.clone());
 
-        let checks_summary = checks::format_check_results(&check_results);
-
-        let review_prompt = prompts::build_review_prompt(
-            &review_template,
-            task,
-            &diff_after,
-            &checks_summary,
-        );
-
-        println!("  {} Calling {}...", ">>".yellow(), reviewer.name());
-        let (reviewer_response, reviewer_usage) = reviewer
-            .generate(&review_prompt, "", &[])
-            .with_context(|| format!("reviewer ({}) failed in round {}", reviewer.name(), round))?;
-        costs.add(reviewer_usage);
-
-        session_log.write_reviewer_response(round, &reviewer_response)?;
-        if !reviewer.streams_output() {
-            print_response(reviewer.name(), &reviewer_response, verbose);
-        }
-
-        let verdict = policy::parse_verdict(&reviewer_response);
-        print_verdict(&verdict);
-
-        last_checks = check_results;
-
-        if verdict.verdict == Verdict::Approved && checks::all_passed(&last_checks) {
-            println!("\n{}", "Approved!".green().bold());
-
-            session_log.write_summary(
-                task,
-                writer.name(),
-                reviewer.name(),
-                round,
-                &verdict,
-                true,
-                true,
-            )?;
-
-            println!("  {} Notifying {} of approval...", ">>".yellow(), writer.name());
-            let approval_prompt = format!("The reviewer has APPROVED your changes with the following feedback:\n\n{}\n\nNo further action is required. Please acknowledge.", reviewer_response);
-            if let Ok((_text, usage)) = writer.generate(&approval_prompt, "", &[]) {
-                costs.add(usage);
+                if !ask_fix_or_stop(&review.verdict, review.checks_passed, writer.name()) {
+                    println!("\n{}", "Stopping. Review feedback saved in logs.".yellow());
+                    setup.session_log.write_summary(task, writer.name(), reviewer.name(), round, &review.verdict, review.checks_passed, false)?;
+                    costs.print_summary();
+                    return Ok(OrchestratorResult { success: true, rounds: round, message: "user stopped after review".into() });
+                }
             }
-
-            costs.print_summary();
-            return Ok(OrchestratorResult {
-                success: true,
-                rounds: round,
-                message: "approved with all checks passing".to_string(),
-            });
-        }
-
-        last_verdict = Some(verdict.clone());
-
-        let prompt_msg = if verdict.verdict == Verdict::Approved && !checks::all_passed(&last_checks) {
-            format!("  {} AI approved, but checks failed. Let {} try to fix the checks? (y/n): ", "?".cyan().bold(), writer.name())
-        } else {
-            format!("  {} Let {} fix the issues? (y/n): ", "?".cyan().bold(), writer.name())
-        };
-
-        let answer = ask_user(&prompt_msg);
-
-        if answer != "y" && answer != "yes" {
-            println!("\n{}", "Stopping. Review feedback saved in logs.".yellow());
-
-            session_log.write_summary(
-                task,
-                writer.name(),
-                reviewer.name(),
-                round,
-                &verdict,
-                checks::all_passed(&last_checks),
-                false,
-            )?;
-
-            costs.print_summary();
-            return Ok(OrchestratorResult {
-                success: true,
-                rounds: round,
-                message: "user stopped after review".to_string(),
-            });
         }
     }
 
     let final_verdict = last_verdict.unwrap_or_else(|| policy::ReviewVerdict {
         verdict: Verdict::ChangesRequested,
-        blockers: vec!["no rounds completed".to_string()],
+        blockers: vec!["no rounds completed".into()],
         suggestions: vec![],
-        tests_to_add: vec![],
         raw: String::new(),
     });
 
-    session_log.write_summary(
-        task,
-        writer.name(),
-        reviewer.name(),
-        total_rounds,
-        &final_verdict,
-        checks::all_passed(&last_checks),
-        false,
-    )?;
-
+    setup.session_log.write_summary(task, writer.name(), reviewer.name(), config.policy.max_rounds, &final_verdict, last_checks_passed, false)?;
     costs.print_summary();
     Ok(OrchestratorResult {
         success: false,
-        rounds: total_rounds,
+        rounds: config.policy.max_rounds,
         message: format!("exhausted {} rounds without full approval", config.policy.max_rounds),
     })
 }
@@ -306,46 +326,16 @@ pub fn run_plan_flow(
     continue_session: bool,
     verbose: bool,
 ) -> Result<OrchestratorResult> {
-    println!(
-        "\n{} {}",
-        "Task:".cyan().bold(),
-        task
-    );
-    println!(
-        "{} writer={}, reviewer={}",
-        "Models:".cyan().bold(),
-        writer.name().green(),
-        reviewer.name().green()
-    );
+    println!("\n{} {}", "Task:".cyan().bold(), task);
+    println!("{} writer={}, reviewer={}", "Models:".cyan().bold(), writer.name().green(), reviewer.name().green());
     println!("{}\n", "Mode: plan".cyan().bold());
 
-    let impl_template = load_prompt_template(&config.prompts.implementation, prompts::DEFAULT_IMPLEMENT_TEMPLATE, repo_dir)?;
-    let review_template = load_prompt_template(&config.prompts.review, prompts::DEFAULT_REVIEW_TEMPLATE, repo_dir)?;
-    let fix_template = load_prompt_template(&config.prompts.fix, prompts::DEFAULT_FIX_TEMPLATE, repo_dir)?;
-
-    let session_log = SessionLog::create(repo_dir, task)?;
-    let mut repo_context = build_repo_context(repo_dir)?;
-    
-    if continue_session {
-        if let Some(last_session) = SessionLog::get_last_session(repo_dir)? {
-            let previous_context = SessionLog::read_session_context(&last_session)?;
-            if !previous_context.is_empty() {
-                println!("  {} Continuing from previous session", "ℹ".cyan());
-                repo_context = format!("{}\n\n{}", repo_context, previous_context);
-            }
-        }
-    }
-
+    let setup = setup_session(config, task, repo_dir, continue_session)?;
     let mut costs = CostTracker::new();
 
-    // ── Step 1: Claude creates a plan ──
+    // ── Planning phase ──
     println!("{}", "━━━ Planning ━━━".cyan().bold());
-    let plan_prompt = prompts::build_plan_prompt(
-        prompts::DEFAULT_PLAN_TEMPLATE,
-        task,
-        &repo_context,
-        "",
-    );
+    let plan_prompt = prompts::build_plan_prompt(prompts::DEFAULT_PLAN_TEMPLATE, task, &setup.repo_context, "");
 
     println!("  {} Asking {} to plan...", ">>".yellow(), writer.name());
     let (plan_response, plan_usage) = writer
@@ -356,9 +346,9 @@ pub fn run_plan_flow(
     if !writer.streams_output() {
         print_response(writer.name(), &plan_response, verbose);
     }
-    session_log.write_writer_response(0, &plan_response)?;
+    setup.session_log.write_writer_response(0, &plan_response)?;
 
-    // ── Step 2: Gemini reviews the plan ──
+    // ── Plan review ──
     let answer = ask_user(&format!(
         "  {} Review this plan with {}? (y/n): ",
         "?".cyan().bold(),
@@ -368,18 +358,10 @@ pub fn run_plan_flow(
     if answer != "y" && answer != "yes" {
         println!("\n{}", "Plan saved but not reviewed. Exiting.".yellow());
         costs.print_summary();
-        return Ok(OrchestratorResult {
-            success: false,
-            rounds: 0,
-            message: "plan created, user skipped review".to_string(),
-        });
+        return Ok(OrchestratorResult { success: false, rounds: 0, message: "plan created, user skipped review".into() });
     }
 
-    let plan_review_prompt = prompts::build_plan_review_prompt(
-        prompts::DEFAULT_PLAN_REVIEW_TEMPLATE,
-        task,
-        &plan_response,
-    );
+    let plan_review_prompt = prompts::build_plan_review_prompt(prompts::DEFAULT_PLAN_REVIEW_TEMPLATE, task, &plan_response);
 
     println!("  {} Asking {} to review plan...", ">>".yellow(), reviewer.name());
     let (plan_review, plan_review_usage) = reviewer
@@ -390,12 +372,12 @@ pub fn run_plan_flow(
     if !reviewer.streams_output() {
         print_response(reviewer.name(), &plan_review, verbose);
     }
-    session_log.write_reviewer_response(0, &plan_review)?;
+    setup.session_log.write_reviewer_response(0, &plan_review)?;
 
     let plan_verdict = policy::parse_verdict(&plan_review);
     print_verdict(&plan_verdict);
 
-    // ── Step 3: Ask user to execute ──
+    // ── Execute ──
     let answer = ask_user(&format!(
         "  {} Execute this task? (y/n): ",
         "?".cyan().bold(),
@@ -404,37 +386,18 @@ pub fn run_plan_flow(
     if answer != "y" && answer != "yes" {
         println!("\n{}", "Exiting without executing.".yellow());
         costs.print_summary();
-        return Ok(OrchestratorResult {
-            success: false,
-            rounds: 0,
-            message: "plan reviewed, user chose not to execute".to_string(),
-        });
+        return Ok(OrchestratorResult { success: false, rounds: 0, message: "plan reviewed, user chose not to execute".into() });
     }
 
-    // ── Step 4: Claude implements with the plan as context ──
-    let mut round = 0;
     let mut last_review_text = String::new();
 
-    loop {
-        round += 1;
-        if round > config.policy.max_rounds {
-            println!("\n{}", format!("Max rounds ({}) reached.", config.policy.max_rounds).red().bold());
-            costs.print_summary();
-            return Ok(OrchestratorResult {
-                success: false,
-                rounds: round - 1,
-                message: "max rounds exceeded".to_string(),
-            });
-        }
-
+    for round in 1..=config.policy.max_rounds {
         println!("\n{}", format!("━━━ Executing (round {}) ━━━", round).cyan().bold());
 
         let writer_prompt = if round == 1 {
-            prompts::build_implement_with_plan_prompt(
-                &impl_template, task, &repo_context, &plan_response,
-            )
+            prompts::build_implement_with_plan_prompt(&setup.impl_template, task, &setup.repo_context, &plan_response)
         } else {
-            prompts::build_fix_prompt(&fix_template, task, &last_review_text)
+            prompts::build_fix_prompt(&setup.fix_template, task, &last_review_text)
         };
 
         let diff_before = git::git_diff(repo_dir).unwrap_or_default();
@@ -448,118 +411,49 @@ pub fn run_plan_flow(
         if !writer.streams_output() {
             print_response(writer.name(), &writer_response, verbose);
         }
-        session_log.write_writer_response(round, &writer_response)?;
+        setup.session_log.write_writer_response(round, &writer_response)?;
 
-        let diff_after = git::git_diff(repo_dir)?;
-        let writer_changed_code = diff_after != diff_before;
-        let has_uncommitted_changes = !diff_after.trim().is_empty();
-
-        if writer_changed_code || has_uncommitted_changes {
-            session_log.write_diff(round, &diff_after)?;
-
-            let stat = git::git_diff_stat(repo_dir).unwrap_or_default();
-            if !stat.trim().is_empty() {
-                println!("  {} Changes:\n{}", "~~".blue(), indent(&stat, "     "));
+        match handle_writer_diff(writer.name(), reviewer.name(), repo_dir, &setup.session_log, round, &diff_before)? {
+            DiffOutcome::NoChanges => {
+                costs.print_summary();
+                return Ok(OrchestratorResult { success: true, rounds: round, message: "completed, no changes needed".into() });
             }
-
-            let answer = ask_user(&format!(
-                "  {} Review changes with {}? (y/n): ",
-                "?".cyan().bold(),
-                reviewer.name()
-            ));
-
-            if answer != "y" && answer != "yes" {
+            DiffOutcome::UserSkippedReview => {
                 println!("\n{}", "Task completed.".green().bold());
                 costs.print_summary();
-                return Ok(OrchestratorResult {
-                    success: true,
-                    rounds: round,
-                    message: "executed, user skipped review".to_string(),
-                });
+                return Ok(OrchestratorResult { success: true, rounds: round, message: "executed, user skipped review".into() });
             }
-        } else {
-            println!("  {} {} answered without making code changes", "ℹ".cyan(), writer.name());
-            costs.print_summary();
-            return Ok(OrchestratorResult {
-                success: true,
-                rounds: round,
-                message: "completed, no changes needed".to_string(),
-            });
-        }
+            DiffOutcome::ReadyForReview(diff) => {
+                let review = run_review(config, task, reviewer, repo_dir, &setup.session_log, &mut costs, round, &setup.review_template, &diff, verbose)?;
+                last_review_text = review.response.clone();
 
-        println!("  {} Running checks...", ">>".yellow());
-        let check_results = checks::run_checks(&config.checks, repo_dir);
-        session_log.write_checks(round, &check_results)?;
+                if review.verdict.verdict == Verdict::Approved && !review.checks_passed {
+                    println!("  {} AI approved, but checks failed.", "⚠".yellow());
+                }
 
-        for cr in &check_results {
-            let icon = if cr.passed { "PASS".green() } else { "FAIL".red() };
-            println!("  [{}] {}", icon, cr.name);
-        }
+                if review.verdict.verdict == Verdict::Approved && review.checks_passed {
+                    println!("\n{}", "Task completed. Approved!".green().bold());
+                    notify_approval(writer, &review.response, &mut costs);
+                    costs.print_summary();
+                    return Ok(OrchestratorResult { success: true, rounds: round, message: "approved".into() });
+                }
 
-        let checks_summary = checks::format_check_results(&check_results);
-
-        let review_prompt = prompts::build_review_prompt(
-            &review_template,
-            task,
-            &diff_after,
-            &checks_summary,
-        );
-
-        println!("  {} Calling {}...", ">>".yellow(), reviewer.name());
-        let (reviewer_response, reviewer_usage) = reviewer
-            .generate(&review_prompt, "", &[])
-            .with_context(|| format!("{} failed in round {}", reviewer.name(), round))?;
-        costs.add(reviewer_usage);
-
-        if !reviewer.streams_output() {
-            print_response(reviewer.name(), &reviewer_response, verbose);
-        }
-        session_log.write_reviewer_response(round, &reviewer_response)?;
-        last_review_text = reviewer_response.clone();
-
-        let verdict = policy::parse_verdict(&reviewer_response);
-        print_verdict(&verdict);
-
-        let checks_passed = checks::all_passed(&check_results);
-        if verdict.verdict == Verdict::Approved && !checks_passed {
-            println!("  {} AI approved, but checks failed.", "⚠".yellow());
-        }
-
-        if verdict.verdict == Verdict::Approved && checks_passed {
-            println!("\n{}", "Task completed. Approved!".green().bold());
-
-            println!("  {} Notifying {} of approval...", ">>".yellow(), writer.name());
-            let approval_prompt = format!("The reviewer has APPROVED your changes with the following feedback:\n\n{}\n\nNo further action is required. Please acknowledge.", reviewer_response);
-            if let Ok((_text, usage)) = writer.generate(&approval_prompt, "", &[]) {
-                costs.add(usage);
+                if !ask_fix_or_stop(&review.verdict, review.checks_passed, writer.name()) {
+                    println!("\n{}", "Stopping. Review feedback saved in logs.".yellow());
+                    costs.print_summary();
+                    return Ok(OrchestratorResult { success: true, rounds: round, message: "user stopped after review".into() });
+                }
             }
-
-            costs.print_summary();
-            return Ok(OrchestratorResult {
-                success: true,
-                rounds: round,
-                message: "approved".to_string(),
-            });
-        }
-
-        let prompt_msg = if verdict.verdict == Verdict::Approved && !checks_passed {
-            format!("  {} AI approved, but checks failed. Let {} try to fix the checks? (y/n): ", "?".cyan().bold(), writer.name())
-        } else {
-            format!("  {} Let {} fix the issues? (y/n): ", "?".cyan().bold(), writer.name())
-        };
-
-        let answer = ask_user(&prompt_msg);
-
-        if answer != "y" && answer != "yes" {
-            println!("\n{}", "Stopping. Review feedback saved in logs.".yellow());
-            costs.print_summary();
-            return Ok(OrchestratorResult {
-                success: true,
-                rounds: round,
-                message: "user stopped after review".to_string(),
-            });
         }
     }
+
+    println!("\n{}", format!("Max rounds ({}) reached.", config.policy.max_rounds).red().bold());
+    costs.print_summary();
+    Ok(OrchestratorResult {
+        success: false,
+        rounds: config.policy.max_rounds,
+        message: "max rounds exceeded".into(),
+    })
 }
 
 pub fn review_only(
@@ -574,20 +468,10 @@ pub fn review_only(
         anyhow::bail!("no uncommitted changes to review");
     }
 
-    let review_template = load_prompt_template(
-        &config.prompts.review,
-        prompts::DEFAULT_REVIEW_TEMPLATE,
-        repo_dir,
-    )?;
-
+    let review_template = load_prompt_template(&config.prompts.review, prompts::DEFAULT_REVIEW_TEMPLATE, repo_dir)?;
     let task_context = task.unwrap_or("Review the current uncommitted changes for bugs, edge cases, and best practices.");
 
-    let review_prompt = prompts::build_review_prompt(
-        &review_template,
-        task_context,
-        &diff,
-        "",
-    );
+    let review_prompt = prompts::build_review_prompt(&review_template, task_context, &diff, "");
 
     println!("Calling {}...", reviewer.name().green());
     let (response, usage) = reviewer.generate(&review_prompt, "", &[])?;
@@ -608,19 +492,13 @@ pub fn review_only(
     Ok(OrchestratorResult {
         success,
         rounds: 1,
-        message: if success {
-            "approved".to_string()
-        } else {
-            "changes requested by AI".to_string()
-        },
+        message: if success { "approved".into() } else { "changes requested by AI".into() },
     })
 }
 
-fn load_prompt_template(
-    path: &std::path::PathBuf,
-    default: &str,
-    repo_dir: &Path,
-) -> Result<String> {
+// ── Utility functions ──
+
+fn load_prompt_template(path: &std::path::PathBuf, default: &str, repo_dir: &Path) -> Result<String> {
     let full_path = repo_dir.join(path);
     if full_path.exists() {
         prompts::load_template(&full_path)
@@ -630,11 +508,10 @@ fn load_prompt_template(
 }
 
 fn build_repo_context(dir: &Path) -> Result<String> {
-    let branch = git::current_branch(dir).unwrap_or_else(|_| "unknown".to_string());
+    let branch = git::current_branch(dir).unwrap_or_else(|_| "unknown".into());
     let status = git::git_status(dir).unwrap_or_default();
 
     let mut context = format!("Branch: {}\n", branch);
-
     if !status.trim().is_empty() {
         context.push_str(&format!("Working tree status:\n{}\n", status));
     }
@@ -680,7 +557,6 @@ fn print_verdict(verdict: &policy::ReviewVerdict) {
             println!("    - {}", s.yellow());
         }
     }
-
 }
 
 fn print_response(model: &str, response: &str, verbose: bool) {
@@ -694,19 +570,17 @@ fn print_response(model: &str, response: &str, verbose: bool) {
     println!("  {}", format!("{}:", model).cyan().bold());
     println!("  {}", separator.dimmed());
 
-    // Use termimad to render markdown cleanly
     let mut skin = termimad::MadSkin::default();
     skin.set_headers_fg(termimad::crossterm::style::Color::Cyan);
     skin.bold.set_fg(termimad::crossterm::style::Color::Yellow);
     skin.italic.set_fg(termimad::crossterm::style::Color::Magenta);
-    
-    // Indent the markdown output so it aligns with the rest of the UI
-    let indented_response = trimmed.lines().map(|l| format!("  {}", l)).collect::<Vec<_>>().join("\n");
+
+    let indented: String = trimmed.lines().map(|l| format!("  {}", l)).collect::<Vec<_>>().join("\n");
 
     if verbose || trimmed.lines().count() <= 40 {
-        skin.print_text(&indented_response);
+        skin.print_text(&indented);
     } else {
-        let truncated = trimmed.lines().take(40).map(|l| format!("  {}", l)).collect::<Vec<_>>().join("\n");
+        let truncated: String = trimmed.lines().take(40).map(|l| format!("  {}", l)).collect::<Vec<_>>().join("\n");
         skin.print_text(&truncated);
         println!(
             "\n  {}",
@@ -720,9 +594,9 @@ fn print_response(model: &str, response: &str, verbose: bool) {
 fn ask_user(prompt: &str) -> String {
     use std::io::Write;
     eprint!("{}", prompt);
-    std::io::stderr().flush().unwrap_or(());
+    let _ = std::io::stderr().flush();
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap_or(0);
+    let _ = std::io::stdin().read_line(&mut input);
     input.trim().to_lowercase()
 }
 

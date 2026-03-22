@@ -12,9 +12,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 anyhow = "1"
-thiserror = "2"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
 colored = "3"
-chrono = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 termimad = "0.34.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
