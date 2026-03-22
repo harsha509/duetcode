@@ -1,4 +1,4 @@
-use crate::adapters::{ImageInput, ModelAdapter};
+use crate::adapters::{ImageInput, ModelAdapter, UsageStats};
 use crate::checks;
 use crate::config::Config;
 use crate::git;
@@ -13,6 +13,44 @@ pub struct OrchestratorResult {
     pub success: bool,
     pub rounds: usize,
     pub message: String,
+}
+
+struct CostTracker {
+    entries: Vec<UsageStats>,
+}
+
+impl CostTracker {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    fn add(&mut self, usage: UsageStats) {
+        print_usage(&usage);
+        self.entries.push(usage);
+    }
+
+    fn print_summary(&self) {
+        if self.entries.is_empty() {
+            return;
+        }
+
+        let total_input: u64 = self.entries.iter().map(|u| u.input_tokens).sum();
+        let total_output: u64 = self.entries.iter().map(|u| u.output_tokens).sum();
+        let total_cost: f64 = self.entries.iter().filter_map(|u| u.cost_usd).sum();
+        let has_cost = self.entries.iter().any(|u| u.cost_usd.is_some());
+
+        println!("\n{}", "━━━ Cost Summary ━━━".cyan().bold());
+        println!(
+            "  {} calls | {}in + {}out = {} tokens",
+            self.entries.len(),
+            total_input,
+            total_output,
+            total_input + total_output,
+        );
+        if has_cost {
+            println!("  Total cost: {}", format!("${:.6}", total_cost).yellow().bold());
+        }
+    }
 }
 
 pub fn run(
@@ -68,6 +106,7 @@ pub fn run(
     let mut last_verdict = None;
     let mut last_checks = Vec::new();
     let mut total_rounds = 0;
+    let mut costs = CostTracker::new();
 
     for round in 1..=config.policy.max_rounds {
         total_rounds = round;
@@ -91,9 +130,10 @@ pub fn run(
         let diff_before = git::git_diff(repo_dir).unwrap_or_default();
 
         println!("  {} Calling {}...", ">>".yellow(), writer.name());
-        let writer_response = writer
+        let (writer_response, writer_usage) = writer
             .generate(&writer_prompt, "", images)
             .with_context(|| format!("writer ({}) failed in round {}", writer.name(), round))?;
+        costs.add(writer_usage);
 
         session_log.write_writer_response(round, &writer_response)?;
         if !writer.streams_output() {
@@ -120,6 +160,7 @@ pub fn run(
 
             if answer != "y" && answer != "yes" {
                 println!("\n{}", "Task completed.".green().bold());
+                costs.print_summary();
                 return Ok(OrchestratorResult {
                     success: true,
                     rounds: round,
@@ -128,8 +169,7 @@ pub fn run(
             }
         } else {
             println!("  {} {} answered without making code changes", "ℹ".cyan(), writer.name());
-            
-            // If there are no uncommitted changes and Claude didn't make any, we exit.
+            costs.print_summary();
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
@@ -156,9 +196,10 @@ pub fn run(
         );
 
         println!("  {} Calling {}...", ">>".yellow(), reviewer.name());
-        let reviewer_response = reviewer
+        let (reviewer_response, reviewer_usage) = reviewer
             .generate(&review_prompt, "", &[])
             .with_context(|| format!("reviewer ({}) failed in round {}", reviewer.name(), round))?;
+        costs.add(reviewer_usage);
 
         session_log.write_reviewer_response(round, &reviewer_response)?;
         if !reviewer.streams_output() {
@@ -183,11 +224,13 @@ pub fn run(
                 true,
             )?;
 
-            // Pass the approval back to Claude so it knows the task is complete
             println!("  {} Notifying {} of approval...", ">>".yellow(), writer.name());
             let approval_prompt = format!("The reviewer has APPROVED your changes with the following feedback:\n\n{}\n\nNo further action is required. Please acknowledge.", reviewer_response);
-            let _ = writer.generate(&approval_prompt, "", &[]);
+            if let Ok((_text, usage)) = writer.generate(&approval_prompt, "", &[]) {
+                costs.add(usage);
+            }
 
+            costs.print_summary();
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
@@ -218,6 +261,7 @@ pub fn run(
                 false,
             )?;
 
+            costs.print_summary();
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
@@ -244,6 +288,7 @@ pub fn run(
         false,
     )?;
 
+    costs.print_summary();
     Ok(OrchestratorResult {
         success: false,
         rounds: total_rounds,
@@ -291,6 +336,8 @@ pub fn run_plan_flow(
         }
     }
 
+    let mut costs = CostTracker::new();
+
     // ── Step 1: Claude creates a plan ──
     println!("{}", "━━━ Planning ━━━".cyan().bold());
     let plan_prompt = prompts::build_plan_prompt(
@@ -301,9 +348,10 @@ pub fn run_plan_flow(
     );
 
     println!("  {} Asking {} to plan...", ">>".yellow(), writer.name());
-    let plan_response = writer
+    let (plan_response, plan_usage) = writer
         .generate(&plan_prompt, "", images)
         .with_context(|| format!("{} failed during planning", writer.name()))?;
+    costs.add(plan_usage);
 
     if !writer.streams_output() {
         print_response(writer.name(), &plan_response, verbose);
@@ -319,6 +367,7 @@ pub fn run_plan_flow(
 
     if answer != "y" && answer != "yes" {
         println!("\n{}", "Plan saved but not reviewed. Exiting.".yellow());
+        costs.print_summary();
         return Ok(OrchestratorResult {
             success: false,
             rounds: 0,
@@ -333,9 +382,10 @@ pub fn run_plan_flow(
     );
 
     println!("  {} Asking {} to review plan...", ">>".yellow(), reviewer.name());
-    let plan_review = reviewer
+    let (plan_review, plan_review_usage) = reviewer
         .generate(&plan_review_prompt, "", &[])
         .with_context(|| format!("{} failed during plan review", reviewer.name()))?;
+    costs.add(plan_review_usage);
 
     if !reviewer.streams_output() {
         print_response(reviewer.name(), &plan_review, verbose);
@@ -353,6 +403,7 @@ pub fn run_plan_flow(
 
     if answer != "y" && answer != "yes" {
         println!("\n{}", "Exiting without executing.".yellow());
+        costs.print_summary();
         return Ok(OrchestratorResult {
             success: false,
             rounds: 0,
@@ -368,6 +419,7 @@ pub fn run_plan_flow(
         round += 1;
         if round > config.policy.max_rounds {
             println!("\n{}", format!("Max rounds ({}) reached.", config.policy.max_rounds).red().bold());
+            costs.print_summary();
             return Ok(OrchestratorResult {
                 success: false,
                 rounds: round - 1,
@@ -388,9 +440,10 @@ pub fn run_plan_flow(
         let diff_before = git::git_diff(repo_dir).unwrap_or_default();
 
         println!("  {} Calling {}...", ">>".yellow(), writer.name());
-        let writer_response = writer
+        let (writer_response, writer_usage) = writer
             .generate(&writer_prompt, "", if round == 1 { images } else { &[] })
             .with_context(|| format!("{} failed in round {}", writer.name(), round))?;
+        costs.add(writer_usage);
 
         if !writer.streams_output() {
             print_response(writer.name(), &writer_response, verbose);
@@ -409,7 +462,6 @@ pub fn run_plan_flow(
                 println!("  {} Changes:\n{}", "~~".blue(), indent(&stat, "     "));
             }
 
-            // ── Step 5: Ask user if they want to review ──
             let answer = ask_user(&format!(
                 "  {} Review changes with {}? (y/n): ",
                 "?".cyan().bold(),
@@ -418,6 +470,7 @@ pub fn run_plan_flow(
 
             if answer != "y" && answer != "yes" {
                 println!("\n{}", "Task completed.".green().bold());
+                costs.print_summary();
                 return Ok(OrchestratorResult {
                     success: true,
                     rounds: round,
@@ -426,8 +479,7 @@ pub fn run_plan_flow(
             }
         } else {
             println!("  {} {} answered without making code changes", "ℹ".cyan(), writer.name());
-            
-            // If there are no uncommitted changes and Claude didn't make any, we exit.
+            costs.print_summary();
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
@@ -435,7 +487,6 @@ pub fn run_plan_flow(
             });
         }
 
-        // Run checks
         println!("  {} Running checks...", ">>".yellow());
         let check_results = checks::run_checks(&config.checks, repo_dir);
         session_log.write_checks(round, &check_results)?;
@@ -447,7 +498,6 @@ pub fn run_plan_flow(
 
         let checks_summary = checks::format_check_results(&check_results);
 
-        // Gemini reviews
         let review_prompt = prompts::build_review_prompt(
             &review_template,
             task,
@@ -456,9 +506,10 @@ pub fn run_plan_flow(
         );
 
         println!("  {} Calling {}...", ">>".yellow(), reviewer.name());
-        let reviewer_response = reviewer
+        let (reviewer_response, reviewer_usage) = reviewer
             .generate(&review_prompt, "", &[])
             .with_context(|| format!("{} failed in round {}", reviewer.name(), round))?;
+        costs.add(reviewer_usage);
 
         if !reviewer.streams_output() {
             print_response(reviewer.name(), &reviewer_response, verbose);
@@ -476,12 +527,14 @@ pub fn run_plan_flow(
 
         if verdict.verdict == Verdict::Approved && checks_passed {
             println!("\n{}", "Task completed. Approved!".green().bold());
-            
-            // Pass the approval back to Claude so it knows the task is complete
+
             println!("  {} Notifying {} of approval...", ">>".yellow(), writer.name());
             let approval_prompt = format!("The reviewer has APPROVED your changes with the following feedback:\n\n{}\n\nNo further action is required. Please acknowledge.", reviewer_response);
-            let _ = writer.generate(&approval_prompt, "", &[]);
+            if let Ok((_text, usage)) = writer.generate(&approval_prompt, "", &[]) {
+                costs.add(usage);
+            }
 
+            costs.print_summary();
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
@@ -489,7 +542,6 @@ pub fn run_plan_flow(
             });
         }
 
-        // If approved but checks failed, or if changes requested, ask user
         let prompt_msg = if verdict.verdict == Verdict::Approved && !checks_passed {
             format!("  {} AI approved, but checks failed. Let {} try to fix the checks? (y/n): ", "?".cyan().bold(), writer.name())
         } else {
@@ -500,6 +552,7 @@ pub fn run_plan_flow(
 
         if answer != "y" && answer != "yes" {
             println!("\n{}", "Stopping. Review feedback saved in logs.".yellow());
+            costs.print_summary();
             return Ok(OrchestratorResult {
                 success: true,
                 rounds: round,
@@ -537,7 +590,8 @@ pub fn review_only(
     );
 
     println!("Calling {}...", reviewer.name().green());
-    let response = reviewer.generate(&review_prompt, "", &[])?;
+    let (response, usage) = reviewer.generate(&review_prompt, "", &[])?;
+    print_usage(&usage);
 
     if !reviewer.streams_output() {
         print_response(reviewer.name(), &response, verbose);
@@ -547,6 +601,9 @@ pub fn review_only(
     print_verdict(&verdict);
 
     let success = verdict.verdict == Verdict::Approved;
+
+    println!("\n{}", "━━━ Cost Summary ━━━".cyan().bold());
+    println!("  {} | {}", usage.model, usage);
 
     Ok(OrchestratorResult {
         success,
@@ -583,6 +640,24 @@ fn build_repo_context(dir: &Path) -> Result<String> {
     }
 
     Ok(context)
+}
+
+fn print_usage(usage: &UsageStats) {
+    if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        return;
+    }
+    let cost_str = match usage.cost_usd {
+        Some(c) => format!(" | ${:.6}", c),
+        None => String::new(),
+    };
+    eprintln!(
+        "  {} {} — {}in / {}out{}",
+        "$".yellow(),
+        usage.model,
+        usage.input_tokens,
+        usage.output_tokens,
+        cost_str,
+    );
 }
 
 fn print_verdict(verdict: &policy::ReviewVerdict) {

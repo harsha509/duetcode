@@ -1,4 +1,5 @@
-use super::{ImageInput, ModelAdapter};
+use super::{ImageInput, ModelAdapter, UsageStats};
+use super::pricing;
 use crate::config::ClaudeConfig;
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -143,7 +144,7 @@ impl ClaudeAdapter {
 
     // ── API mode (direct Anthropic REST API with SSE streaming) ──
 
-    fn run_api(&self, prompt: &str, context: &str, images: &[ImageInput]) -> Result<String> {
+    fn run_api(&self, prompt: &str, context: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
         let api_key = self.api_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!(
                 "{} not set — export it or add to your shell profile",
@@ -220,12 +221,15 @@ impl ClaudeAdapter {
         self.parse_sse_stream(response)
     }
 
-    fn parse_sse_stream(&self, response: reqwest::blocking::Response) -> Result<String> {
+    fn parse_sse_stream(&self, response: reqwest::blocking::Response) -> Result<(String, UsageStats)> {
         let reader = BufReader::new(response);
         let mut collected = String::new();
         let mut header_printed = false;
         let separator = "─".repeat(60);
         let start = std::time::Instant::now();
+        let mut input_tokens: u64 = 0;
+        let mut output_tokens: u64 = 0;
+        let mut model_name = self.config.api_model.clone();
 
         for line in reader.lines() {
             let line = match line {
@@ -270,6 +274,10 @@ impl ClaudeAdapter {
                 }
                 "message_start" => {
                     let model = event.pointer("/message/model").and_then(|v| v.as_str()).unwrap_or("?");
+                    model_name = model.to_string();
+                    if let Some(it) = event.pointer("/message/usage/input_tokens").and_then(|v| v.as_u64()) {
+                        input_tokens = it;
+                    }
                     eprintln!("  {} streaming from {}", "●".green(), model);
                     eprintln!("  {} thinking...", "◌".cyan());
                 }
@@ -280,6 +288,9 @@ impl ClaudeAdapter {
                     }
                 }
                 "message_delta" => {
+                    if let Some(ot) = event.pointer("/usage/output_tokens").and_then(|v| v.as_u64()) {
+                        output_tokens = ot;
+                    }
                     if let Some(reason) = event.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
                         let elapsed = start.elapsed().as_secs_f64();
                         eprintln!("  {} finished ({:.1}s, reason: {})", "●".green(), elapsed, reason);
@@ -301,12 +312,20 @@ impl ClaudeAdapter {
         }
         eprintln!("  {}", separator.dimmed());
 
-        Ok(collected)
+        let cost_usd = pricing::compute_cost(&model_name, input_tokens, output_tokens);
+        let usage = UsageStats {
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            model: model_name,
+        };
+
+        Ok((collected, usage))
     }
 
     // ── CLI mode (spawn claude command) ──
 
-    fn run_cli(&self, prompt: &str, context: &str, images: &[ImageInput]) -> Result<String> {
+    fn run_cli(&self, prompt: &str, context: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
         let full_prompt = if context.is_empty() {
             prompt.to_string()
         } else {
@@ -320,7 +339,7 @@ impl ClaudeAdapter {
         }
     }
 
-    fn run_cli_simple(&self, full_prompt: &str) -> Result<String> {
+    fn run_cli_simple(&self, full_prompt: &str) -> Result<(String, UsageStats)> {
         let mut cmd = Command::new(&self.config.command);
         cmd.arg("-p")
             .arg(full_prompt)
@@ -329,7 +348,7 @@ impl ClaudeAdapter {
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
-            .arg("--dangerously-skip-permissions") // Always skip permissions to allow auto-editing
+            .arg("--dangerously-skip-permissions")
             .current_dir(&self.working_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -343,7 +362,7 @@ impl ClaudeAdapter {
             .spawn()
             .with_context(|| format!("failed to execute '{}'", self.config.command))?;
 
-        let stdout = self.stream_cli_json(&mut child)?;
+        let (stdout, usage) = self.stream_cli_json(&mut child)?;
         let status = child.wait().context("failed to wait for claude")?;
         let stderr = self.collect_stderr(&mut child);
 
@@ -362,10 +381,10 @@ impl ClaudeAdapter {
             anyhow::bail!("claude CLI exited with {}: {}", status, details);
         }
 
-        Ok(stdout)
+        Ok((stdout, usage))
     }
 
-    fn run_cli_with_images(&self, full_prompt: &str, images: &[ImageInput]) -> Result<String> {
+    fn run_cli_with_images(&self, full_prompt: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
         let mut content_parts = vec![serde_json::json!({
             "type": "text",
             "text": full_prompt
@@ -414,7 +433,7 @@ impl ClaudeAdapter {
         }
         drop(child.stdin.take());
 
-        let stdout = self.stream_cli_json(&mut child)?;
+        let (stdout, usage) = self.stream_cli_json(&mut child)?;
         let status = child.wait().context("failed to wait for claude")?;
         let stderr = self.collect_stderr(&mut child);
 
@@ -429,7 +448,7 @@ impl ClaudeAdapter {
             anyhow::bail!("claude CLI exited with {}: {}", status, details);
         }
 
-        Ok(stdout)
+        Ok((stdout, usage))
     }
 
     fn describe_tool_action(tool: &str, input: Option<&serde_json::Value>) -> String {
@@ -503,7 +522,7 @@ impl ClaudeAdapter {
         }
     }
 
-    fn stream_cli_json(&self, child: &mut std::process::Child) -> Result<String> {
+    fn stream_cli_json(&self, child: &mut std::process::Child) -> Result<(String, UsageStats)> {
         let stdout_pipe = child.stdout.take().context("failed to capture claude stdout")?;
         let reader = BufReader::new(stdout_pipe);
         let mut full_result = String::new();
@@ -511,6 +530,10 @@ impl ClaudeAdapter {
         let mut streaming_text = false;
         let separator = "─".repeat(60);
         let start = std::time::Instant::now();
+        let mut cost_usd: Option<f64> = None;
+        let mut model_name = self.config.model.clone();
+        let mut input_tokens: u64 = 0;
+        let mut output_tokens: u64 = 0;
 
         for line in reader.lines() {
             let line = match line {
@@ -535,6 +558,7 @@ impl ClaudeAdapter {
             match (event_type, subtype) {
                 ("system", "init") => {
                     let model = event.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    model_name = model.to_string();
                     eprintln!("  {} connected (model: {})", "●".green(), model);
                     eprintln!("  {} thinking...", "◌".cyan());
                 }
@@ -590,8 +614,18 @@ impl ClaudeAdapter {
                         full_result = result.to_string();
                     }
                     if let Some(cost) = event.get("cost_usd").and_then(|v| v.as_f64()) {
+                        cost_usd = Some(cost);
                         let duration = event.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                         eprintln!("  {} done ({:.1}s, ${:.4})", "●".green(), duration as f64 / 1000.0, cost);
+                    }
+                    if let Some(it) = event.get("input_tokens").and_then(|v| v.as_u64()) {
+                        input_tokens = it;
+                    }
+                    if let Some(ot) = event.get("output_tokens").and_then(|v| v.as_u64()) {
+                        output_tokens = ot;
+                    }
+                    if let Some(m) = event.get("model").and_then(|v| v.as_str()) {
+                        model_name = m.to_string();
                     }
                 }
                 ("system", "task_started") => {}
@@ -648,13 +682,26 @@ impl ClaudeAdapter {
         if streaming_text { eprintln!(); }
         eprintln!("  {}", separator.dimmed());
 
-        if !full_result.is_empty() {
-            Ok(full_result)
-        } else if !delta_text.is_empty() {
-            Ok(delta_text)
-        } else {
-            Ok(String::new())
+        if cost_usd.is_none() && (input_tokens > 0 || output_tokens > 0) {
+            cost_usd = pricing::compute_cost(&model_name, input_tokens, output_tokens);
         }
+
+        let usage = UsageStats {
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            model: model_name,
+        };
+
+        let text = if !full_result.is_empty() {
+            full_result
+        } else if !delta_text.is_empty() {
+            delta_text
+        } else {
+            String::new()
+        };
+
+        Ok((text, usage))
     }
 
     fn collect_stderr(&self, child: &mut std::process::Child) -> String {
@@ -668,13 +715,13 @@ impl ClaudeAdapter {
 }
 
 impl ModelAdapter for ClaudeAdapter {
-    fn generate(&self, prompt: &str, context: &str, images: &[ImageInput]) -> Result<String> {
+    fn generate(&self, prompt: &str, context: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
         if self.use_api {
             self.run_api(prompt, context, images)
         } else {
             let result = self.run_cli(prompt, context, images);
             match result {
-                Ok(text) => Ok(text),
+                Ok(r) => Ok(r),
                 Err(e) if self.api_key.is_some() && self.config.mode == "auto" => {
                     eprintln!("  {} CLI failed ({}), falling back to API...", "↻".yellow(), e);
                     self.run_api(prompt, context, images)

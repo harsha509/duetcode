@@ -1,8 +1,34 @@
 pub mod claude;
 pub mod gemini;
+pub mod pricing;
 
 use anyhow::Result;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageStats {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub model: String,
+}
+
+impl UsageStats {
+    #[allow(dead_code)]
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
+impl std::fmt::Display for UsageStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tokens: {}in / {}out", self.input_tokens, self.output_tokens)?;
+        if let Some(cost) = self.cost_usd {
+            write!(f, " | cost: ${:.6}", cost)?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ImageInput {
@@ -56,7 +82,7 @@ pub trait ModelAdapter {
         prompt: &str,
         context: &str,
         images: &[ImageInput],
-    ) -> Result<String>;
+    ) -> Result<(String, UsageStats)>;
 
     fn name(&self) -> &str;
 
