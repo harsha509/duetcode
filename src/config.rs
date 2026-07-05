@@ -4,23 +4,29 @@ use std::path::{Path, PathBuf};
 
 const CONFIG_FILENAME: &str = ".duet/config.toml";
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
+    #[serde(default)]
     pub claude: ClaudeConfig,
+    #[serde(default)]
     pub gemini: GeminiConfig,
+    #[serde(default)]
     pub checks: ChecksConfig,
+    #[serde(default)]
     pub policy: PolicyConfig,
+    #[serde(default)]
     pub prompts: PromptsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClaudeConfig {
+    #[serde(default = "default_claude_command")]
     pub command: String,
-    #[serde(default = "default_claude_args")]
-    pub args: Vec<String>,
     #[serde(default = "default_claude_model")]
     pub model: String,
-    #[serde(default)]
+    /// Pass --dangerously-skip-permissions so the writer can edit files
+    /// without interactive prompts. Disable to run with normal permissions.
+    #[serde(default = "default_true")]
     pub skip_permissions: bool,
     /// "cli", "api", or "auto" (try CLI, fall back to API)
     #[serde(default = "default_claude_mode")]
@@ -57,8 +63,9 @@ pub struct ChecksConfig {
 pub struct PolicyConfig {
     #[serde(default = "default_max_rounds")]
     pub max_rounds: usize,
-    #[serde(default = "default_true")]
-    pub require_both_approvals: bool,
+    /// Run the write→review loop without per-round confirmation prompts.
+    #[serde(default)]
+    pub auto: bool,
     #[serde(default = "default_true")]
     pub allow_dirty_worktree: bool,
 }
@@ -73,7 +80,7 @@ pub struct PromptsConfig {
     pub fix: PathBuf,
 }
 
-fn default_claude_args() -> Vec<String> { vec!["-p".into()] }
+fn default_claude_command() -> String { "claude".into() }
 fn default_claude_model() -> String { "sonnet".into() }
 fn default_claude_mode() -> String { "auto".into() }
 fn default_claude_api_key_env() -> String { "ANTHROPIC_API_KEY".into() }
@@ -90,10 +97,9 @@ fn default_fix_prompt() -> PathBuf { PathBuf::from(".duet/prompts/fix.txt") }
 impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
-            command: "claude".into(),
-            args: default_claude_args(),
+            command: default_claude_command(),
             model: default_claude_model(),
-            skip_permissions: false,
+            skip_permissions: true,
             mode: default_claude_mode(),
             api_key_env: default_claude_api_key_env(),
             api_model: default_claude_api_model(),
@@ -116,7 +122,7 @@ impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             max_rounds: default_max_rounds(),
-            require_both_approvals: true,
+            auto: false,
             allow_dirty_worktree: true,
         }
     }
@@ -128,18 +134,6 @@ impl Default for PromptsConfig {
             implementation: default_implement_prompt(),
             review: default_review_prompt(),
             fix: default_fix_prompt(),
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            claude: ClaudeConfig::default(),
-            gemini: GeminiConfig::default(),
-            checks: ChecksConfig::default(),
-            policy: PolicyConfig::default(),
-            prompts: PromptsConfig::default(),
         }
     }
 }

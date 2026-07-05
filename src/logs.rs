@@ -8,6 +8,16 @@ pub struct SessionLog {
     pub dir: PathBuf,
 }
 
+pub struct RunSummary<'a> {
+    pub task: &'a str,
+    pub writer: &'a str,
+    pub reviewer: &'a str,
+    pub rounds: usize,
+    pub verdict: &'a ReviewVerdict,
+    pub checks_passed: bool,
+    pub success: bool,
+}
+
 impl SessionLog {
     pub fn create(base_dir: &Path, task: &str) -> Result<Self> {
         let timestamp = Local::now().format("%Y%m%d-%H%M%S");
@@ -56,26 +66,23 @@ impl SessionLog {
             .with_context(|| format!("failed to write {}", path.display()))
     }
 
-    pub fn write_summary(
-        &self,
-        task: &str,
-        writer: &str,
-        reviewer: &str,
-        rounds: usize,
-        verdict: &ReviewVerdict,
-        checks_passed: bool,
-        success: bool,
-    ) -> Result<()> {
+    pub fn write_clarification(&self, round: usize, text: &str) -> Result<()> {
+        let path = self.round_dir(round)?.join("clarification.md");
+        std::fs::write(&path, text)
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    pub fn write_summary(&self, summary: &RunSummary) -> Result<()> {
         let summary = serde_json::json!({
-            "task": task,
-            "writer": writer,
-            "reviewer": reviewer,
-            "total_rounds": rounds,
-            "final_verdict": format!("{:?}", verdict.verdict),
-            "blockers": verdict.blockers,
-            "suggestions": verdict.suggestions,
-            "checks_passed": checks_passed,
-            "success": success,
+            "task": summary.task,
+            "writer": summary.writer,
+            "reviewer": summary.reviewer,
+            "total_rounds": summary.rounds,
+            "final_verdict": format!("{:?}", summary.verdict.verdict),
+            "blockers": summary.verdict.blockers,
+            "suggestions": summary.verdict.suggestions,
+            "checks_passed": summary.checks_passed,
+            "success": summary.success,
             "timestamp": Local::now().to_rfc3339(),
         });
 
@@ -165,4 +172,27 @@ fn slugify(text: &str) -> String {
         .take(6)
         .collect::<Vec<_>>()
         .join("-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slugify;
+
+    #[test]
+    fn slugify_lowercases_and_dashes() {
+        assert_eq!(slugify("Add OAuth Login!"), "add-oauth-login");
+    }
+
+    #[test]
+    fn slugify_caps_at_six_words() {
+        assert_eq!(
+            slugify("one two three four five six seven eight"),
+            "one-two-three-four-five-six"
+        );
+    }
+
+    #[test]
+    fn slugify_collapses_symbol_runs() {
+        assert_eq!(slugify("fix -- the ***bug***"), "fix-the-bug");
+    }
 }

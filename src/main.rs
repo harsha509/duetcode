@@ -7,6 +7,8 @@ mod logs;
 mod orchestrator;
 mod policy;
 mod prompts;
+mod repl;
+mod ui;
 
 fn main() {
     if let Err(e) = cli::run() {

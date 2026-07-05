@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Approved,
@@ -9,7 +11,6 @@ pub struct ReviewVerdict {
     pub verdict: Verdict,
     pub blockers: Vec<String>,
     pub suggestions: Vec<String>,
-    pub raw: String,
 }
 
 pub fn parse_verdict(raw: &str) -> ReviewVerdict {
@@ -19,8 +20,40 @@ pub fn parse_verdict(raw: &str) -> ReviewVerdict {
         verdict: parse_verdict_line(&lines),
         blockers: parse_list_section(&lines, "BLOCKERS:"),
         suggestions: parse_list_section(&lines, "SUGGESTIONS:"),
-        raw: raw.to_string(),
     }
+}
+
+/// Word-level Jaccard similarity between two blocker lists. Used to detect
+/// a stalled loop: the reviewer keeps raising essentially the same issues.
+pub fn blockers_similar(a: &[String], b: &[String]) -> bool {
+    if a.is_empty() && b.is_empty() {
+        return true;
+    }
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+
+    let wa = word_set(a);
+    let wb = word_set(b);
+    let intersection = wa.intersection(&wb).count();
+    let union = wa.union(&wb).count();
+
+    union > 0 && (intersection as f64 / union as f64) >= 0.5
+}
+
+fn word_set(items: &[String]) -> HashSet<String> {
+    items
+        .iter()
+        .flat_map(|s| {
+            s.to_lowercase()
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+                .collect::<String>()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn parse_verdict_line(lines: &[&str]) -> Verdict {
@@ -82,6 +115,50 @@ fn parse_list_section(lines: &[&str], header: &str) -> Vec<String> {
     items
 }
 
-pub fn format_review_feedback(verdict: &ReviewVerdict) -> String {
-    verdict.raw.clone()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_explicit_approved_verdict() {
+        let v = parse_verdict("Looks good.\n\nVERDICT: APPROVED");
+        assert_eq!(v.verdict, Verdict::Approved);
+        assert!(v.blockers.is_empty());
+    }
+
+    #[test]
+    fn parses_changes_requested_with_blockers() {
+        let review = "BLOCKERS:\n- missing null check in foo()\n- test coverage absent\n\nVERDICT: CHANGES_REQUESTED";
+        let v = parse_verdict(review);
+        assert_eq!(v.verdict, Verdict::ChangesRequested);
+        assert_eq!(v.blockers.len(), 2);
+    }
+
+    #[test]
+    fn defaults_to_changes_requested_when_no_verdict() {
+        let v = parse_verdict("I am not sure about this diff.");
+        assert_eq!(v.verdict, Verdict::ChangesRequested);
+    }
+
+    #[test]
+    fn similar_blockers_detected_despite_rewording() {
+        let a = vec!["missing null check in foo() function".to_string()];
+        let b = vec!["the foo() function is missing a null check".to_string()];
+        assert!(blockers_similar(&a, &b));
+    }
+
+    #[test]
+    fn different_blockers_not_similar() {
+        let a = vec!["missing null check in foo()".to_string()];
+        let b = vec!["SQL injection in the login handler".to_string()];
+        assert!(!blockers_similar(&a, &b));
+    }
+
+    #[test]
+    fn empty_vs_nonempty_not_similar() {
+        let a: Vec<String> = vec![];
+        let b = vec!["anything".to_string()];
+        assert!(!blockers_similar(&a, &b));
+        assert!(blockers_similar(&a, &[]));
+    }
 }

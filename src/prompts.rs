@@ -26,10 +26,21 @@ pub fn build_implement_prompt(template: &str, task: &str, context: &str, previou
     render(template, &[("task", task), ("context", &context_with_session(context, previous_session))])
 }
 
-pub fn build_review_prompt(template: &str, task: &str, diff: &str, checks: &str) -> String {
+pub fn build_review_prompt(
+    template: &str,
+    task: &str,
+    diff: &str,
+    checks: &str,
+    writer_notes: &str,
+) -> String {
     render(
         template,
-        &[("task", task), ("diff", diff), ("checks", checks)],
+        &[
+            ("task", task),
+            ("diff", diff),
+            ("checks", checks),
+            ("writer_notes", writer_notes),
+        ],
     )
 }
 
@@ -73,6 +84,9 @@ After completing the task, briefly explain what you did and why.
 pub const DEFAULT_REVIEW_TEMPLATE: &str = r#"You are a senior code reviewer. You are reviewing uncommitted changes in a codebase.
 
 TASK: {task}
+
+WRITER'S NOTES (what the author says they did and why):
+{writer_notes}
 
 DIFF:
 {diff}
@@ -155,3 +169,27 @@ At the end, write one of these on its own line:
 VERDICT: APPROVED
 VERDICT: CHANGES_REQUESTED
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_replaces_all_placeholders() {
+        let out = render("do {task} in {context}", &[("task", "X"), ("context", "Y")]);
+        assert_eq!(out, "do X in Y");
+    }
+
+    #[test]
+    fn render_leaves_unknown_placeholders_untouched() {
+        let out = render("do {task} with {unknown}", &[("task", "X")]);
+        assert_eq!(out, "do X with {unknown}");
+    }
+
+    #[test]
+    fn review_prompt_includes_writer_notes() {
+        let out = build_review_prompt(DEFAULT_REVIEW_TEMPLATE, "t", "d", "c", "my notes");
+        assert!(out.contains("my notes"));
+        assert!(!out.contains("{writer_notes}"));
+    }
+}

@@ -1,13 +1,15 @@
 use crate::adapters::claude::ClaudeAdapter;
 use crate::adapters::gemini::GeminiAdapter;
-use crate::adapters::ImageInput;
+use crate::adapters::{ImageInput, ModelAdapter};
 use crate::config::Config;
 use crate::git;
-use crate::orchestrator;
+use crate::orchestrator::{self, TaskOptions};
+use crate::repl;
+use crate::ui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -34,6 +36,10 @@ pub struct Cli {
     /// Plan mode: plan first, you approve each step before execution
     #[arg(long)]
     pub plan: bool,
+
+    /// Auto mode: loop write→review without prompts until both models approve
+    #[arg(long, short = 'a')]
+    pub auto: bool,
 
     /// Continue from the previous session's context
     #[arg(long, short = 'c')]
@@ -68,6 +74,10 @@ pub enum Commands {
         #[arg(long = "image")]
         images: Vec<PathBuf>,
 
+        /// Auto mode: loop write→review without prompts until both models approve
+        #[arg(long, short = 'a')]
+        auto: bool,
+
         /// Continue from the previous session's context
         #[arg(long, short = 'c')]
         continue_session: bool,
@@ -89,6 +99,10 @@ pub enum Commands {
         /// Path(s) to screenshot/image files to include as context
         #[arg(long = "image")]
         images: Vec<PathBuf>,
+
+        /// Auto mode for the execution phase after the plan is approved
+        #[arg(long, short = 'a')]
+        auto: bool,
 
         /// Continue from the previous session's context
         #[arg(long, short = 'c')]
@@ -118,44 +132,81 @@ pub enum Commands {
     Clear,
 }
 
+/// Everything cmd_task needs, collected from whichever CLI form was used.
+struct TaskArgs {
+    task: String,
+    writer: String,
+    images: Vec<PathBuf>,
+    continue_session: bool,
+    verbose: bool,
+    auto: bool,
+    plan_first: bool,
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let verbose = cli.verbose;
 
     match cli.command {
         Some(Commands::Init) => cmd_init(&cwd),
-        Some(Commands::Doctor { verbose: v }) => cmd_doctor(&cwd, verbose || v),
-        Some(Commands::Run {
-            task,
-            writer,
-            images,
-            continue_session,
-            verbose: v,
-        }) => cmd_run(&cwd, &task, &writer, &images, continue_session, verbose || v),
-        Some(Commands::Plan {
-            task,
-            writer,
-            images,
-            continue_session,
-            verbose: v,
-        }) => cmd_plan(&cwd, &task, &writer, &images, continue_session, verbose || v),
-        Some(Commands::Review { reviewer, task, verbose: v }) => cmd_review(&cwd, &reviewer, task.as_deref(), verbose || v),
+        Some(Commands::Doctor { verbose: v }) => cmd_doctor(&cwd, cli.verbose || v),
+        Some(Commands::Run { task, writer, images, auto, continue_session, verbose: v }) => {
+            cmd_task(&cwd, TaskArgs {
+                task,
+                writer,
+                images,
+                continue_session,
+                verbose: cli.verbose || v,
+                auto: cli.auto || auto,
+                plan_first: false,
+            })
+        }
+        Some(Commands::Plan { task, writer, images, auto, continue_session, verbose: v }) => {
+            cmd_task(&cwd, TaskArgs {
+                task,
+                writer,
+                images,
+                continue_session,
+                verbose: cli.verbose || v,
+                auto: cli.auto || auto,
+                plan_first: true,
+            })
+        }
+        Some(Commands::Review { reviewer, task, verbose: v }) => {
+            cmd_review(&cwd, &reviewer, task.as_deref(), cli.verbose || v)
+        }
         Some(Commands::Clear) => cmd_clear(&cwd),
 
-        None => {
-            if let Some(task) = cli.task {
-                if cli.plan {
-                    cmd_plan(&cwd, &task, &cli.writer, &cli.images, cli.continue_session, verbose)
+        None => match cli.task {
+            Some(task) => cmd_task(&cwd, TaskArgs {
+                task,
+                writer: cli.writer,
+                images: cli.images,
+                continue_session: cli.continue_session,
+                verbose: cli.verbose,
+                auto: cli.auto,
+                plan_first: cli.plan,
+            }),
+            None => {
+                if git::is_git_repo(&cwd) && Config::config_path(&cwd).exists() {
+                    cmd_session(&cwd, &cli.writer, cli.verbose, cli.auto)
                 } else {
-                    cmd_run(&cwd, &task, &cli.writer, &cli.images, cli.continue_session, verbose)
+                    print_usage();
+                    Ok(())
                 }
-            } else {
-                print_usage();
-                Ok(())
             }
-        }
+        },
     }
+}
+
+/// Bare `dt` in an initialized repo: interactive session where both models
+/// keep their context across tasks.
+fn cmd_session(dir: &Path, writer_name: &str, verbose: bool, auto: bool) -> Result<()> {
+    let TaskSetup { config, images: _, mut writer, mut reviewer } =
+        setup_task(dir, writer_name, &[], verbose)?;
+
+    let auto = auto || config.policy.auto;
+    repl::run(dir, &config, writer.as_mut(), reviewer.as_mut(), verbose, auto)
 }
 
 fn print_usage() {
@@ -164,7 +215,9 @@ fn print_usage() {
         "dt — AI pair programming CLI".cyan().bold()
     );
     println!("Usage:");
-    println!("  {} \"add OAuth login\"              auto mode: Claude writes, Gemini reviews", "dt".green());
+    println!("  {}                                 start an interactive session (in an initialized repo)", "dt".green());
+    println!("  {} \"add OAuth login\"              interactive: Claude writes, Gemini reviews", "dt".green());
+    println!("  {} \"add OAuth login\" --auto        auto: loop until both models approve", "dt".green());
     println!("  {} plan \"add OAuth login\"          plan mode: you approve each step", "dt".green());
     println!("  {} \"task\" --plan                   same as dt plan", "dt".green());
     println!("  {} \"task\" --writer gemini           flip: Gemini writes, Claude reviews", "dt".green());
@@ -177,7 +230,98 @@ fn print_usage() {
     println!("\nRun {} for all options.", "dt --help".cyan());
 }
 
-fn cmd_init(dir: &std::path::Path) -> Result<()> {
+struct TaskSetup {
+    config: Config,
+    images: Vec<ImageInput>,
+    writer: Box<dyn ModelAdapter>,
+    reviewer: Box<dyn ModelAdapter>,
+}
+
+/// Validates the repo, loads config, and resolves writer/reviewer adapters.
+fn setup_task(
+    dir: &Path,
+    writer_name: &str,
+    image_paths: &[PathBuf],
+    verbose: bool,
+) -> Result<TaskSetup> {
+    if !git::is_git_repo(dir) {
+        anyhow::bail!("not a git repository — run `git init` first");
+    }
+
+    let config = Config::load(dir).context("failed to load config")?;
+
+    let images: Vec<ImageInput> = image_paths
+        .iter()
+        .map(|p| ImageInput::load(p.clone()))
+        .collect::<Result<Vec<_>>>()?;
+
+    let claude: Box<dyn ModelAdapter> = Box::new(ClaudeAdapter::new(&config.claude, dir, verbose));
+    let gemini: Box<dyn ModelAdapter> = Box::new(GeminiAdapter::new(&config.gemini)?);
+
+    let (writer, reviewer) = match writer_name.to_lowercase().as_str() {
+        "claude" => (claude, gemini),
+        "gemini" => (gemini, claude),
+        other => anyhow::bail!("unknown writer '{}' — use 'claude' or 'gemini'", other),
+    };
+
+    Ok(TaskSetup { config, images, writer, reviewer })
+}
+
+fn cmd_task(dir: &Path, args: TaskArgs) -> Result<()> {
+    let TaskSetup { config, images, mut writer, mut reviewer } =
+        setup_task(dir, &args.writer, &args.images, args.verbose)?;
+
+    if !config.policy.allow_dirty_worktree && !git::is_worktree_clean(dir)? {
+        anyhow::bail!(
+            "worktree has uncommitted changes — commit or stash them first \
+             (or set allow_dirty_worktree = true in .duet/config.toml)"
+        );
+    }
+
+    let opts = TaskOptions {
+        config: &config,
+        task: &args.task,
+        images: &images,
+        repo_dir: dir,
+        continue_session: args.continue_session,
+        verbose: args.verbose,
+        auto: args.auto || config.policy.auto,
+        plan_first: args.plan_first,
+    };
+
+    let result = orchestrator::run(&opts, writer.as_mut(), reviewer.as_mut())?;
+
+    ui::final_line(result.success, result.rounds, writer.name(), reviewer.name(), &result.message);
+
+    if result.success { Ok(()) } else { std::process::exit(1); }
+}
+
+fn cmd_review(dir: &Path, reviewer_name: &str, task: Option<&str>, verbose: bool) -> Result<()> {
+    if !git::is_git_repo(dir) {
+        anyhow::bail!("not a git repository");
+    }
+
+    let config = Config::load(dir).context("failed to load config")?;
+
+    let mut reviewer: Box<dyn ModelAdapter> = match reviewer_name.to_lowercase().as_str() {
+        "gemini" => Box::new(GeminiAdapter::new(&config.gemini)?),
+        "claude" => Box::new(ClaudeAdapter::new(&config.claude, dir, verbose)),
+        other => anyhow::bail!("unknown reviewer '{}' — use 'claude' or 'gemini'", other),
+    };
+
+    let result = orchestrator::review_only(&config, reviewer.as_mut(), dir, task, verbose)?;
+
+    if result.success {
+        println!("\n{}", "Final Result: APPROVED".green().bold());
+    } else {
+        println!("\n{}", "Final Result: CHANGES NEEDED".red().bold());
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn cmd_init(dir: &Path) -> Result<()> {
     println!("{}", "Initializing dt...".cyan().bold());
 
     if !git::is_git_repo(dir) {
@@ -227,7 +371,7 @@ fn cmd_init(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_doctor(dir: &std::path::Path, verbose: bool) -> Result<()> {
+fn cmd_doctor(dir: &Path, verbose: bool) -> Result<()> {
     println!("{}\n", "dt doctor".cyan().bold());
     let mut all_ok = true;
 
@@ -348,133 +492,7 @@ fn cmd_doctor(dir: &std::path::Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// Shared setup for cmd_run and cmd_plan: validates git repo, loads config, resolves adapters.
-fn setup_task(
-    dir: &std::path::Path,
-    writer_name: &str,
-    image_paths: &[PathBuf],
-    verbose: bool,
-) -> Result<(
-    Config,
-    Vec<ImageInput>,
-    Box<dyn crate::adapters::ModelAdapter>,
-    Box<dyn crate::adapters::ModelAdapter>,
-    &'static str,
-    &'static str,
-)> {
-    if !git::is_git_repo(dir) {
-        anyhow::bail!("not a git repository — run `git init` first");
-    }
-
-    let config = Config::load(dir).context("failed to load config")?;
-
-    let images: Vec<ImageInput> = image_paths
-        .iter()
-        .map(|p| ImageInput::load(p.clone()))
-        .collect::<Result<Vec<_>>>()?;
-
-    let (writer_label, reviewer_label): (&'static str, &'static str) = match writer_name.to_lowercase().as_str() {
-        "claude" => ("claude", "gemini"),
-        "gemini" => ("gemini", "claude"),
-        other => anyhow::bail!("unknown writer '{}' — use 'claude' or 'gemini'", other),
-    };
-
-    let claude = ClaudeAdapter::new(&config.claude, dir, verbose);
-    let gemini = GeminiAdapter::new(&config.gemini)?;
-
-    let (writer, reviewer): (Box<dyn crate::adapters::ModelAdapter>, Box<dyn crate::adapters::ModelAdapter>) =
-        if writer_label == "claude" {
-            (Box::new(claude), Box::new(gemini))
-        } else {
-            (Box::new(gemini), Box::new(claude))
-        };
-
-    Ok((config, images, writer, reviewer, writer_label, reviewer_label))
-}
-
-fn cmd_run(
-    dir: &std::path::Path,
-    task: &str,
-    writer_name: &str,
-    image_paths: &[PathBuf],
-    continue_session: bool,
-    verbose: bool,
-) -> Result<()> {
-    let (config, images, writer, reviewer, writer_label, reviewer_label) =
-        setup_task(dir, writer_name, image_paths, verbose)?;
-
-    if !config.policy.allow_dirty_worktree && !git::is_worktree_clean(dir)? {
-        anyhow::bail!(
-            "worktree has uncommitted changes — commit or stash them first \
-             (or set allow_dirty_worktree = true in duet.toml)"
-        );
-    }
-
-    let result = orchestrator::run(&config, task, writer.as_ref(), reviewer.as_ref(), &images, dir, continue_session, verbose)?;
-
-    println!(
-        "\n{} rounds={}, writer={}, reviewer={}",
-        if result.success { "SUCCESS".green().bold() } else { "FAILED".red().bold() },
-        result.rounds,
-        writer_label,
-        reviewer_label,
-    );
-    println!("{}\n", result.message);
-
-    if result.success { Ok(()) } else { std::process::exit(1); }
-}
-
-fn cmd_plan(
-    dir: &std::path::Path,
-    task: &str,
-    writer_name: &str,
-    image_paths: &[PathBuf],
-    continue_session: bool,
-    verbose: bool,
-) -> Result<()> {
-    let (config, images, writer, reviewer, writer_label, reviewer_label) =
-        setup_task(dir, writer_name, image_paths, verbose)?;
-
-    let result = orchestrator::run_plan_flow(&config, task, writer.as_ref(), reviewer.as_ref(), &images, dir, continue_session, verbose)?;
-
-    println!(
-        "\n{} rounds={}, writer={}, reviewer={}",
-        if result.success { "SUCCESS".green().bold() } else { "STOPPED".yellow().bold() },
-        result.rounds,
-        writer_label,
-        reviewer_label,
-    );
-    println!("{}\n", result.message);
-
-    if result.success { Ok(()) } else { std::process::exit(1); }
-}
-
-fn cmd_review(dir: &std::path::Path, reviewer_name: &str, task: Option<&str>, verbose: bool) -> Result<()> {
-    if !git::is_git_repo(dir) {
-        anyhow::bail!("not a git repository");
-    }
-
-    let config = Config::load(dir).context("failed to load config")?;
-
-    let reviewer: Box<dyn crate::adapters::ModelAdapter> = match reviewer_name.to_lowercase().as_str() {
-        "gemini" => Box::new(GeminiAdapter::new(&config.gemini)?),
-        "claude" => Box::new(ClaudeAdapter::new(&config.claude, dir, verbose)),
-        other => anyhow::bail!("unknown reviewer '{}' — use 'claude' or 'gemini'", other),
-    };
-
-    let result = orchestrator::review_only(&config, reviewer.as_ref(), dir, task, verbose)?;
-
-    if result.success {
-        println!("\n{}", "Final Result: APPROVED".green().bold());
-    } else {
-        println!("\n{}", "Final Result: CHANGES NEEDED".red().bold());
-        std::process::exit(1);
-    }
-
-    Ok(())
-}
-
-fn cmd_clear(dir: &std::path::Path) -> Result<()> {
+fn cmd_clear(dir: &Path) -> Result<()> {
     let sessions_dir = dir.join(".duet").join("sessions");
 
     if sessions_dir.exists() {
@@ -488,7 +506,7 @@ fn cmd_clear(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn write_default_prompt(dir: &std::path::Path, name: &str, content: &str) -> Result<()> {
+fn write_default_prompt(dir: &Path, name: &str, content: &str) -> Result<()> {
     let path = dir.join(name);
     if path.exists() {
         println!("  {} prompts/{} already exists", "✓".green(), name);

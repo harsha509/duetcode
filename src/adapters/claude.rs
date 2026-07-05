@@ -1,23 +1,35 @@
-use super::{ImageInput, ModelAdapter, UsageStats};
-use super::pricing;
+use super::{pricing, ImageInput, ModelAdapter, UsageStats};
 use crate::config::ClaudeConfig;
+use crate::ui;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const MAX_OUTPUT_TOKENS: u32 = 8192;
 
 pub struct ClaudeAdapter {
     config: ClaudeConfig,
-    working_dir: std::path::PathBuf,
+    working_dir: PathBuf,
     verbose: bool,
     use_api: bool,
     api_key: Option<String>,
     agent: Option<ureq::Agent>,
+    /// CLI session id captured from the first call; later calls `--resume` it
+    /// so Claude keeps its full context (files read, edits made, reasoning).
+    session_id: Option<String>,
+    /// API-mode conversation history in Anthropic messages format.
+    messages: Vec<serde_json::Value>,
+}
+
+struct CliOutput {
+    text: String,
+    usage: UsageStats,
+    session_id: Option<String>,
 }
 
 impl ClaudeAdapter {
@@ -60,6 +72,8 @@ impl ClaudeAdapter {
             use_api,
             api_key,
             agent,
+            session_id: None,
+            messages: Vec::new(),
         }
     }
 
@@ -103,85 +117,62 @@ impl ClaudeAdapter {
 
     // ── API mode (direct Anthropic REST API with SSE streaming) ──
 
-    fn run_api(&self, prompt: &str, context: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
-        let api_key = self.api_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!(
-                "{} not set — export it or add to your shell profile",
-                self.config.api_key_env
-            ))?;
-
-        let agent = self.agent.as_ref()
+    fn run_api(&mut self, prompt: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
+        let api_key = self.api_key.clone().ok_or_else(|| anyhow::anyhow!(
+            "{} not set — export it or add to your shell profile",
+            self.config.api_key_env
+        ))?;
+        let agent = self.agent.clone()
             .ok_or_else(|| anyhow::anyhow!("HTTP client not initialized"))?;
 
-        let full_text = if context.is_empty() {
-            prompt.to_string()
-        } else {
-            format!("{}\n\nCONTEXT:\n{}", prompt, context)
-        };
-
-        let content = if images.is_empty() {
-            serde_json::json!([{ "type": "text", "text": full_text }])
-        } else {
-            let mut parts = vec![serde_json::json!({ "type": "text", "text": full_text })];
-            for img in images {
-                parts.push(serde_json::json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": img.media_type,
-                        "data": img.base64_data()
-                    }
-                }));
-            }
-            serde_json::json!(parts)
-        };
+        super::trim_history(&mut self.messages);
+        self.messages.push(serde_json::json!({
+            "role": "user",
+            "content": build_content(prompt, images)
+        }));
 
         let body = serde_json::json!({
             "model": self.config.api_model,
-            "max_tokens": 8192,
+            "max_tokens": MAX_OUTPUT_TOKENS,
             "stream": true,
-            "messages": [{
-                "role": "user",
-                "content": content
-            }]
+            "messages": self.messages,
         });
 
         if self.verbose {
-            eprintln!("  {} POST {} (model: {})", "[verbose]".dimmed(), ANTHROPIC_API_URL, self.config.api_model);
+            eprintln!(
+                "  {} POST {} (model: {}, history: {} turns)",
+                "[verbose]".dimmed(), ANTHROPIC_API_URL, self.config.api_model, self.messages.len()
+            );
         }
 
-        let response = agent
+        let result = agent
             .post(ANTHROPIC_API_URL)
-            .set("x-api-key", api_key)
+            .set("x-api-key", &api_key)
             .set("anthropic-version", ANTHROPIC_VERSION)
             .set("content-type", "application/json")
             .send_json(&body)
-            .map_err(|e| match e {
-                ureq::Error::Status(code, response) => {
-                    let error_body = response.into_string().unwrap_or_default();
-                    let error_msg = serde_json::from_str::<serde_json::Value>(&error_body)
-                        .ok()
-                        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
-                        .unwrap_or(error_body);
-                    anyhow::anyhow!("Anthropic API returned {}: {}", code, error_msg)
-                }
-                ureq::Error::Transport(t) => {
-                    anyhow::anyhow!(
-                        "failed to reach Anthropic API: {} — \
-                         try increasing timeout_secs in duet.toml [claude] section",
-                        t
-                    )
-                }
-            })?;
+            .map_err(map_api_error)
+            .and_then(|response| self.parse_sse_stream(response.into_reader()));
 
-        self.parse_sse_stream(response.into_reader())
+        match result {
+            Ok((text, usage)) => {
+                self.messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": text }]
+                }));
+                Ok((text, usage))
+            }
+            Err(e) => {
+                self.messages.pop();
+                Err(e)
+            }
+        }
     }
 
     fn parse_sse_stream(&self, body: impl Read) -> Result<(String, UsageStats)> {
         let reader = BufReader::new(body);
         let mut collected = String::new();
         let mut header_printed = false;
-        let separator = "─".repeat(60);
         let start = std::time::Instant::now();
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
@@ -218,9 +209,7 @@ impl ClaudeAdapter {
                 "content_block_delta" => {
                     if let Some(text) = event.pointer("/delta/text").and_then(|v| v.as_str()) {
                         if !header_printed {
-                            eprintln!("\n  {}", separator.dimmed());
-                            eprintln!("  {}", "claude:".cyan().bold());
-                            eprintln!("  {}", separator.dimmed());
+                            ui::stream_header("claude");
                             header_printed = true;
                         }
                         eprint!("{}", text);
@@ -266,7 +255,7 @@ impl ClaudeAdapter {
         if header_printed {
             eprintln!();
         }
-        eprintln!("  {}", separator.dimmed());
+        ui::stream_footer();
 
         let cost_usd = pricing::compute_cost(&model_name, input_tokens, output_tokens);
         let usage = UsageStats {
@@ -279,71 +268,80 @@ impl ClaudeAdapter {
         Ok((collected, usage))
     }
 
-    // ── CLI mode (spawn claude command) ──
+    // ── CLI mode (spawn claude command, resume the session across calls) ──
 
-    fn run_cli(&self, prompt: &str, context: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
-        let full_prompt = if context.is_empty() {
-            prompt.to_string()
-        } else {
-            format!("{}\n\nCONTEXT:\n{}", prompt, context)
-        };
-
-        if images.is_empty() {
-            self.run_cli_simple(&full_prompt)
-        } else {
-            self.run_cli_with_images(&full_prompt, images)
+    fn run_cli(&mut self, prompt: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
+        let resuming = self.session_id.is_some();
+        match self.run_cli_once(prompt, images) {
+            Err(e) if resuming => {
+                eprintln!("  {} could not resume session ({:#}) — starting fresh", "↻".yellow(), e);
+                self.session_id = None;
+                self.run_cli_once(prompt, images)
+            }
+            other => other,
         }
     }
 
-    fn run_cli_simple(&self, full_prompt: &str) -> Result<(String, UsageStats)> {
+    fn run_cli_once(&mut self, prompt: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
+        let output = if images.is_empty() {
+            self.spawn_cli_text(prompt)
+        } else {
+            self.spawn_cli_images(prompt, images)
+        }?;
+
+        let CliOutput { text, usage, session_id } = output;
+        if session_id.is_some() {
+            self.session_id = session_id;
+        }
+        Ok((text, usage))
+    }
+
+    fn base_cli_command(&self) -> Command {
         let mut cmd = Command::new(&self.config.command);
-        cmd.arg("-p")
-            .arg(full_prompt)
-            .arg("--model")
+        cmd.arg("--model")
             .arg(&self.config.model)
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
-            .arg("--dangerously-skip-permissions")
-            .current_dir(&self.working_dir)
+            .current_dir(&self.working_dir);
+
+        if self.config.skip_permissions {
+            cmd.arg("--dangerously-skip-permissions");
+        }
+        if let Some(id) = &self.session_id {
+            cmd.arg("--resume").arg(id);
+        }
+        cmd
+    }
+
+    fn spawn_cli_text(&self, prompt: &str) -> Result<CliOutput> {
+        let mut cmd = self.base_cli_command();
+        cmd.arg("-p")
+            .arg(prompt)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         if self.verbose {
-            eprintln!("  {} {} -p <prompt> --output-format stream-json --verbose --dangerously-skip-permissions", "[verbose]".dimmed(), self.config.command);
+            eprintln!(
+                "  {} {} -p <prompt> --output-format stream-json{}",
+                "[verbose]".dimmed(),
+                self.config.command,
+                if self.session_id.is_some() { " --resume <session>" } else { "" },
+            );
         }
 
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to execute '{}'", self.config.command))?;
 
-        let (stdout, usage) = self.stream_cli_json(&mut child)?;
-        let status = child.wait().context("failed to wait for claude")?;
-        let stderr = self.collect_stderr(&mut child);
-
-        if self.verbose && !stderr.is_empty() {
-            eprintln!("  {} stderr: {}", "[verbose]".dimmed(), stderr.trim());
-        }
-
-        if !status.success() {
-            let details = if !stderr.trim().is_empty() {
-                stderr.trim().to_string()
-            } else if !stdout.trim().is_empty() {
-                stdout.trim().to_string()
-            } else {
-                "no output (claude may need authentication — run `claude` interactively first)".to_string()
-            };
-            anyhow::bail!("claude CLI exited with {}: {}", status, details);
-        }
-
-        Ok((stdout, usage))
+        self.finish_cli(&mut child)
     }
 
-    fn run_cli_with_images(&self, full_prompt: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
+    fn spawn_cli_images(&self, prompt: &str, images: &[ImageInput]) -> Result<CliOutput> {
         let mut content_parts = vec![serde_json::json!({
             "type": "text",
-            "text": full_prompt
+            "text": prompt
         })];
 
         for img in images {
@@ -365,17 +363,10 @@ impl ClaudeAdapter {
         let json_str = serde_json::to_string(&message)
             .context("failed to serialize image payload")?;
 
-        let mut cmd = Command::new(&self.config.command);
+        let mut cmd = self.base_cli_command();
         cmd.arg("-p")
             .arg("--input-format")
             .arg("stream-json")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
-            .arg("--model")
-            .arg(&self.config.model)
-            .arg("--dangerously-skip-permissions")
-            .current_dir(&self.working_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -389,22 +380,30 @@ impl ClaudeAdapter {
         }
         drop(child.stdin.take());
 
-        let (stdout, usage) = self.stream_cli_json(&mut child)?;
+        self.finish_cli(&mut child)
+    }
+
+    fn finish_cli(&self, child: &mut Child) -> Result<CliOutput> {
+        let output = self.stream_cli_json(child)?;
         let status = child.wait().context("failed to wait for claude")?;
-        let stderr = self.collect_stderr(&mut child);
+        let stderr = collect_stderr(child);
+
+        if self.verbose && !stderr.is_empty() {
+            eprintln!("  {} stderr: {}", "[verbose]".dimmed(), stderr.trim());
+        }
 
         if !status.success() {
             let details = if !stderr.trim().is_empty() {
                 stderr.trim().to_string()
-            } else if !stdout.trim().is_empty() {
-                stdout.trim().to_string()
+            } else if !output.text.trim().is_empty() {
+                output.text.trim().to_string()
             } else {
-                "no output".to_string()
+                "no output (claude may need authentication — run `claude` interactively first)".to_string()
             };
             anyhow::bail!("claude CLI exited with {}: {}", status, details);
         }
 
-        Ok((stdout, usage))
+        Ok(output)
     }
 
     fn describe_tool_action(tool: &str, input: Option<&serde_json::Value>) -> String {
@@ -478,18 +477,18 @@ impl ClaudeAdapter {
         }
     }
 
-    fn stream_cli_json(&self, child: &mut std::process::Child) -> Result<(String, UsageStats)> {
+    fn stream_cli_json(&self, child: &mut Child) -> Result<CliOutput> {
         let stdout_pipe = child.stdout.take().context("failed to capture claude stdout")?;
         let reader = BufReader::new(stdout_pipe);
         let mut full_result = String::new();
         let mut delta_text = String::new();
         let mut streaming_text = false;
-        let separator = "─".repeat(60);
         let start = std::time::Instant::now();
         let mut cost_usd: Option<f64> = None;
         let mut model_name = self.config.model.clone();
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
+        let mut session_id: Option<String> = None;
 
         for line in reader.lines() {
             let line = match line {
@@ -515,6 +514,9 @@ impl ClaudeAdapter {
                 ("system", "init") => {
                     let model = event.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
                     model_name = model.to_string();
+                    if let Some(id) = event.get("session_id").and_then(|v| v.as_str()) {
+                        session_id = Some(id.to_string());
+                    }
                     eprintln!("  {} connected (model: {})", "●".green(), model);
                     eprintln!("  {} thinking...", "◌".cyan());
                 }
@@ -528,9 +530,7 @@ impl ClaudeAdapter {
                 ("assistant", "chunk") | ("content_block_delta", _) => {
                     if let Some(text) = event.pointer("/delta/text").and_then(|v| v.as_str()) {
                         if !streaming_text {
-                            eprintln!("\n  {}", separator.dimmed());
-                            eprintln!("  {}", "claude:".cyan().bold());
-                            eprintln!("  {}", separator.dimmed());
+                            ui::stream_header("claude");
                             streaming_text = true;
                         }
                         eprint!("{}", text);
@@ -597,9 +597,7 @@ impl ClaudeAdapter {
                                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                         if !text.is_empty() {
                                             if !streaming_text {
-                                                eprintln!("\n  {}", separator.dimmed());
-                                                eprintln!("  {}", "claude:".cyan().bold());
-                                                eprintln!("  {}", separator.dimmed());
+                                                ui::stream_header("claude");
                                                 streaming_text = true;
                                             }
                                             eprint!("{}", text);
@@ -631,7 +629,7 @@ impl ClaudeAdapter {
         }
 
         if streaming_text { eprintln!(); }
-        eprintln!("  {}", separator.dimmed());
+        ui::stream_footer();
 
         if cost_usd.is_none() && (input_tokens > 0 || output_tokens > 0) {
             cost_usd = pricing::compute_cost(&model_name, input_tokens, output_tokens);
@@ -646,39 +644,75 @@ impl ClaudeAdapter {
 
         let text = if !full_result.is_empty() {
             full_result
-        } else if !delta_text.is_empty() {
-            delta_text
         } else {
-            String::new()
+            delta_text
         };
 
-        Ok((text, usage))
-    }
-
-    fn collect_stderr(&self, child: &mut std::process::Child) -> String {
-        child.stderr.take()
-            .map(|pipe| {
-                let reader = BufReader::new(pipe);
-                reader.lines().filter_map(|l| l.ok()).collect::<Vec<_>>().join("\n")
-            })
-            .unwrap_or_default()
+        Ok(CliOutput { text, usage, session_id })
     }
 }
 
-impl ModelAdapter for ClaudeAdapter {
-    fn generate(&self, prompt: &str, context: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
-        if self.use_api {
-            self.run_api(prompt, context, images)
-        } else {
-            let result = self.run_cli(prompt, context, images);
-            match result {
-                Ok(r) => Ok(r),
-                Err(e) if self.api_key.is_some() && self.config.mode == "auto" => {
-                    eprintln!("  {} CLI failed ({}), falling back to API...", "↻".yellow(), e);
-                    self.run_api(prompt, context, images)
-                }
-                Err(e) => Err(e),
+fn build_content(prompt: &str, images: &[ImageInput]) -> serde_json::Value {
+    if images.is_empty() {
+        return serde_json::json!([{ "type": "text", "text": prompt }]);
+    }
+    let mut parts = vec![serde_json::json!({ "type": "text", "text": prompt })];
+    for img in images {
+        parts.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": img.media_type,
+                "data": img.base64_data()
             }
+        }));
+    }
+    serde_json::json!(parts)
+}
+
+fn map_api_error(e: ureq::Error) -> anyhow::Error {
+    match e {
+        ureq::Error::Status(code, response) => {
+            let error_body = response.into_string().unwrap_or_default();
+            let error_msg = serde_json::from_str::<serde_json::Value>(&error_body)
+                .ok()
+                .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
+                .unwrap_or(error_body);
+            anyhow::anyhow!("Anthropic API returned {}: {}", code, error_msg)
+        }
+        ureq::Error::Transport(t) => {
+            anyhow::anyhow!(
+                "failed to reach Anthropic API: {} — \
+                 try increasing timeout_secs in .duet/config.toml [claude]",
+                t
+            )
+        }
+    }
+}
+
+fn collect_stderr(child: &mut Child) -> String {
+    child.stderr.take()
+        .map(|pipe| {
+            BufReader::new(pipe)
+                .lines()
+                .map_while(Result::ok)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+impl ModelAdapter for ClaudeAdapter {
+    fn generate(&mut self, prompt: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
+        if self.use_api {
+            return self.run_api(prompt, images);
+        }
+        match self.run_cli(prompt, images) {
+            Err(e) if self.api_key.is_some() && self.config.mode == "auto" => {
+                eprintln!("  {} CLI failed ({:#}) — falling back to API", "↻".yellow(), e);
+                self.run_api(prompt, images)
+            }
+            other => other,
         }
     }
 

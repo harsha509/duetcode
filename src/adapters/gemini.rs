@@ -1,6 +1,6 @@
-use super::{ImageInput, ModelAdapter, UsageStats};
-use super::pricing;
+use super::{pricing, ImageInput, ModelAdapter, UsageStats};
 use crate::config::GeminiConfig;
+use crate::ui;
 use anyhow::Result;
 use colored::Colorize;
 use std::io::{BufRead, BufReader, Write};
@@ -12,6 +12,9 @@ pub struct GeminiAdapter {
     model: String,
     api_key: String,
     agent: ureq::Agent,
+    /// Conversation history in Gemini `contents` format, so each review
+    /// remembers what it said in earlier rounds.
+    history: Vec<serde_json::Value>,
 }
 
 impl GeminiAdapter {
@@ -32,6 +35,7 @@ impl GeminiAdapter {
             model: config.model.clone(),
             api_key,
             agent,
+            history: Vec::new(),
         })
     }
 
@@ -39,14 +43,8 @@ impl GeminiAdapter {
         std::env::var(&config.api_key_env).is_ok()
     }
 
-    fn build_parts(prompt: &str, context: &str, images: &[ImageInput]) -> Vec<serde_json::Value> {
-        let full_text = if context.is_empty() {
-            prompt.to_string()
-        } else {
-            format!("{}\n\nCONTEXT:\n{}", prompt, context)
-        };
-
-        let mut parts = vec![serde_json::json!({ "text": full_text })];
+    fn build_parts(prompt: &str, images: &[ImageInput]) -> Vec<serde_json::Value> {
+        let mut parts = vec![serde_json::json!({ "text": prompt })];
 
         for img in images {
             parts.push(serde_json::json!({
@@ -69,33 +67,48 @@ impl GeminiAdapter {
     }
 
     fn stream_generate(
-        &self,
+        &mut self,
         prompt: &str,
-        context: &str,
         images: &[ImageInput],
     ) -> Result<(String, UsageStats)> {
-        let parts = Self::build_parts(prompt, context, images);
+        super::trim_history(&mut self.history);
+        self.history.push(serde_json::json!({
+            "role": "user",
+            "parts": Self::build_parts(prompt, images)
+        }));
 
-        let body = serde_json::json!({
-            "contents": [{
-                "parts": parts
-            }]
-        });
-
+        let body = serde_json::json!({ "contents": self.history });
         let url = format!(
-            "{}{}:streamGenerateContent?alt=sse&key={}",
+            "{}{}:streamGenerateContent?alt=sse",
             GEMINI_API_BASE,
             self.model_path(),
-            self.api_key
         );
 
+        match self.exchange(&url, &body) {
+            Ok((text, usage)) => {
+                self.history.push(serde_json::json!({
+                    "role": "model",
+                    "parts": [{ "text": text }]
+                }));
+                Ok((text, usage))
+            }
+            Err(e) => {
+                self.history.pop();
+                Err(e)
+            }
+        }
+    }
+
+    fn exchange(&self, url: &str, body: &serde_json::Value) -> Result<(String, UsageStats)> {
         eprintln!("  {} streaming from {}", "●".green(), self.model);
         eprintln!("  {} thinking...", "◌".cyan());
 
         let start = std::time::Instant::now();
 
-        let response = self.agent.post(&url)
-            .send_json(&body)
+        // Key goes in a header so it never shows up in URLs or error output.
+        let response = self.agent.post(url)
+            .set("x-goog-api-key", &self.api_key)
+            .send_json(body)
             .map_err(|e| match e {
                 ureq::Error::Status(code, response) => {
                     let error_body = response.into_string().unwrap_or_default();
@@ -105,7 +118,7 @@ impl GeminiAdapter {
                 ureq::Error::Transport(t) => {
                     anyhow::anyhow!(
                         "failed to reach Gemini API: {} — \
-                         try increasing timeout_secs in duet.toml [gemini] section \
+                         try increasing timeout_secs in .duet/config.toml [gemini] \
                          or try a faster model like 'gemini-2.0-flash'",
                         t
                     )
@@ -115,7 +128,6 @@ impl GeminiAdapter {
         let reader = BufReader::new(response.into_reader());
         let mut collected = String::new();
         let mut header_printed = false;
-        let separator = "─".repeat(60);
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
         let mut chunk_count: u64 = 0;
@@ -151,9 +163,7 @@ impl GeminiAdapter {
             {
                 if !text.is_empty() {
                     if !header_printed {
-                        eprintln!("\n  {}", separator.dimmed());
-                        eprintln!("  {}", "gemini:".cyan().bold());
-                        eprintln!("  {}", separator.dimmed());
+                        ui::stream_header("gemini");
                         header_printed = true;
                     }
                     eprint!("{}", text);
@@ -185,7 +195,7 @@ impl GeminiAdapter {
             elapsed,
             chunk_count,
         );
-        eprintln!("  {}", separator.dimmed());
+        ui::stream_footer();
 
         if collected.is_empty() {
             anyhow::bail!(
@@ -207,12 +217,11 @@ impl GeminiAdapter {
 
 impl ModelAdapter for GeminiAdapter {
     fn generate(
-        &self,
+        &mut self,
         prompt: &str,
-        context: &str,
         images: &[ImageInput],
     ) -> Result<(String, UsageStats)> {
-        self.stream_generate(prompt, context, images)
+        self.stream_generate(prompt, images)
     }
 
     fn name(&self) -> &str {
