@@ -211,6 +211,8 @@ pub fn session_banner(writer: &str, reviewer: &str, auto: bool) {
 pub fn session_help() {
     println!("  {}", "commands:".bold());
     println!("    {}           toggle auto mode (loop without per-round prompts)", "/auto".green());
+    println!("    {} <path>   attach a screenshot/image to the next task (repeatable)", "/image".green());
+    println!("    {}          attach the image on the clipboard to the next task", "/paste".green());
     println!("    {} [task]  review uncommitted changes", "/review".green());
     println!("    {} <task>   plan first, then execute", "/plan".green());
     println!("    {}           show this help", "/help".green());

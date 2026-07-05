@@ -17,6 +17,8 @@ base64 = "0.22"
 colored = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 termimad = "0.34.1"
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+png = "0.17"
 
 [profile.release]
 opt-level = 3
