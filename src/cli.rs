@@ -2,14 +2,17 @@ use crate::adapters::claude::ClaudeAdapter;
 use crate::adapters::gemini::GeminiAdapter;
 use crate::adapters::{ImageInput, ModelAdapter};
 use crate::config::Config;
+use crate::events::{Sink, TerminalSink};
 use crate::git;
 use crate::orchestrator::{self, TaskOptions};
 use crate::repl;
+use crate::serve;
 use crate::ui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
@@ -130,6 +133,13 @@ pub enum Commands {
 
     /// Clear all past session logs
     Clear,
+
+    /// Run as a JSON-lines server for GUI frontends (e.g. the VS Code extension)
+    Serve {
+        /// Which model writes code: "claude" or "gemini"
+        #[arg(long, default_value = "claude")]
+        writer: String,
+    },
 }
 
 /// Everything cmd_task needs, collected from whichever CLI form was used.
@@ -176,6 +186,7 @@ pub fn run() -> Result<()> {
             cmd_review(&cwd, &reviewer, task.as_deref(), cli.verbose || v)
         }
         Some(Commands::Clear) => cmd_clear(&cwd),
+        Some(Commands::Serve { writer }) => serve::run(&cwd, &writer),
 
         None => match cli.task {
             Some(task) => cmd_task(&cwd, TaskArgs {
@@ -202,11 +213,12 @@ pub fn run() -> Result<()> {
 /// Bare `dt` in an initialized repo: interactive session where both models
 /// keep their context across tasks.
 fn cmd_session(dir: &Path, writer_name: &str, verbose: bool, auto: bool) -> Result<()> {
+    let sink: Arc<dyn Sink> = Arc::new(TerminalSink::new(verbose));
     let TaskSetup { config, images: _, mut writer, mut reviewer } =
-        setup_task(dir, writer_name, &[], verbose)?;
+        setup_task(dir, writer_name, &[], verbose, sink.clone())?;
 
     let auto = auto || config.policy.auto;
-    repl::run(dir, &config, writer.as_mut(), reviewer.as_mut(), verbose, auto)
+    repl::run(dir, &config, writer.as_mut(), reviewer.as_mut(), auto, sink.as_ref())
 }
 
 fn print_usage() {
@@ -230,19 +242,20 @@ fn print_usage() {
     println!("\nRun {} for all options.", "dt --help".cyan());
 }
 
-struct TaskSetup {
-    config: Config,
-    images: Vec<ImageInput>,
-    writer: Box<dyn ModelAdapter>,
-    reviewer: Box<dyn ModelAdapter>,
+pub(crate) struct TaskSetup {
+    pub(crate) config: Config,
+    pub(crate) images: Vec<ImageInput>,
+    pub(crate) writer: Box<dyn ModelAdapter>,
+    pub(crate) reviewer: Box<dyn ModelAdapter>,
 }
 
 /// Validates the repo, loads config, and resolves writer/reviewer adapters.
-fn setup_task(
+pub(crate) fn setup_task(
     dir: &Path,
     writer_name: &str,
     image_paths: &[PathBuf],
     verbose: bool,
+    sink: Arc<dyn Sink>,
 ) -> Result<TaskSetup> {
     if !git::is_git_repo(dir) {
         anyhow::bail!("not a git repository — run `git init` first");
@@ -255,8 +268,9 @@ fn setup_task(
         .map(|p| ImageInput::load(p.clone()))
         .collect::<Result<Vec<_>>>()?;
 
-    let claude: Box<dyn ModelAdapter> = Box::new(ClaudeAdapter::new(&config.claude, dir, verbose));
-    let gemini: Box<dyn ModelAdapter> = Box::new(GeminiAdapter::new(&config.gemini)?);
+    let claude: Box<dyn ModelAdapter> =
+        Box::new(ClaudeAdapter::new(&config.claude, dir, verbose, sink.clone()));
+    let gemini: Box<dyn ModelAdapter> = Box::new(GeminiAdapter::new(&config.gemini, sink)?);
 
     let (writer, reviewer) = match writer_name.to_lowercase().as_str() {
         "claude" => (claude, gemini),
@@ -268,8 +282,9 @@ fn setup_task(
 }
 
 fn cmd_task(dir: &Path, args: TaskArgs) -> Result<()> {
+    let sink: Arc<dyn Sink> = Arc::new(TerminalSink::new(args.verbose));
     let TaskSetup { config, images, mut writer, mut reviewer } =
-        setup_task(dir, &args.writer, &args.images, args.verbose)?;
+        setup_task(dir, &args.writer, &args.images, args.verbose, sink.clone())?;
 
     if !config.policy.allow_dirty_worktree && !git::is_worktree_clean(dir)? {
         anyhow::bail!(
@@ -284,12 +299,11 @@ fn cmd_task(dir: &Path, args: TaskArgs) -> Result<()> {
         images: &images,
         repo_dir: dir,
         continue_session: args.continue_session,
-        verbose: args.verbose,
         auto: args.auto || config.policy.auto,
         plan_first: args.plan_first,
     };
 
-    let result = orchestrator::run(&opts, writer.as_mut(), reviewer.as_mut())?;
+    let result = orchestrator::run(&opts, writer.as_mut(), reviewer.as_mut(), sink.as_ref())?;
 
     ui::final_line(result.success, result.rounds, writer.name(), reviewer.name(), &result.message);
 
@@ -302,14 +316,15 @@ fn cmd_review(dir: &Path, reviewer_name: &str, task: Option<&str>, verbose: bool
     }
 
     let config = Config::load(dir).context("failed to load config")?;
+    let sink: Arc<dyn Sink> = Arc::new(TerminalSink::new(verbose));
 
     let mut reviewer: Box<dyn ModelAdapter> = match reviewer_name.to_lowercase().as_str() {
-        "gemini" => Box::new(GeminiAdapter::new(&config.gemini)?),
-        "claude" => Box::new(ClaudeAdapter::new(&config.claude, dir, verbose)),
+        "gemini" => Box::new(GeminiAdapter::new(&config.gemini, sink.clone())?),
+        "claude" => Box::new(ClaudeAdapter::new(&config.claude, dir, verbose, sink.clone())),
         other => anyhow::bail!("unknown reviewer '{}' — use 'claude' or 'gemini'", other),
     };
 
-    let result = orchestrator::review_only(&config, reviewer.as_mut(), dir, task, verbose)?;
+    let result = orchestrator::review_only(&config, reviewer.as_mut(), dir, task, sink.as_ref())?;
 
     if result.success {
         println!("\n{}", "Final Result: APPROVED".green().bold());
@@ -407,7 +422,9 @@ fn cmd_doctor(dir: &Path, verbose: bool) -> Result<()> {
         .map(|c| c.claude.clone())
         .unwrap_or_default();
 
-    let claude = ClaudeAdapter::new(&claude_config, dir, verbose);
+    let claude = ClaudeAdapter::new(
+        &claude_config, dir, verbose, Arc::new(TerminalSink::new(verbose)),
+    );
 
     let cli_ok = if claude.is_available() {
         println!("  {} claude CLI found", "✓".green());

@@ -4,6 +4,7 @@
 
 use crate::adapters::{ImageInput, ModelAdapter};
 use crate::config::Config;
+use crate::events::Sink;
 use crate::orchestrator::{self, OrchestratorResult, TaskOptions};
 use crate::ui;
 use anyhow::Result;
@@ -14,8 +15,8 @@ pub fn run(
     config: &Config,
     writer: &mut dyn ModelAdapter,
     reviewer: &mut dyn ModelAdapter,
-    verbose: bool,
     auto_start: bool,
+    sink: &dyn Sink,
 ) -> Result<()> {
     let mut auto = auto_start;
     let mut staged_images: Vec<ImageInput> = Vec::new();
@@ -57,18 +58,18 @@ pub fn run(
         let outcome = if let Some(rest) = line.strip_prefix("/review") {
             let task = rest.trim();
             let task = if task.is_empty() { None } else { Some(task) };
-            orchestrator::review_only(config, reviewer, dir, task, verbose)
+            orchestrator::review_only(config, reviewer, dir, task, sink)
         } else if let Some(task) = line.strip_prefix("/plan ") {
             let images = std::mem::take(&mut staged_images);
             let spec = TaskSpec { task: task.trim(), plan_first: true, images: &images };
-            run_task(dir, config, writer, reviewer, &spec, verbose, auto)
+            run_task(dir, config, writer, reviewer, &spec, auto, sink)
         } else if line.starts_with('/') {
             ui::warn("unknown command — type /help");
             continue;
         } else {
             let images = std::mem::take(&mut staged_images);
             let spec = TaskSpec { task: line, plan_first: false, images: &images };
-            run_task(dir, config, writer, reviewer, &spec, verbose, auto)
+            run_task(dir, config, writer, reviewer, &spec, auto, sink)
         };
 
         match outcome {
@@ -93,8 +94,8 @@ fn run_task(
     writer: &mut dyn ModelAdapter,
     reviewer: &mut dyn ModelAdapter,
     spec: &TaskSpec,
-    verbose: bool,
     auto: bool,
+    sink: &dyn Sink,
 ) -> Result<OrchestratorResult> {
     let opts = TaskOptions {
         config,
@@ -102,11 +103,10 @@ fn run_task(
         images: spec.images,
         repo_dir: dir,
         continue_session: false,
-        verbose,
         auto,
         plan_first: spec.plan_first,
     };
-    orchestrator::run(&opts, writer, reviewer)
+    orchestrator::run(&opts, writer, reviewer, sink)
 }
 
 fn stage_image(arg: &str, staged: &mut Vec<ImageInput>) {

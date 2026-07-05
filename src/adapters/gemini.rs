@@ -1,9 +1,11 @@
 use super::{pricing, ImageInput, ModelAdapter, UsageStats};
 use crate::config::GeminiConfig;
+use crate::events::{Event, Sink};
 use crate::ui;
 use anyhow::Result;
 use colored::Colorize;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
+use std::sync::Arc;
 use std::time::Duration;
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -15,10 +17,11 @@ pub struct GeminiAdapter {
     /// Conversation history in Gemini `contents` format, so each review
     /// remembers what it said in earlier rounds.
     history: Vec<serde_json::Value>,
+    sink: Arc<dyn Sink>,
 }
 
 impl GeminiAdapter {
-    pub fn new(config: &GeminiConfig) -> Result<Self> {
+    pub fn new(config: &GeminiConfig, sink: Arc<dyn Sink>) -> Result<Self> {
         let api_key = std::env::var(&config.api_key_env).map_err(|_| {
             anyhow::anyhow!(
                 "{} not set — export it or add to your shell profile",
@@ -36,6 +39,7 @@ impl GeminiAdapter {
             api_key,
             agent,
             history: Vec::new(),
+            sink,
         })
     }
 
@@ -163,11 +167,13 @@ impl GeminiAdapter {
             {
                 if !text.is_empty() {
                     if !header_printed {
-                        ui::stream_header("gemini");
+                        self.sink.event(Event::StreamStart { model: "gemini".into() });
                         header_printed = true;
                     }
-                    eprint!("{}", text);
-                    let _ = std::io::stderr().lock().flush();
+                    self.sink.event(Event::StreamChunk {
+                        model: "gemini".into(),
+                        text: text.to_string(),
+                    });
                     collected.push_str(text);
                 }
             }
@@ -182,9 +188,7 @@ impl GeminiAdapter {
             }
         }
 
-        if header_printed {
-            eprintln!();
-        }
+        self.sink.event(Event::StreamEnd { model: "gemini".into() });
 
         let elapsed = start.elapsed().as_secs_f64();
         let cost_usd = pricing::compute_cost(&self.model, input_tokens, output_tokens);

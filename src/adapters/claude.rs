@@ -1,11 +1,13 @@
 use super::{pricing, ImageInput, ModelAdapter, UsageStats};
 use crate::config::ClaudeConfig;
+use crate::events::{Event, Sink};
 use crate::ui;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -24,6 +26,7 @@ pub struct ClaudeAdapter {
     session_id: Option<String>,
     /// API-mode conversation history in Anthropic messages format.
     messages: Vec<serde_json::Value>,
+    sink: Arc<dyn Sink>,
 }
 
 struct CliOutput {
@@ -33,7 +36,7 @@ struct CliOutput {
 }
 
 impl ClaudeAdapter {
-    pub fn new(config: &ClaudeConfig, working_dir: &Path, verbose: bool) -> Self {
+    pub fn new(config: &ClaudeConfig, working_dir: &Path, verbose: bool, sink: Arc<dyn Sink>) -> Self {
         let mode = config.mode.to_lowercase();
 
         let cli_available = mode != "api" && Self::check_cli_available(&config.command);
@@ -74,7 +77,16 @@ impl ClaudeAdapter {
             agent,
             session_id: None,
             messages: Vec::new(),
+            sink,
         }
+    }
+
+    fn emit_chunk(&self, started: &mut bool, text: &str) {
+        if !*started {
+            self.sink.event(Event::StreamStart { model: "claude".into() });
+            *started = true;
+        }
+        self.sink.event(Event::StreamChunk { model: "claude".into(), text: text.to_string() });
     }
 
     fn is_real_api_key(key: &str) -> bool {
@@ -208,12 +220,7 @@ impl ClaudeAdapter {
             match event_type {
                 "content_block_delta" => {
                     if let Some(text) = event.pointer("/delta/text").and_then(|v| v.as_str()) {
-                        if !header_printed {
-                            ui::stream_header("claude");
-                            header_printed = true;
-                        }
-                        eprint!("{}", text);
-                        let _ = std::io::stderr().lock().flush();
+                        self.emit_chunk(&mut header_printed, text);
                         collected.push_str(text);
                     }
                 }
@@ -224,12 +231,12 @@ impl ClaudeAdapter {
                         input_tokens = it;
                     }
                     eprintln!("  {} streaming from {}", "●".green(), model);
-                    eprintln!("  {} thinking...", "◌".cyan());
+                    self.sink.event(Event::Thinking { model: "claude".into() });
                 }
                 "content_block_start" => {
                     let block_type = event.pointer("/content_block/type").and_then(|v| v.as_str()).unwrap_or("");
                     if block_type == "thinking" {
-                        eprintln!("  {} reasoning...", "◌".cyan());
+                        self.sink.event(Event::Thinking { model: "claude".into() });
                     }
                 }
                 "message_delta" => {
@@ -238,6 +245,7 @@ impl ClaudeAdapter {
                     }
                     if let Some(reason) = event.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
                         let elapsed = start.elapsed().as_secs_f64();
+                        self.sink.event(Event::StreamEnd { model: "claude".into() });
                         eprintln!("  {} finished ({:.1}s, reason: {})", "●".green(), elapsed, reason);
                     }
                 }
@@ -252,9 +260,7 @@ impl ClaudeAdapter {
             }
         }
 
-        if header_printed {
-            eprintln!();
-        }
+        self.sink.event(Event::StreamEnd { model: "claude".into() });
         ui::stream_footer();
 
         let cost_usd = pricing::compute_cost(&model_name, input_tokens, output_tokens);
@@ -482,7 +488,7 @@ impl ClaudeAdapter {
         let reader = BufReader::new(stdout_pipe);
         let mut full_result = String::new();
         let mut delta_text = String::new();
-        let mut streaming_text = false;
+        let mut started = false;
         let start = std::time::Instant::now();
         let mut cost_usd: Option<f64> = None;
         let mut model_name = self.config.model.clone();
@@ -518,7 +524,7 @@ impl ClaudeAdapter {
                         session_id = Some(id.to_string());
                     }
                     eprintln!("  {} connected (model: {})", "●".green(), model);
-                    eprintln!("  {} thinking...", "◌".cyan());
+                    self.sink.event(Event::Thinking { model: "claude".into() });
                 }
                 ("system", "api_retry") => {
                     let attempt = event.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -529,18 +535,12 @@ impl ClaudeAdapter {
                 }
                 ("assistant", "chunk") | ("content_block_delta", _) => {
                     if let Some(text) = event.pointer("/delta/text").and_then(|v| v.as_str()) {
-                        if !streaming_text {
-                            ui::stream_header("claude");
-                            streaming_text = true;
-                        }
-                        eprint!("{}", text);
-                        let _ = std::io::stderr().lock().flush();
+                        self.emit_chunk(&mut started, text);
                         delta_text.push_str(text);
                     }
                 }
                 ("assistant", "thinking") => {
-                    if streaming_text { eprintln!(); streaming_text = false; }
-                    eprintln!("  {} reasoning...", "◌".cyan());
+                    self.sink.event(Event::Thinking { model: "claude".into() });
                 }
                 ("assistant", "tool_use") | ("tool_use", _) => {
                     let tool = event.get("tool").and_then(|v| v.as_str())
@@ -548,11 +548,10 @@ impl ClaudeAdapter {
                         .unwrap_or("tool");
                     let input = event.get("input")
                         .or_else(|| event.pointer("/content_block/input"));
-                    if streaming_text { eprintln!(); streaming_text = false; }
                     let desc = Self::describe_tool_action(tool, input);
 
                     if tool != "Bash" || !desc.starts_with("running `cat >") && !desc.starts_with("running `python -c") {
-                        eprintln!("  {} {}", "⚡".cyan(), desc);
+                        self.sink.event(Event::ToolAction { model: "claude".into(), desc });
                     }
                 }
                 ("assistant", "tool_result") | ("tool_result", _) => {
@@ -613,12 +612,7 @@ impl ClaudeAdapter {
                                 Some("text") => {
                                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                         if !text.is_empty() {
-                                            if !streaming_text {
-                                                ui::stream_header("claude");
-                                                streaming_text = true;
-                                            }
-                                            eprint!("{}", text);
-                                            let _ = std::io::stderr().lock().flush();
+                                            self.emit_chunk(&mut started, text);
                                             delta_text.push_str(text);
                                         }
                                     }
@@ -626,9 +620,8 @@ impl ClaudeAdapter {
                                 Some("tool_use") => {
                                     let tool = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                                     let input = block.get("input");
-                                    if streaming_text { eprintln!(); streaming_text = false; }
                                     let desc = Self::describe_tool_action(tool, input);
-                                    eprintln!("  {} {}", "⚡".cyan(), desc);
+                                    self.sink.event(Event::ToolAction { model: "claude".into(), desc });
                                 }
                                 _ => {}
                             }
@@ -645,7 +638,7 @@ impl ClaudeAdapter {
             }
         }
 
-        if streaming_text { eprintln!(); }
+        self.sink.event(Event::StreamEnd { model: "claude".into() });
         ui::stream_footer();
 
         if cost_usd.is_none() && (input_tokens > 0 || output_tokens > 0) {

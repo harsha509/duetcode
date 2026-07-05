@@ -1,0 +1,98 @@
+{
+  "name": "dt-duet",
+  "displayName": "DT Duet — AI Pair Programming",
+  "description": "Claude writes, Gemini reviews — run and watch the duet from VS Code.",
+  "version": "0.1.0",
+  "publisher": "harsha509",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/harsha509/duetcode"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dtDuet",
+          "title": "DT Duet",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "dtDuet": [
+        {
+          "id": "dtSessions",
+          "name": "Sessions"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "dt.newTask",
+        "title": "DT: New Task",
+        "icon": "$(add)"
+      },
+      {
+        "command": "dt.refreshSessions",
+        "title": "DT: Refresh Sessions",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dt.openSession",
+        "title": "DT: Open Session"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "dt.newTask",
+          "when": "view == dtSessions",
+          "group": "navigation"
+        },
+        {
+          "command": "dt.refreshSessions",
+          "when": "view == dtSessions",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "DT Duet",
+      "properties": {
+        "dt.binaryPath": {
+          "type": "string",
+          "default": "dt",
+          "description": "Path to the dt binary."
+        },
+        "dt.writer": {
+          "type": "string",
+          "enum": [
+            "claude",
+            "gemini"
+          ],
+          "default": "claude",
+          "description": "Which model writes code (the other reviews)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

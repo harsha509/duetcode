@@ -1,11 +1,11 @@
 use crate::adapters::{ImageInput, ModelAdapter, UsageStats};
 use crate::checks;
 use crate::config::Config;
+use crate::events::{ask_yes_no, AskKind, Event, Sink};
 use crate::git;
 use crate::logs::{RunSummary, SessionLog};
 use crate::policy::{self, ReviewVerdict, Verdict};
 use crate::prompts;
-use crate::ui;
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -22,7 +22,6 @@ pub struct TaskOptions<'a> {
     pub images: &'a [ImageInput],
     pub repo_dir: &'a Path,
     pub continue_session: bool,
-    pub verbose: bool,
     pub auto: bool,
     pub plan_first: bool,
 }
@@ -37,22 +36,45 @@ struct Session {
     fix_template: String,
 }
 
-struct CostTracker {
+struct CostTracker<'a> {
     entries: Vec<UsageStats>,
+    sink: &'a dyn Sink,
 }
 
-impl CostTracker {
-    fn new() -> Self {
-        Self { entries: Vec::new() }
+impl<'a> CostTracker<'a> {
+    fn new(sink: &'a dyn Sink) -> Self {
+        Self { entries: Vec::new(), sink }
     }
 
     fn add(&mut self, usage: UsageStats) {
-        ui::usage(&usage);
+        if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            self.sink.event(Event::Usage {
+                model: usage.model.clone(),
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cost_usd: usage.cost_usd,
+            });
+        }
         self.entries.push(usage);
     }
 
     fn summary(&self) {
-        ui::cost_summary(&self.entries);
+        if self.entries.is_empty() {
+            return;
+        }
+        let input_tokens: u64 = self.entries.iter().map(|u| u.input_tokens).sum();
+        let output_tokens: u64 = self.entries.iter().map(|u| u.output_tokens).sum();
+        let cost_usd = if self.entries.iter().any(|u| u.cost_usd.is_some()) {
+            Some(self.entries.iter().filter_map(|u| u.cost_usd).sum())
+        } else {
+            None
+        };
+        self.sink.event(Event::CostSummary {
+            calls: self.entries.len(),
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        });
     }
 }
 
@@ -131,6 +153,7 @@ pub fn run(
     opts: &TaskOptions,
     writer: &mut dyn ModelAdapter,
     reviewer: &mut dyn ModelAdapter,
+    sink: &dyn Sink,
 ) -> Result<OrchestratorResult> {
     let mode = match (opts.plan_first, opts.auto) {
         (true, true) => "plan + auto",
@@ -138,15 +161,21 @@ pub fn run(
         (false, true) => "auto",
         (false, false) => "interactive",
     };
-    ui::banner(opts.task, writer.name(), reviewer.name(), mode, opts.config.policy.max_rounds);
+    sink.event(Event::TaskStarted {
+        task: opts.task.to_string(),
+        writer: writer.name().to_string(),
+        reviewer: reviewer.name().to_string(),
+        mode: mode.to_string(),
+        max_rounds: opts.config.policy.max_rounds,
+    });
 
-    let session = setup_session(opts)?;
-    ui::info(&format!("logs: {}", session.log.dir.display()));
+    let session = setup_session(opts, sink)?;
+    sink.event(Event::Info { text: format!("logs: {}", session.log.dir.display()) });
 
-    let mut costs = CostTracker::new();
+    let mut costs = CostTracker::new(sink);
 
     let plan = if opts.plan_first {
-        match plan_phase(opts, writer, reviewer, &session, &mut costs)? {
+        match plan_phase(opts, writer, reviewer, &session, &mut costs, sink)? {
             PlanOutcome::Proceed(plan) => Some(plan),
             PlanOutcome::Abort(result) => return Ok(result),
         }
@@ -154,7 +183,7 @@ pub fn run(
         None
     };
 
-    execute_loop(opts, writer, reviewer, &session, plan.as_deref(), &mut costs)
+    execute_loop(opts, writer, reviewer, &session, plan.as_deref(), &mut costs, sink)
 }
 
 pub fn review_only(
@@ -162,7 +191,7 @@ pub fn review_only(
     reviewer: &mut dyn ModelAdapter,
     repo_dir: &Path,
     task: Option<&str>,
-    verbose: bool,
+    sink: &dyn Sink,
 ) -> Result<OrchestratorResult> {
     let diff = git::git_diff(repo_dir)?;
     if diff.trim().is_empty() {
@@ -183,17 +212,20 @@ pub fn review_only(
         "(not provided — judge the diff on its own)",
     );
 
-    let mut costs = CostTracker::new();
-    ui::working(reviewer.name(), "reviewing uncommitted changes…");
+    let mut costs = CostTracker::new(sink);
+    sink.event(Event::Working {
+        actor: reviewer.name().to_string(),
+        action: "reviewing uncommitted changes…".to_string(),
+    });
     let (response, usage) = reviewer.generate(&review_prompt, &[])?;
     costs.add(usage);
 
     if !reviewer.streams_output() {
-        ui::response_block(reviewer.name(), &response, verbose);
+        sink.event(Event::Response { model: reviewer.name().to_string(), text: response.clone() });
     }
 
     let verdict = policy::parse_verdict(&response);
-    ui::verdict(&verdict);
+    emit_verdict(sink, &verdict);
     costs.summary();
 
     let success = verdict.verdict == Verdict::Approved;
@@ -212,25 +244,29 @@ fn plan_phase(
     reviewer: &mut dyn ModelAdapter,
     session: &Session,
     costs: &mut CostTracker,
+    sink: &dyn Sink,
 ) -> Result<PlanOutcome> {
-    ui::section("Planning");
+    sink.event(Event::Section { title: "Planning".into() });
 
     let plan_prompt =
         prompts::build_plan_prompt(prompts::DEFAULT_PLAN_TEMPLATE, opts.task, &session.repo_context, "");
 
-    ui::working(writer.name(), "drafting a plan…");
+    sink.event(Event::Working {
+        actor: writer.name().to_string(),
+        action: "drafting a plan…".to_string(),
+    });
     let (plan, usage) = writer
         .generate(&plan_prompt, opts.images)
         .with_context(|| format!("{} failed during planning", writer.name()))?;
     costs.add(usage);
 
     if !writer.streams_output() {
-        ui::response_block(writer.name(), &plan, opts.verbose);
+        sink.event(Event::Response { model: writer.name().to_string(), text: plan.clone() });
     }
     session.log.write_writer_response(0, &plan)?;
 
-    if !ui::ask_yes_no(&format!("review this plan with {}?", reviewer.name())) {
-        ui::stopped("Plan saved but not reviewed. Exiting.");
+    if !ask_yes_no(sink, &format!("review this plan with {}?", reviewer.name())) {
+        sink.event(Event::Stopped { text: "Plan saved but not reviewed. Exiting.".into() });
         costs.summary();
         return Ok(PlanOutcome::Abort(OrchestratorResult {
             success: false,
@@ -242,20 +278,23 @@ fn plan_phase(
     let review_prompt =
         prompts::build_plan_review_prompt(prompts::DEFAULT_PLAN_REVIEW_TEMPLATE, opts.task, &plan);
 
-    ui::working(reviewer.name(), "reviewing the plan…");
+    sink.event(Event::Working {
+        actor: reviewer.name().to_string(),
+        action: "reviewing the plan…".to_string(),
+    });
     let (plan_review, usage) = reviewer
         .generate(&review_prompt, &[])
         .with_context(|| format!("{} failed during plan review", reviewer.name()))?;
     costs.add(usage);
 
     if !reviewer.streams_output() {
-        ui::response_block(reviewer.name(), &plan_review, opts.verbose);
+        sink.event(Event::Response { model: reviewer.name().to_string(), text: plan_review.clone() });
     }
     session.log.write_reviewer_response(0, &plan_review)?;
-    ui::verdict(&policy::parse_verdict(&plan_review));
+    emit_verdict(sink, &policy::parse_verdict(&plan_review));
 
-    if !ui::ask_yes_no("execute this task?") {
-        ui::stopped("Exiting without executing.");
+    if !ask_yes_no(sink, "execute this task?") {
+        sink.event(Event::Stopped { text: "Exiting without executing.".into() });
         costs.summary();
         return Ok(PlanOutcome::Abort(OrchestratorResult {
             success: false,
@@ -274,6 +313,7 @@ fn execute_loop(
     session: &Session,
     plan: Option<&str>,
     costs: &mut CostTracker,
+    sink: &dyn Sink,
 ) -> Result<OrchestratorResult> {
     let max_rounds = opts.config.policy.max_rounds;
     let hard_cap = max_rounds * 2;
@@ -293,7 +333,7 @@ fn execute_loop(
 
     while round < budget {
         round += 1;
-        ui::round_header(round, budget);
+        sink.event(Event::RoundStarted { round, budget });
 
         let clar = clarification.take();
         let writer_prompt = build_writer_prompt(
@@ -301,10 +341,10 @@ fn execute_loop(
         );
         let diff_before = git::git_diff(opts.repo_dir).unwrap_or_default();
 
-        ui::working(
-            writer.name(),
-            if round == 1 { "implementing…" } else { "addressing review feedback…" },
-        );
+        sink.event(Event::Working {
+            actor: writer.name().to_string(),
+            action: if round == 1 { "implementing…" } else { "addressing review feedback…" }.to_string(),
+        });
         let round_images = if round == 1 { opts.images } else { &[][..] };
         let (writer_response, usage) = writer
             .generate(&writer_prompt, round_images)
@@ -313,31 +353,40 @@ fn execute_loop(
 
         session.log.write_writer_response(round, &writer_response)?;
         if !writer.streams_output() {
-            ui::response_block(writer.name(), &writer_response, opts.verbose);
+            sink.event(Event::Response { model: writer.name().to_string(), text: writer_response.clone() });
         }
 
-        match writer_diff_outcome(opts, reviewer.name(), &session.log, round, &diff_before)? {
+        match writer_diff_outcome(opts, reviewer.name(), &session.log, round, &diff_before, sink)? {
             DiffOutcome::NoChanges if !answer_mode && round > 1 => {
-                ui::warn(&format!("{} made no changes in response to feedback", writer.name()));
+                sink.event(Event::Warn {
+                    text: format!("{} made no changes in response to feedback", writer.name()),
+                });
                 stall.observe_no_changes();
             }
             DiffOutcome::NoChanges => {
                 answer_mode = true;
-                ui::info(&format!("{} answered without making code changes", writer.name()));
+                sink.event(Event::Info {
+                    text: format!("{} answered without making code changes", writer.name()),
+                });
 
                 let wants_review = opts.auto
-                    || ui::ask_yes_no(&format!("review this answer with {}?", reviewer.name()));
+                    || ask_yes_no(sink, &format!("review this answer with {}?", reviewer.name()));
                 if !wants_review {
                     costs.summary();
                     return Ok(ok_result(round, "completed — answer accepted without review"));
                 }
 
-                let review =
-                    run_answer_review(opts, reviewer, session, costs, round, &writer_response, clar.as_deref())?;
+                let input = ReviewInput {
+                    round,
+                    diff: "",
+                    writer_notes: &writer_response,
+                    clarification: clar.as_deref(),
+                };
+                let review = run_answer_review(opts, reviewer, session, costs, &input, sink)?;
                 last_checks_passed = true;
 
                 if review.approved() {
-                    ui::success("Answer approved!");
+                    sink.event(Event::Success { text: "Answer approved!".into() });
                     session.log.write_summary(&RunSummary {
                         task: opts.task,
                         writer: writer.name(),
@@ -356,9 +405,9 @@ fn execute_loop(
                 last_verdict = Some(review.verdict.clone());
 
                 if !opts.auto
-                    && !ui::ask_yes_no(&format!("let {} revise the answer?", writer.name()))
+                    && !ask_yes_no(sink, &format!("let {} revise the answer?", writer.name()))
                 {
-                    ui::stopped("Stopping. Review feedback saved in logs.");
+                    sink.event(Event::Stopped { text: "Stopping. Review feedback saved in logs.".into() });
                     session.log.write_summary(&RunSummary {
                         task: opts.task,
                         writer: writer.name(),
@@ -373,7 +422,7 @@ fn execute_loop(
                 }
             }
             DiffOutcome::UserSkipped => {
-                ui::success("Task completed.");
+                sink.event(Event::Success { text: "Task completed.".into() });
                 costs.summary();
                 return Ok(ok_result(round, "completed — user accepted without review"));
             }
@@ -385,11 +434,11 @@ fn execute_loop(
                     writer_notes: &writer_response,
                     clarification: clar.as_deref(),
                 };
-                let review = run_review(opts, reviewer, session, costs, &input)?;
+                let review = run_review(opts, reviewer, session, costs, &input, sink)?;
                 last_checks_passed = review.checks_passed;
 
                 if review.approved() {
-                    ui::success("Approved!");
+                    sink.event(Event::Success { text: "Approved!".into() });
                     session.log.write_summary(&RunSummary {
                         task: opts.task,
                         writer: writer.name(),
@@ -399,21 +448,21 @@ fn execute_loop(
                         checks_passed: true,
                         success: true,
                     })?;
-                    notify_approval(writer, &review.response, costs);
+                    notify_approval(writer, &review.response, costs, sink);
                     costs.summary();
                     return Ok(ok_result(round, "approved with all checks passing"));
                 }
 
                 if review.verdict.verdict == Verdict::Approved && !review.checks_passed {
-                    ui::warn("AI approved, but checks failed");
+                    sink.event(Event::Warn { text: "AI approved, but checks failed".into() });
                 }
 
                 stall.observe_review(&review.verdict.blockers, &diff);
                 feedback = Some(build_feedback(&review));
                 last_verdict = Some(review.verdict.clone());
 
-                if !opts.auto && !ask_fix(&review, writer.name()) {
-                    ui::stopped("Stopping. Review feedback saved in logs.");
+                if !opts.auto && !ask_fix(&review, writer.name(), sink) {
+                    sink.event(Event::Stopped { text: "Stopping. Review feedback saved in logs.".into() });
                     session.log.write_summary(&RunSummary {
                         task: opts.task,
                         writer: writer.name(),
@@ -430,7 +479,7 @@ fn execute_loop(
         }
 
         if opts.auto && (stall.is_stuck() || round == budget) && round < hard_cap {
-            match escalate(last_verdict.as_ref(), &mut clarifications_used, &session.log, round)? {
+            match escalate(last_verdict.as_ref(), &mut clarifications_used, &session.log, round, sink)? {
                 Escalation::Continue(text) => {
                     clarification = Some(text);
                     stall = StallDetector::default();
@@ -507,6 +556,7 @@ fn writer_diff_outcome(
     log: &SessionLog,
     round: usize,
     diff_before: &str,
+    sink: &dyn Sink,
 ) -> Result<DiffOutcome> {
     let diff_after = git::git_diff(opts.repo_dir)?;
     let changed = diff_after != diff_before;
@@ -520,10 +570,10 @@ fn writer_diff_outcome(
 
     let stat = git::git_diff_stat(opts.repo_dir).unwrap_or_default();
     if !stat.trim().is_empty() {
-        ui::changes(&stat);
+        sink.event(Event::Changes { stat });
     }
 
-    if opts.auto || ui::ask_yes_no(&format!("review changes with {}?", reviewer_name)) {
+    if opts.auto || ask_yes_no(sink, &format!("review changes with {}?", reviewer_name)) {
         Ok(DiffOutcome::Review(diff_after))
     } else {
         Ok(DiffOutcome::UserSkipped)
@@ -536,16 +586,17 @@ fn run_review(
     session: &Session,
     costs: &mut CostTracker,
     input: &ReviewInput,
+    sink: &dyn Sink,
 ) -> Result<ReviewOutcome> {
-    ui::working("checks", "running configured checks…");
+    sink.event(Event::Working { actor: "checks".into(), action: "running configured checks…".into() });
     let check_results = checks::run_checks(&opts.config.checks, opts.repo_dir);
     session.log.write_checks(input.round, &check_results)?;
 
     if check_results.is_empty() {
-        ui::info("no checks configured (.duet/config.toml [checks])");
+        sink.event(Event::Info { text: "no checks configured (.duet/config.toml [checks])".into() });
     }
     for cr in &check_results {
-        ui::check_result(&cr.name, cr.passed);
+        sink.event(Event::Check { name: cr.name.clone(), passed: cr.passed });
     }
 
     let checks_summary = checks::format_check_results(&check_results);
@@ -560,7 +611,10 @@ fn run_review(
         review_prompt.push_str(&format!("\n\nUSER CLARIFICATION (authoritative):\n{}", text));
     }
 
-    ui::working(reviewer.name(), "reviewing the changes…");
+    sink.event(Event::Working {
+        actor: reviewer.name().to_string(),
+        action: "reviewing the changes…".to_string(),
+    });
     let (response, usage) = reviewer
         .generate(&review_prompt, &[])
         .with_context(|| format!("reviewer ({}) failed in round {}", reviewer.name(), input.round))?;
@@ -568,11 +622,11 @@ fn run_review(
 
     session.log.write_reviewer_response(input.round, &response)?;
     if !reviewer.streams_output() {
-        ui::response_block(reviewer.name(), &response, opts.verbose);
+        sink.event(Event::Response { model: reviewer.name().to_string(), text: response.clone() });
     }
 
     let verdict = policy::parse_verdict(&response);
-    ui::verdict(&verdict);
+    emit_verdict(sink, &verdict);
 
     Ok(ReviewOutcome {
         checks_passed: checks::all_passed(&check_results),
@@ -588,30 +642,32 @@ fn run_answer_review(
     reviewer: &mut dyn ModelAdapter,
     session: &Session,
     costs: &mut CostTracker,
-    round: usize,
-    answer: &str,
-    clarification: Option<&str>,
+    input: &ReviewInput,
+    sink: &dyn Sink,
 ) -> Result<ReviewOutcome> {
     let mut prompt = prompts::build_answer_review_prompt(
-        prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE, opts.task, answer,
+        prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE, opts.task, input.writer_notes,
     );
-    if let Some(text) = clarification {
+    if let Some(text) = input.clarification {
         prompt.push_str(&format!("\n\nUSER CLARIFICATION (authoritative):\n{}", text));
     }
 
-    ui::working(reviewer.name(), "reviewing the answer…");
+    sink.event(Event::Working {
+        actor: reviewer.name().to_string(),
+        action: "reviewing the answer…".to_string(),
+    });
     let (response, usage) = reviewer
         .generate(&prompt, &[])
-        .with_context(|| format!("reviewer ({}) failed in round {}", reviewer.name(), round))?;
+        .with_context(|| format!("reviewer ({}) failed in round {}", reviewer.name(), input.round))?;
     costs.add(usage);
 
-    session.log.write_reviewer_response(round, &response)?;
+    session.log.write_reviewer_response(input.round, &response)?;
     if !reviewer.streams_output() {
-        ui::response_block(reviewer.name(), &response, opts.verbose);
+        sink.event(Event::Response { model: reviewer.name().to_string(), text: response.clone() });
     }
 
     let verdict = policy::parse_verdict(&response);
-    ui::verdict(&verdict);
+    emit_verdict(sink, &verdict);
 
     Ok(ReviewOutcome {
         checks_passed: true,
@@ -634,13 +690,13 @@ fn build_feedback(review: &ReviewOutcome) -> String {
     }
 }
 
-fn ask_fix(review: &ReviewOutcome, writer_name: &str) -> bool {
+fn ask_fix(review: &ReviewOutcome, writer_name: &str, sink: &dyn Sink) -> bool {
     let question = if review.verdict.verdict == Verdict::Approved && !review.checks_passed {
         format!("AI approved, but checks failed. Let {} try to fix the checks?", writer_name)
     } else {
         format!("let {} fix the issues?", writer_name)
     };
-    ui::ask_yes_no(&question)
+    ask_yes_no(sink, &question)
 }
 
 fn escalate(
@@ -648,25 +704,29 @@ fn escalate(
     clarifications_used: &mut usize,
     log: &SessionLog,
     round: usize,
+    sink: &dyn Sink,
 ) -> Result<Escalation> {
-    ui::section("Needs your input");
-    ui::warn("the models are not converging on their own");
+    sink.event(Event::Section { title: "Needs your input".into() });
+    sink.event(Event::Warn { text: "the models are not converging on their own".into() });
 
     if let Some(v) = last_verdict {
         if !v.blockers.is_empty() {
-            ui::info("open blockers:");
+            sink.event(Event::Info { text: "open blockers:".into() });
             for b in &v.blockers {
-                ui::blocker(b);
+                sink.event(Event::Blocker { text: b.clone() });
             }
         }
     }
 
     if *clarifications_used >= 1 {
-        ui::stopped("Clarification already given once — stopping so you can take over.");
+        sink.event(Event::Stopped {
+            text: "Clarification already given once — stopping so you can take over.".into(),
+        });
         return Ok(Escalation::Stop);
     }
 
-    let text = ui::ask_text("guidance for both models (empty to stop)");
+    let text = sink.ask(AskKind::Text, "guidance for both models (empty to stop)");
+    let text = text.trim().to_string();
     if text.is_empty() {
         return Ok(Escalation::Stop);
     }
@@ -676,8 +736,16 @@ fn escalate(
     Ok(Escalation::Continue(text))
 }
 
-fn notify_approval(writer: &mut dyn ModelAdapter, reviewer_response: &str, costs: &mut CostTracker) {
-    ui::working(writer.name(), "acknowledging approval…");
+fn notify_approval(
+    writer: &mut dyn ModelAdapter,
+    reviewer_response: &str,
+    costs: &mut CostTracker,
+    sink: &dyn Sink,
+) {
+    sink.event(Event::Working {
+        actor: writer.name().to_string(),
+        action: "acknowledging approval…".to_string(),
+    });
     let prompt = format!(
         "The reviewer has APPROVED your changes with the following feedback:\n\n{}\n\n\
          No further action is required. Please acknowledge.",
@@ -688,9 +756,17 @@ fn notify_approval(writer: &mut dyn ModelAdapter, reviewer_response: &str, costs
     }
 }
 
+fn emit_verdict(sink: &dyn Sink, verdict: &ReviewVerdict) {
+    sink.event(Event::Verdict {
+        approved: verdict.verdict == Verdict::Approved,
+        blockers: verdict.blockers.clone(),
+        suggestions: verdict.suggestions.clone(),
+    });
+}
+
 // ── Setup helpers ──
 
-fn setup_session(opts: &TaskOptions) -> Result<Session> {
+fn setup_session(opts: &TaskOptions, sink: &dyn Sink) -> Result<Session> {
     let config = opts.config;
     let repo_dir = opts.repo_dir;
 
@@ -709,7 +785,7 @@ fn setup_session(opts: &TaskOptions) -> Result<Session> {
         if let Some(last_session) = SessionLog::get_last_session(repo_dir)? {
             let previous_context = SessionLog::read_session_context(&last_session)?;
             if !previous_context.is_empty() {
-                ui::info("continuing from previous session");
+                sink.event(Event::Info { text: "continuing from previous session".into() });
                 repo_context = format!("{}\n\n{}", repo_context, previous_context);
             }
         }

@@ -2,7 +2,6 @@
 //! formatting concerns and the CLI has one consistent voice.
 
 use crate::adapters::UsageStats;
-use crate::policy::{ReviewVerdict, Verdict};
 use colored::Colorize;
 use std::io::Write;
 
@@ -69,25 +68,34 @@ pub fn changes(stat: &str) {
     println!("  {} Changes:\n{}", "~~".blue(), indent(stat, "     "));
 }
 
-pub fn verdict(v: &ReviewVerdict) {
-    let label = match v.verdict {
-        Verdict::Approved => "APPROVED".green().bold(),
-        Verdict::ChangesRequested => "CHANGES REQUESTED".red().bold(),
+pub fn verdict(approved: bool, blockers: &[String], suggestions: &[String]) {
+    let label = if approved {
+        "APPROVED".green().bold()
+    } else {
+        "CHANGES REQUESTED".red().bold()
     };
     println!("  {} AI Verdict: {}", "⚖".cyan(), label);
 
-    if !v.blockers.is_empty() {
+    if !blockers.is_empty() {
         println!("  {} Blockers:", "✗".red());
-        for b in &v.blockers {
+        for b in blockers {
             blocker(b);
         }
     }
-    if !v.suggestions.is_empty() {
+    if !suggestions.is_empty() {
         println!("  {} Suggestions:", "~".yellow());
-        for s in &v.suggestions {
+        for s in suggestions {
             println!("    - {}", s.yellow());
         }
     }
+}
+
+pub fn thinking() {
+    eprintln!("  {} reasoning...", "◌".cyan());
+}
+
+pub fn tool_action(desc: &str) {
+    eprintln!("  {} {}", "⚡".cyan(), desc);
 }
 
 pub fn usage(u: &UsageStats) {
@@ -105,25 +113,20 @@ pub fn usage(u: &UsageStats) {
     );
 }
 
-pub fn cost_summary(entries: &[UsageStats]) {
-    if entries.is_empty() {
+pub fn cost_summary(calls: usize, input_tokens: u64, output_tokens: u64, cost_usd: Option<f64>) {
+    if calls == 0 {
         return;
     }
-    let total_in: u64 = entries.iter().map(|u| u.input_tokens).sum();
-    let total_out: u64 = entries.iter().map(|u| u.output_tokens).sum();
-    let total_cost: f64 = entries.iter().filter_map(|u| u.cost_usd).sum();
-    let has_cost = entries.iter().any(|u| u.cost_usd.is_some());
-
     println!("\n{}", "━━━ Cost Summary ━━━".cyan().bold());
     println!(
         "  {} calls | {}in + {}out = {} tokens",
-        entries.len(),
-        total_in,
-        total_out,
-        total_in + total_out,
+        calls,
+        input_tokens,
+        output_tokens,
+        input_tokens + output_tokens,
     );
-    if has_cost {
-        println!("  Total cost: {}", format!("${:.6}", total_cost).yellow().bold());
+    if let Some(cost) = cost_usd {
+        println!("  Total cost: {}", format!("${:.6}", cost).yellow().bold());
     }
 }
 
