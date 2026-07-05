@@ -565,16 +565,33 @@ impl ClaudeAdapter {
                     if let Some(result) = event.get("result").and_then(|v| v.as_str()) {
                         full_result = result.to_string();
                     }
-                    if let Some(cost) = event.get("cost_usd").and_then(|v| v.as_f64()) {
+                    // Older CLI: cost_usd. Newer CLI: total_cost_usd.
+                    let cost = event.get("cost_usd").and_then(|v| v.as_f64())
+                        .or_else(|| event.get("total_cost_usd").and_then(|v| v.as_f64()));
+                    if let Some(cost) = cost {
                         cost_usd = Some(cost);
                         let duration = event.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                         eprintln!("  {} done ({:.1}s, ${:.4})", "●".green(), duration as f64 / 1000.0, cost);
                     }
+                    // Older CLI: top-level token counts. Newer CLI: nested
+                    // under `usage`, with cache tokens split out.
                     if let Some(it) = event.get("input_tokens").and_then(|v| v.as_u64()) {
                         input_tokens = it;
                     }
                     if let Some(ot) = event.get("output_tokens").and_then(|v| v.as_u64()) {
                         output_tokens = ot;
+                    }
+                    if let Some(usage) = event.get("usage") {
+                        let count = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+                        let total_in = count("input_tokens")
+                            + count("cache_read_input_tokens")
+                            + count("cache_creation_input_tokens");
+                        if total_in > 0 {
+                            input_tokens = total_in;
+                        }
+                        if let Some(ot) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                            output_tokens = ot;
+                        }
                     }
                     if let Some(m) = event.get("model").and_then(|v| v.as_str()) {
                         model_name = m.to_string();

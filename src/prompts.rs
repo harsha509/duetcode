@@ -59,6 +59,17 @@ pub fn build_plan_review_prompt(template: &str, task: &str, plan: &str) -> Strin
     render(template, &[("task", task), ("plan", plan)])
 }
 
+pub fn build_answer_review_prompt(template: &str, task: &str, answer: &str) -> String {
+    render(template, &[("task", task), ("answer", answer)])
+}
+
+pub fn build_answer_fix_prompt(template: &str, task: &str, review_feedback: &str) -> String {
+    render(
+        template,
+        &[("task", task), ("review_feedback", review_feedback)],
+    )
+}
+
 pub fn build_implement_with_plan_prompt(template: &str, task: &str, context: &str, plan: &str) -> String {
     let full_context = format!("{}\n\nAPPROVED PLAN:\n{}", context, plan);
     render(template, &[("task", task), ("context", &full_context)])
@@ -168,6 +179,38 @@ Rules:
 At the end, write one of these on its own line:
 VERDICT: APPROVED
 VERDICT: CHANGES_REQUESTED
+"#;
+
+pub const DEFAULT_ANSWER_REVIEW_TEMPLATE: &str = r#"You are a senior engineer giving a second opinion. Another engineer investigated the repository and answered the question below. Verify their answer.
+
+TASK / QUESTION: {task}
+
+THEIR ANSWER:
+{answer}
+
+Assess whether the reasoning is sound, internally consistent, and actually answers the question. If you are able to inspect the repository, verify the specific claims (files, line numbers, APIs) really exist and support the conclusions. Flag anything wrong, unverifiable, or missing. Do not make any code changes.
+
+Rules:
+- NEVER run `git add`, `git commit`, or `git push`. You are a reviewer only.
+- Be direct. If the answer is accurate and complete, approve it.
+
+At the end, write one of these on its own line:
+VERDICT: APPROVED
+VERDICT: CHANGES_REQUESTED
+"#;
+
+pub const DEFAULT_ANSWER_FIX_TEMPLATE: &str = r#"You are an expert software engineer. A reviewer checked the answer you gave and found issues. Revise your answer.
+
+TASK / QUESTION: {task}
+
+REVIEWER FEEDBACK:
+{review_feedback}
+
+Rules:
+- This is a question/analysis task — do NOT make code changes unless the feedback explicitly requires them.
+- NEVER run `git add`, `git commit`, or `git push`.
+
+Give the corrected, complete answer.
 "#;
 
 #[cfg(test)]

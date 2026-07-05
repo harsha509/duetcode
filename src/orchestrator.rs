@@ -285,6 +285,10 @@ fn execute_loop(
     let mut feedback: Option<String> = None;
     let mut last_verdict: Option<ReviewVerdict> = None;
     let mut last_checks_passed = false;
+    // True while the task is being handled as a text answer (no code changes
+    // yet): review targets the answer itself, and later no-change rounds are
+    // revisions, not stalls.
+    let mut answer_mode = false;
     let mut round = 0;
 
     while round < budget {
@@ -292,8 +296,9 @@ fn execute_loop(
         ui::round_header(round, budget);
 
         let clar = clarification.take();
-        let writer_prompt =
-            build_writer_prompt(session, opts.task, plan, round, feedback.as_deref(), clar.as_deref());
+        let writer_prompt = build_writer_prompt(
+            session, opts.task, plan, round, feedback.as_deref(), clar.as_deref(), answer_mode,
+        );
         let diff_before = git::git_diff(opts.repo_dir).unwrap_or_default();
 
         ui::working(
@@ -312,14 +317,60 @@ fn execute_loop(
         }
 
         match writer_diff_outcome(opts, reviewer.name(), &session.log, round, &diff_before)? {
-            DiffOutcome::NoChanges => {
-                if round == 1 {
-                    ui::info(&format!("{} answered without making code changes", writer.name()));
-                    costs.summary();
-                    return Ok(ok_result(round, "completed — no code changes needed"));
-                }
+            DiffOutcome::NoChanges if !answer_mode && round > 1 => {
                 ui::warn(&format!("{} made no changes in response to feedback", writer.name()));
                 stall.observe_no_changes();
+            }
+            DiffOutcome::NoChanges => {
+                answer_mode = true;
+                ui::info(&format!("{} answered without making code changes", writer.name()));
+
+                let wants_review = opts.auto
+                    || ui::ask_yes_no(&format!("review this answer with {}?", reviewer.name()));
+                if !wants_review {
+                    costs.summary();
+                    return Ok(ok_result(round, "completed — answer accepted without review"));
+                }
+
+                let review =
+                    run_answer_review(opts, reviewer, session, costs, round, &writer_response, clar.as_deref())?;
+                last_checks_passed = true;
+
+                if review.approved() {
+                    ui::success("Answer approved!");
+                    session.log.write_summary(&RunSummary {
+                        task: opts.task,
+                        writer: writer.name(),
+                        reviewer: reviewer.name(),
+                        rounds: round,
+                        verdict: &review.verdict,
+                        checks_passed: true,
+                        success: true,
+                    })?;
+                    costs.summary();
+                    return Ok(ok_result(round, "answer approved by reviewer"));
+                }
+
+                stall.observe_review(&review.verdict.blockers, "");
+                feedback = Some(review.response.clone());
+                last_verdict = Some(review.verdict.clone());
+
+                if !opts.auto
+                    && !ui::ask_yes_no(&format!("let {} revise the answer?", writer.name()))
+                {
+                    ui::stopped("Stopping. Review feedback saved in logs.");
+                    session.log.write_summary(&RunSummary {
+                        task: opts.task,
+                        writer: writer.name(),
+                        reviewer: reviewer.name(),
+                        rounds: round,
+                        verdict: &review.verdict,
+                        checks_passed: true,
+                        success: false,
+                    })?;
+                    costs.summary();
+                    return Ok(ok_result(round, "user stopped after answer review"));
+                }
             }
             DiffOutcome::UserSkipped => {
                 ui::success("Task completed.");
@@ -327,6 +378,7 @@ fn execute_loop(
                 return Ok(ok_result(round, "completed — user accepted without review"));
             }
             DiffOutcome::Review(diff) => {
+                answer_mode = false;
                 let input = ReviewInput {
                     round,
                     diff: &diff,
@@ -421,6 +473,7 @@ fn build_writer_prompt(
     round: usize,
     feedback: Option<&str>,
     clarification: Option<&str>,
+    answer_mode: bool,
 ) -> String {
     let mut prompt = if round == 1 {
         match plan {
@@ -431,6 +484,10 @@ fn build_writer_prompt(
                 &session.impl_template, task, &session.repo_context, "",
             ),
         }
+    } else if answer_mode {
+        prompts::build_answer_fix_prompt(
+            prompts::DEFAULT_ANSWER_FIX_TEMPLATE, task, feedback.unwrap_or_default(),
+        )
     } else {
         prompts::build_fix_prompt(&session.fix_template, task, feedback.unwrap_or_default())
     };
@@ -522,6 +579,45 @@ fn run_review(
         verdict,
         response,
         checks_summary,
+    })
+}
+
+/// Second opinion on a text answer (no diff involved, so no checks either).
+fn run_answer_review(
+    opts: &TaskOptions,
+    reviewer: &mut dyn ModelAdapter,
+    session: &Session,
+    costs: &mut CostTracker,
+    round: usize,
+    answer: &str,
+    clarification: Option<&str>,
+) -> Result<ReviewOutcome> {
+    let mut prompt = prompts::build_answer_review_prompt(
+        prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE, opts.task, answer,
+    );
+    if let Some(text) = clarification {
+        prompt.push_str(&format!("\n\nUSER CLARIFICATION (authoritative):\n{}", text));
+    }
+
+    ui::working(reviewer.name(), "reviewing the answer…");
+    let (response, usage) = reviewer
+        .generate(&prompt, &[])
+        .with_context(|| format!("reviewer ({}) failed in round {}", reviewer.name(), round))?;
+    costs.add(usage);
+
+    session.log.write_reviewer_response(round, &response)?;
+    if !reviewer.streams_output() {
+        ui::response_block(reviewer.name(), &response, opts.verbose);
+    }
+
+    let verdict = policy::parse_verdict(&response);
+    ui::verdict(&verdict);
+
+    Ok(ReviewOutcome {
+        checks_passed: true,
+        checks_summary: String::new(),
+        verdict,
+        response,
     })
 }
 
