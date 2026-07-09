@@ -74,7 +74,7 @@ impl Sink for JsonSink {
     }
 }
 
-pub fn run(dir: &Path, writer_name: &str) -> Result<()> {
+pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Result<()> {
     if !git::is_git_repo(dir) {
         anyhow::bail!("not a git repository — run `git init` first");
     }
@@ -85,7 +85,7 @@ pub fn run(dir: &Path, writer_name: &str) -> Result<()> {
     let sink: Arc<JsonSink> = Arc::new(JsonSink::new(ans_rx));
     spawn_stdin_reader(cmd_tx, ans_tx, sink.clone());
 
-    let setup = cli::setup_task(dir, writer_name, &[], false, sink.clone())?;
+    let setup = cli::setup_task(dir, writer_name, &[], false, sink.clone(), &overrides)?;
     let cli::TaskSetup { config, images: _, mut writer, mut reviewer } = setup;
 
     sink.event(Event::Ready {

@@ -12,6 +12,8 @@ export class DuetPanel {
   static current: DuetPanel | undefined;
 
   private pendingImages: string[] = [];
+  /** Pasted screenshots written to tmp for the current task; deleted when it ends. */
+  private sentTmpImages: string[] = [];
   private readonly disposables: vscode.Disposable[] = [];
 
   static createOrShow(ctx: vscode.ExtensionContext, client: ServeClient): DuetPanel {
@@ -40,7 +42,12 @@ export class DuetPanel {
   ) {
     panel.webview.html = this.renderHtml(ctx);
     this.disposables.push(
-      this.client.onEvent((ev) => this.post({ type: 'event', ev })),
+      this.client.onEvent((ev) => {
+        this.post({ type: 'event', ev });
+        if (ev.event === 'task_done' || ev.event === 'error') {
+          this.cleanupTmpImages();
+        }
+      }),
       this.client.onExit((code) => this.post({ type: 'serveExit', code })),
       panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg)),
       panel.onDidDispose(() => this.dispose()),
@@ -62,6 +69,8 @@ export class DuetPanel {
         };
         if (this.pendingImages.length > 0) {
           cmd.images = this.pendingImages;
+          const tmp = os.tmpdir();
+          this.sentTmpImages.push(...this.pendingImages.filter((p) => p.startsWith(tmp)));
           this.pendingImages = [];
         }
         this.client.send(cmd);
@@ -75,6 +84,9 @@ export class DuetPanel {
         break;
       case 'attach':
         void this.pickImages();
+        break;
+      case 'settings':
+        void vscode.commands.executeCommand('dt.settings');
         break;
       case 'pastedImage':
         this.savePastedImage(msg.dataB64);
@@ -103,6 +115,12 @@ export class DuetPanel {
     fs.writeFileSync(file, Buffer.from(dataB64, 'base64'));
     this.pendingImages.push(file);
     this.post({ type: 'attached', name: 'clipboard image' });
+  }
+
+  private cleanupTmpImages(): void {
+    for (const file of this.sentTmpImages.splice(0)) {
+      fs.unlink(file, () => {});
+    }
   }
 
   private post(msg: unknown): void {
@@ -138,6 +156,7 @@ export class DuetPanel {
       <label><input type="checkbox" id="auto" checked> auto</label>
       <label><input type="checkbox" id="plan"> plan</label>
       <button id="attach" title="Attach image">📎</button>
+      <button id="settings" title="Settings — API keys, Claude login">⚙</button>
       <button id="review" title="Review uncommitted changes">review</button>
       <button id="send">Send</button>
     </div>

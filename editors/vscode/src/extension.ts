@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import { DuetPanel } from './panel';
 import { ServeClient } from './serveClient';
 import { SessionsProvider } from './sessions';
+import { secretEnv } from './settings';
+import { SettingsPanel } from './settingsPanel';
 
 export function activate(ctx: vscode.ExtensionContext): void {
   const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -9,13 +11,30 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const provider = new SessionsProvider(root);
   ctx.subscriptions.push(vscode.window.registerTreeDataProvider('dtSessions', provider));
 
-  const cfg = vscode.workspace.getConfiguration('dt');
   const client = new ServeClient(
-    cfg.get('binaryPath', 'dt'),
+    () => {
+      const cfg = vscode.workspace.getConfiguration('dt');
+      return {
+        binPath: cfg.get('binaryPath', 'dt'),
+        writer: cfg.get('writer', 'claude'),
+        claudeModel: cfg.get('claudeModel', ''),
+        geminiModel: cfg.get('geminiModel', ''),
+      };
+    },
     root ?? process.cwd(),
-    cfg.get('writer', 'claude'),
+    () => secretEnv(ctx),
   );
   ctx.subscriptions.push(client);
+
+  // Settings only take effect on a fresh `dt serve` spawn; restart so the
+  // next task picks up a changed writer, model, or binary path.
+  ctx.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('dt')) {
+        client.restart();
+      }
+    }),
+  );
 
   ctx.subscriptions.push(
     vscode.commands.registerCommand('dt.newTask', () => {
@@ -25,6 +44,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dt.openSession', (dir: string) => {
       DuetPanel.createOrShow(ctx, client).showHistory(dir);
     }),
+    vscode.commands.registerCommand('dt.settings', () => SettingsPanel.createOrShow(ctx, client)),
   );
 
   if (root) {

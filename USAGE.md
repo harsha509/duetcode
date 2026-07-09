@@ -1,71 +1,82 @@
 # duetcode (`dt`) Usage Guide
 
-`dt` is an AI pair programming CLI that orchestrates two LLM agents: a **Writer** (default: Claude) that implements code, and a **Reviewer** (default: Gemini) that reviews the changes against your linters and tests.
-
-This guide covers all available commands and how to use them effectively.
+`dt` orchestrates two LLM agents: a **Writer** (default: Claude) that implements code, and a **Reviewer** (default: Gemini) that reviews the changes against your linters and tests. This guide covers every command and mode.
 
 ---
 
 ## Core Commands
 
-### 1. `dt <task>` (Default Run)
+### 1. `dt` (Interactive Session)
 
-The primary command. It takes a natural language task, asks the Writer to implement it, and then interactively guides you through reviewing and fixing the code.
+Bare `dt` in an initialized repo opens a persistent session. Both models keep their context for the whole session — follow-up tasks build on what was just done, on both the writer and reviewer side.
 
-**Basic usage:**
+```
+$ dt
+dt ❯ add a dark mode toggle
+dt ❯ now persist it to localStorage      ← full memory of the previous task
+```
+
+Session commands:
+
+| Command | Effect |
+|---|---|
+| `/auto` | Toggle autonomous looping on/off |
+| `/image <path>` | Stage a screenshot for the next task (repeatable; handles drag-and-drop paths and `~/`) |
+| `/paste` | Stage the image currently on the OS clipboard (`Cmd+Ctrl+Shift+4` → snip → `/paste`) |
+| `/plan <task>` | Plan first, then execute after approval |
+| `/review [task]` | Review uncommitted changes |
+| `/help`, `/quit` | Help / leave |
+
+Anything else you type is sent to the duet as a task.
+
+### 2. `dt <task>` (One-shot Run)
+
 ```bash
 dt "add input validation to the signup form"
 ```
 
-**With images (e.g., UI mockups or bug screenshots):**
+**Interactive flow (default):**
+1. The writer reads your codebase and makes the change.
+2. `dt` shows the diff stat and asks: `review changes with gemini? (y/n)`
+3. Your configured checks run; the reviewer gets the diff, check results, and the writer's own explanation of what it did.
+4. Verdict: `APPROVED` (and checks pass) → done. Otherwise: `let claude fix the issues? (y/n)` and the loop continues.
+
+**Auto flow (`--auto`):** same loop with no questions — the models iterate until mutual approval or the round budget (`max_rounds`) runs out. If the reviewer keeps raising the same blockers or the writer stops making progress, dt pauses, shows you the disputed blockers, and asks for one clarification; your guidance is injected into **both** models' prompts and the loop resumes (budget extends once, up to 2×`max_rounds`).
+
 ```bash
-dt "make the button look like this" --image ./mockup.png
+dt "add input validation" --auto
 ```
 
-**Interactive Flow:**
-1. Claude reads your codebase and writes the code.
-2. `dt` shows you the exact files changed.
-3. You are asked: `Review changes with gemini? (y/n)`
-4. If `y`, `dt` runs your local tests/linters and sends the diff + test results to Gemini.
-5. Gemini replies with `APPROVED` or `CHANGES_REQUESTED`.
-6. If changes are requested, you are asked: `Let claude fix? (y/n)`.
-7. If `y`, the loop continues.
+**Question tasks:** if the task is a question ("do we have performance issues?"), the writer answers without touching code — and the reviewer then gives a second opinion on the answer itself (auto: always; interactive: you're asked). Wrong or incomplete answers loop back for revision like code does.
 
-### 2. `dt plan <task>`
+**Role flip / images / continuity:**
+```bash
+dt "fix bug" --writer gemini          # Gemini writes, Claude reviews
+dt "match this" --image mockup.png    # attach screenshots
+dt "fix the test" -c                  # carry previous session's context
+```
 
-For large, complex, or ambiguous tasks, it's best to ask the AI to write a plan *before* it starts editing files.
+### 3. `dt plan <task>`
 
-**Usage:**
+For large or ambiguous tasks: plan before touching files.
+
 ```bash
 dt plan "refactor the database connection logic"
 ```
 
-**Interactive Flow:**
-1. Claude explores the codebase and writes a Markdown plan (no files are changed).
-2. You are asked: `Review this plan with gemini? (y/n)`
-3. If `y`, Gemini critiques the architecture and approach.
-4. You are asked: `Execute this task? (y/n)`
-5. If `y`, Claude begins implementing the code using the approved plan as context.
+1. The writer produces a Markdown plan (no code changes).
+2. `review this plan with gemini? (y/n)` — the reviewer critiques the approach.
+3. `execute this task? (y/n)` — on yes, implementation starts with the approved plan as context (add `--auto` to run the execution loop unattended).
 
-### 3. `dt review`
+### 4. `dt review`
 
-If you have already written some code yourself and just want Gemini to review your uncommitted changes, use the review command. The reviewer analyzes the diff to understand what was changed and why, checks for correctness, edge cases, and potential issues — even without a task description.
+Review uncommitted changes you wrote yourself — including new untracked files, which are folded into the diff.
 
-**Usage:**
 ```bash
 dt review
+dt review --task "add OAuth login flow"   # verify against your intent
+dt review --reviewer claude
 ```
-
-**With a task description** (helps the reviewer verify changes against your intent):
-```bash
-dt review --task "add OAuth login flow"
-```
-
-This will:
-1. Capture your current `git diff`.
-2. Send the diff to the Reviewer.
-3. The Reviewer analyzes the changes: understands intent, verifies correctness, checks edge cases, assesses impact.
-4. Output the Reviewer's structured feedback and verdict.
 
 ---
 
@@ -73,96 +84,68 @@ This will:
 
 ### `dt init`
 
-Initializes `dt` in a new repository.
-
-**Usage:**
-```bash
-cd my-project
-dt init
-```
-
-This creates:
-- `.duet/config.toml`: The configuration file where you define your linters and model preferences.
-- `.duet/prompts/`: A directory containing the default system prompts. You can edit these to customize how the agents behave in your specific project.
+Creates `.duet/config.toml` (checks, models, policy) and `.duet/prompts/` (editable prompt templates), and gitignores `.duet/sessions/`.
 
 ### `dt doctor`
 
-Diagnoses your environment to ensure `dt` can run properly.
+Verifies: git repo, `.duet/config.toml` parses, Claude CLI presence and auth, `ANTHROPIC_API_KEY` fallback, `GEMINI_API_KEY`, prompt templates.
 
-**Usage:**
-```bash
-dt doctor
-```
+### `dt clear`
 
-Checks for:
-- Git repository presence
-- Claude CLI installation and authentication
-- `GEMINI_API_KEY` environment variable
-- Valid `.duet/config.toml` configuration
+Deletes all session logs.
+
+### `dt serve`
+
+Runs dt as a JSON-lines server on stdin/stdout for GUI frontends — this is what the [VS Code extension](editors/vscode/) talks to. Commands in (`task`, `plan`, `review`, `answer`, `ping`, `quit`), events out (`round_started`, `stream_chunk`, `verdict`, `ask`, `task_done`, …). Adapters persist across tasks, so context carries exactly like the interactive session.
 
 ---
 
 ## Global Flags
 
-| Flag | Applies to | Description | Example |
-|---|---|---|---|
-| `--writer <model>` | `dt <task>`, `dt plan` | Override the default writer model. | `dt "fix bug" --writer gemini` |
-| `--reviewer <model>` | `dt review` | Override the default reviewer model. | `dt review --reviewer claude` |
-| `-t, --task <desc>` | `dt review` | Describe the task for the reviewer to verify against. | `dt review --task "add login"` |
-| `-i, --image <path>` | `dt <task>`, `dt plan` | Attach one or more images to the prompt. | `dt "fix UI" -i bug.png` |
-| `-c` | `dt <task>`, `dt plan` | Continue from the previous session's context. | `dt "fix the test" -c` |
-| `-v, --verbose` | All commands | Show raw API events and full un-truncated outputs. | `dt "fix bug" -v` |
+| Flag | Applies to | Description |
+|---|---|---|
+| `-a, --auto` | `dt <task>`, `dt run`, `dt plan`, bare `dt` | Loop without per-round prompts until both models approve |
+| `--writer <model>` | task commands, `dt serve` | Which model writes (`claude`/`gemini`); the other reviews |
+| `--reviewer <model>` | `dt review` | Which model reviews |
+| `-t, --task <desc>` | `dt review` | Intent for the reviewer to verify against |
+| `--image <path>` | task commands | Attach one or more images |
+| `-c, --continue-session` | task commands | Include the previous session's context |
+| `-v, --verbose` | all | Full untruncated output and diagnostics |
 
 ---
 
 ## Configuration (`.duet/config.toml`)
 
-When you run `dt init`, a `.duet/config.toml` file is created. Here is how to configure it:
+### Quality checks
 
-### Quality Checks
-`dt` runs these commands before asking the Reviewer to look at the code. If a check fails, the Reviewer is given the error output so it can suggest a fix. Checks are optional — if not configured, the write/review loop still works but without automated verification.
+Run before every review; failures are shown to the reviewer and block approval until fixed.
 
 ```toml
 [checks]
-# Configure these for your project's toolchain:
-# test = "npm test"
-# lint = "npm run lint"
-# typecheck = "npx tsc --noEmit"
-```
-
-Examples for common stacks:
-
-```toml
-# Python
-test = "pytest"
-lint = "ruff check ."
-typecheck = "mypy ."
-
-# Rust
-test = "cargo test"
-lint = "cargo clippy -- -D warnings"
-typecheck = "cargo check"
-
-# Go
-test = "go test ./..."
-lint = "golangci-lint run"
-typecheck = "go vet ./..."
+test = "npm test"
+lint = "npm run lint"
+typecheck = "npx tsc --noEmit"
 ```
 
 ### Policy
-Control how many times the agents are allowed to loop before giving up.
 
 ```toml
 [policy]
-max_rounds = 3
+max_rounds = 4      # round budget per task
+auto = false        # true = behave as if --auto was always passed
+allow_dirty_worktree = true
 ```
 
-### Customizing Prompts
-If you want the agents to follow specific coding guidelines (e.g., "Always use Tailwind utility classes"), you can edit the files in the `.duet/prompts/` directory created by `dt init`. The `.duet/config.toml` file maps to these templates:
+### Claude modes
 
 ```toml
-[prompts]
-implementation = ".duet/prompts/implement.txt"
-review = ".duet/prompts/review.txt"
-fix = ".duet/prompts/fix.txt"
+[claude]
+mode = "auto"       # "cli" (Claude Code CLI, keeps its session via --resume),
+                    # "api" (direct Anthropic API with message history),
+                    # "auto" (CLI first, API fallback)
+skip_permissions = true   # let the writer edit files without interactive prompts
 ```
+
+### Customizing prompts
+
+Edit the files in `.duet/prompts/` to add project rules (e.g. "always use Tailwind utilities"). Available variables: `implement.txt` — `{task}`, `{context}` · `review.txt` — `{task}`, `{diff}`, `{checks}`, `{writer_notes}` · `fix.txt` — `{task}`, `{review_feedback}` · `plan.txt` — `{task}`, `{context}`.

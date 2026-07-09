@@ -54,19 +54,22 @@ body {
   margin-bottom: 4px;
 }
 
+/* Writer above, reviewer below — full width each, sized to content, so a
+   long stream on one side never squeezes or stretches the other. */
 .cols {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
 }
 
 .col {
   border: 1px solid var(--vscode-panel-border);
   border-radius: 6px;
-  padding: 6px 8px;
-  min-height: 40px;
+  padding: 6px 10px;
   overflow-x: hidden;
 }
+
+.col:empty { display: none; }
 
 .col-head {
   font-size: 11px;
@@ -77,6 +80,8 @@ body {
   margin-bottom: 6px;
 }
 
+.col.writer { border-left: 3px solid var(--vscode-charts-green); }
+.col.reviewer { border-left: 3px solid var(--vscode-charts-purple); }
 .col.writer .col-head { color: var(--vscode-charts-green); }
 .col.reviewer .col-head { color: var(--vscode-charts-purple); }
 

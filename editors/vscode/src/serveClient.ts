@@ -1,6 +1,14 @@
 import * as vscode from 'vscode';
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 
+/** Spawn options read fresh from settings each time the server starts. */
+export interface ServeOptions {
+  binPath: string;
+  writer: string;
+  claudeModel: string;
+  geminiModel: string;
+}
+
 /**
  * Thin client for `dt serve`: spawns the binary once, sends JSON-line
  * commands on stdin, and emits parsed JSON events from stdout.
@@ -13,18 +21,52 @@ export class ServeClient implements vscode.Disposable {
   private readonly _onExit = new vscode.EventEmitter<number | null>();
   readonly onExit = this._onExit.event;
 
+  private starting?: Promise<void>;
+
   constructor(
-    private readonly binPath: string,
+    /** Settings snapshot taken at spawn time, so restart() picks up changes. */
+    private readonly optionsProvider: () => ServeOptions,
     private readonly cwd: string,
-    private readonly writerModel: string,
+    /** Extra env (API keys from SecretStorage) injected at spawn time. */
+    private readonly envProvider: () => Promise<Record<string, string>> = async () => ({}),
   ) {}
 
-  start(): void {
+  /** Kill the server; the next send() respawns it with fresh secrets. */
+  restart(): void {
+    try {
+      this.proc?.kill();
+    } catch {
+      // already gone
+    }
+    this.proc = undefined;
+  }
+
+  private ensureStarted(): Promise<void> {
+    if (this.proc) {
+      return Promise.resolve();
+    }
+    this.starting ??= this.start().finally(() => {
+      this.starting = undefined;
+    });
+    return this.starting;
+  }
+
+  private async start(): Promise<void> {
     if (this.proc) {
       return;
     }
-    const proc = spawn(this.binPath, ['serve', '--writer', this.writerModel], {
+    const extraEnv = await this.envProvider();
+    const opts = this.optionsProvider();
+    const args = ['serve', '--writer', opts.writer];
+    if (opts.claudeModel) {
+      args.push('--claude-model', opts.claudeModel);
+    }
+    if (opts.geminiModel) {
+      args.push('--gemini-model', opts.geminiModel);
+    }
+    const proc = spawn(opts.binPath, args, {
       cwd: this.cwd,
+      env: { ...process.env, ...extraEnv },
     });
     this.proc = proc;
 
@@ -54,7 +96,7 @@ export class ServeClient implements vscode.Disposable {
       this.proc = undefined;
       this._onEvent.fire({
         event: 'error',
-        message: `failed to start '${this.binPath}': ${err.message} — set dt.binaryPath in settings`,
+        message: `failed to start '${opts.binPath}': ${err.message} — set dt.binaryPath in settings`,
       });
     });
     proc.on('exit', (code) => {
@@ -64,8 +106,9 @@ export class ServeClient implements vscode.Disposable {
   }
 
   send(obj: unknown): void {
-    this.start();
-    this.proc?.stdin.write(JSON.stringify(obj) + '\n');
+    void this.ensureStarted().then(() => {
+      this.proc?.stdin.write(JSON.stringify(obj) + '\n');
+    });
   }
 
   dispose(): void {

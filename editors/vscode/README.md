@@ -1,30 +1,64 @@
-# DT Duet — VS Code extension
+# DT Duet — AI Pair Programming
 
-Run [duetcode](https://github.com/harsha509/duetcode) from VS Code: one model
-writes, the other reviews, and you watch both sides of the duet live.
+One model writes, another reviews — in a loop, until both approve.
 
-- **Sessions sidebar** — every past run from `.duet/sessions`, click to open.
-- **Duet panel** — round-aligned columns: writer on the left, reviewer on the
-  right, with checks, verdicts, blockers, and cost per task.
-- **Task composer** — type a task, toggle `auto`/`plan`, attach images with
-  the picker or **paste screenshots directly** (Cmd+V).
-- Approval prompts appear as buttons; clarifications as an input field.
+DT Duet runs [duetcode](https://github.com/harsha509/duetcode) inside
+VS Code: Claude implements your task, Gemini reviews the diff against your
+tests and linters, and you watch both sides of the conversation live.
+
+## Features
+
+- **Duet panel** — per round, the writer's stream (tool actions, code,
+  explanation) stacks above the reviewer's block (check results, review,
+  verdict with blockers), each full-width.
+- **Sessions sidebar** — every past run from `.duet/sessions`, with outcome
+  icons; click to replay any session round by round, patches included.
+- **Task composer** — type a task, toggle `auto` (models loop unattended
+  until mutual approval) or `plan` (plan → review → approve → execute).
+- **Screenshots** — attach with the picker or **paste directly with Cmd+V**;
+  pasted images are cleaned up after the task.
+- **Approvals as buttons** — when a model needs your call (review now?
+  fix issues? guidance when the models deadlock), it's a click, not a
+  terminal prompt.
+- **Secure keys** — API keys live in your OS keychain via VS Code
+  SecretStorage and are injected only into the spawned `dt` process. Claude
+  CLI users need no Anthropic key at all.
 
 ## Requirements
 
-- The `dt` binary on your PATH (or set `dt.binaryPath`), built with
-  `cargo install --path .` from the repo root.
-- A workspace initialized with `dt init` (and `GEMINI_API_KEY` exported for
-  the Gemini side).
+- The `dt` binary — `cargo install --git https://github.com/harsha509/duetcode`
+  (set `dt.binaryPath` if it's not on VS Code's PATH, e.g. `~/.cargo/bin/dt`).
+- A workspace initialized with `dt init`.
+- Gemini API key — add it via the ⚙ gear (stored in the keychain) or export
+  `GEMINI_API_KEY`.
+- Claude CLI authenticated (`claude` → `/login`), or an Anthropic API key.
+
+## Quick start
+
+1. Open a `dt init`-ed project.
+2. Click the DT Duet icon in the activity bar.
+3. Hit **+** (New Task), type what you want, press Enter.
+4. Watch Claude write and Gemini review; answer prompts with the buttons.
+
+Settings live behind the **⚙ gear** (sidebar title or panel): API keys,
+Claude CLI login, binary path, writer model.
+
+## Security
+
+- Keys: OS keychain only — never settings.json, never synced, never logged.
+- `dt.binaryPath` is machine-scoped, so a cloned repo's workspace settings
+  cannot redirect the extension to an untrusted binary.
+- The extension talks to `dt serve` over stdio only; no network ports.
+- Model providers (Anthropic, Google) receive your diffs and prompts, as
+  with any AI coding tool.
 
 ## Development
 
 ```bash
 cd editors/vscode
 npm install
-npm run compile
+npm run compile   # or press F5 for an Extension Development Host
 ```
 
-Then open this folder in VS Code and press **F5** to launch an Extension
-Development Host. The extension talks to `dt serve` over a JSON-lines
-protocol; see `src/serve.rs` in the repo root for the protocol reference.
+The extension is a thin client over `dt serve`'s JSON-lines protocol —
+see `src/serve.rs` in the repo root. Releasing: see [RELEASING.md](RELEASING.md).

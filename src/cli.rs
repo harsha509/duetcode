@@ -139,7 +139,23 @@ pub enum Commands {
         /// Which model writes code: "claude" or "gemini"
         #[arg(long, default_value = "claude")]
         writer: String,
+
+        /// Override the Claude model from .duet/config.toml (alias like "opus"
+        /// or a full model id like "claude-opus-4-8")
+        #[arg(long)]
+        claude_model: Option<String>,
+
+        /// Override the Gemini model from .duet/config.toml (e.g. "gemini-2.5-flash")
+        #[arg(long)]
+        gemini_model: Option<String>,
     },
+}
+
+/// Model overrides that take precedence over .duet/config.toml.
+#[derive(Debug, Default)]
+pub(crate) struct ModelOverrides {
+    pub(crate) claude: Option<String>,
+    pub(crate) gemini: Option<String>,
 }
 
 /// Everything cmd_task needs, collected from whichever CLI form was used.
@@ -186,7 +202,9 @@ pub fn run() -> Result<()> {
             cmd_review(&cwd, &reviewer, task.as_deref(), cli.verbose || v)
         }
         Some(Commands::Clear) => cmd_clear(&cwd),
-        Some(Commands::Serve { writer }) => serve::run(&cwd, &writer),
+        Some(Commands::Serve { writer, claude_model, gemini_model }) => {
+            serve::run(&cwd, &writer, ModelOverrides { claude: claude_model, gemini: gemini_model })
+        }
 
         None => match cli.task {
             Some(task) => cmd_task(&cwd, TaskArgs {
@@ -215,7 +233,7 @@ pub fn run() -> Result<()> {
 fn cmd_session(dir: &Path, writer_name: &str, verbose: bool, auto: bool) -> Result<()> {
     let sink: Arc<dyn Sink> = Arc::new(TerminalSink::new(verbose));
     let TaskSetup { config, images: _, mut writer, mut reviewer } =
-        setup_task(dir, writer_name, &[], verbose, sink.clone())?;
+        setup_task(dir, writer_name, &[], verbose, sink.clone(), &ModelOverrides::default())?;
 
     let auto = auto || config.policy.auto;
     repl::run(dir, &config, writer.as_mut(), reviewer.as_mut(), auto, sink.as_ref())
@@ -256,12 +274,20 @@ pub(crate) fn setup_task(
     image_paths: &[PathBuf],
     verbose: bool,
     sink: Arc<dyn Sink>,
+    overrides: &ModelOverrides,
 ) -> Result<TaskSetup> {
     if !git::is_git_repo(dir) {
         anyhow::bail!("not a git repository — run `git init` first");
     }
 
-    let config = Config::load(dir).context("failed to load config")?;
+    let mut config = Config::load(dir).context("failed to load config")?;
+    if let Some(model) = &overrides.claude {
+        config.claude.model = model.clone();
+        config.claude.api_model = model.clone();
+    }
+    if let Some(model) = &overrides.gemini {
+        config.gemini.model = model.clone();
+    }
 
     let images: Vec<ImageInput> = image_paths
         .iter()
@@ -284,7 +310,7 @@ pub(crate) fn setup_task(
 fn cmd_task(dir: &Path, args: TaskArgs) -> Result<()> {
     let sink: Arc<dyn Sink> = Arc::new(TerminalSink::new(args.verbose));
     let TaskSetup { config, images, mut writer, mut reviewer } =
-        setup_task(dir, &args.writer, &args.images, args.verbose, sink.clone())?;
+        setup_task(dir, &args.writer, &args.images, args.verbose, sink.clone(), &ModelOverrides::default())?;
 
     if !config.policy.allow_dirty_worktree && !git::is_worktree_clean(dir)? {
         anyhow::bail!(

@@ -36,9 +36,20 @@
     return 'reviewer'; // reviewer, checks, and everything review-adjacent
   }
 
+  // Columns are created on first use, so a round only shows the blocks that
+  // actually have content (no empty reviewer box while the writer streams).
   function colFor(actor) {
     if (!currentRound) newRound('•', '');
-    return sideFor(actor) === 'writer' ? currentRound.writerCol : currentRound.reviewerCol;
+    const side = sideFor(actor);
+    const key = side + 'Col';
+    if (!currentRound[key]) {
+      const col = el('div', 'col ' + side);
+      const label = side === 'writer' ? writerName + ' · writer' : reviewerName + ' · reviewer';
+      col.appendChild(el('div', 'col-head', label));
+      currentRound.cols.appendChild(col);
+      currentRound[key] = col;
+    }
+    return currentRound[key];
   }
 
   function line(target, cls, text) {
@@ -54,16 +65,10 @@
     const block = el('section', 'round');
     const head = el('div', 'round-head', budget ? `round ${label}/${budget}` : String(label));
     const cols = el('div', 'cols');
-    const w = el('div', 'col writer');
-    const r = el('div', 'col reviewer');
-    w.appendChild(el('div', 'col-head', writerName + ' · writer'));
-    r.appendChild(el('div', 'col-head', reviewerName + ' · reviewer'));
-    cols.appendChild(w);
-    cols.appendChild(r);
     block.appendChild(head);
     block.appendChild(cols);
     timeline.appendChild(block);
-    currentRound = { writerCol: w, reviewerCol: r };
+    currentRound = { cols, writerCol: null, reviewerCol: null };
     streams = {};
     scrollDown();
   }
@@ -246,8 +251,8 @@
 
     for (const r of data.rounds) {
       newRound(r.round === 0 ? 'planning' : r.round, '');
-      if (r.writer) renderMarkdownish(currentRound.writerCol, 'stream', r.writer);
-      if (r.reviewer) renderMarkdownish(currentRound.reviewerCol, 'stream', r.reviewer);
+      if (r.writer) renderMarkdownish(colFor(writerName), 'stream', r.writer);
+      if (r.reviewer) renderMarkdownish(colFor(reviewerName), 'stream', r.reviewer);
       if (Array.isArray(r.checks)) {
         for (const c of r.checks) {
           line(currentRound.reviewerCol, c.passed ? 'check ok' : 'check bad',
@@ -284,6 +289,7 @@
 
   document.getElementById('send').onclick = submitTask;
   document.getElementById('attach').onclick = () => vscode.postMessage({ type: 'attach' });
+  document.getElementById('settings').onclick = () => vscode.postMessage({ type: 'settings' });
   document.getElementById('review').onclick = () => {
     if (!busy) {
       vscode.postMessage({ type: 'review', text: input.value.trim() });

@@ -2,22 +2,32 @@
 
 AI pair programming CLI — one model writes code, another reviews it, with you in control.
 
-`dt` orchestrates Claude and Gemini in a structured write/review cycle. One model implements a task, then you decide if you want the other model to review the diff. The loop continues until the reviewer approves and all quality checks pass — or until you decide it's done.
+`dt` orchestrates Claude and Gemini in a structured write/review cycle. One model implements a task, the other reviews the diff against your tests and linters, and the loop continues until the reviewer approves and all checks pass. Run it interactively (you gate each round), fully automatic (`--auto`, the models iterate until mutual approval and only escalate to you if they deadlock), as a persistent session, or from the [VS Code extension](editors/vscode/).
 
 ## How it works
 
 ```
 You give a task
-    → Claude (writer) implements it
-    → git diff captured
-    → You are asked: "Review changes with gemini? (y/n)"
-    → Your configured checks run (test / lint / typecheck)
-    → Gemini (reviewer) reviews the diff + check results
-    → APPROVED? → done
-    → CHANGES_REQUESTED? → You are asked: "Let claude fix? (y/n)" → repeat
+    → Claude (writer) implements it              [keeps its session across rounds]
+    → git diff captured (new files included)
+    → your checks run (test / lint / typecheck)
+    → Gemini (reviewer) reviews diff + checks + writer's notes
+    → APPROVED and checks pass?  → done
+    → CHANGES_REQUESTED?         → writer fixes → repeat
+    → models stuck on the same blockers? → you're asked for guidance
 ```
 
-You can flip the roles (`--writer gemini`) so Gemini writes and Claude reviews.
+- **Interactive mode** (default): you confirm each review and fix round.
+- **Auto mode** (`--auto`): no prompts — the loop runs until approval, a round
+  budget is exhausted, or the models stop converging, at which point dt shows
+  the open blockers and asks you for one clarification (injected into both
+  models' prompts) before continuing.
+- **Question tasks**: if the writer answers without changing code (e.g. "do we
+  have performance issues?"), the reviewer gives a second opinion on the
+  answer itself, and the writer revises until it's approved.
+- Both models keep context: the Claude CLI session is resumed across rounds
+  (`--resume`), and API-mode Claude and Gemini carry capped message history.
+- Flip roles anytime with `--writer gemini`.
 
 ## Installation
 
@@ -28,9 +38,7 @@ You can flip the roles (`--writer gemini`) so Gemini writes and Claude reviews.
 - A [Gemini API key](https://aistudio.google.com/apikey) exported as `GEMINI_API_KEY`
 - Git
 
-### Using Cargo (Recommended)
-
-You can install `dt` directly from the GitHub repository using Cargo:
+### Using Cargo (recommended)
 
 ```bash
 cargo install --git https://github.com/harsha509/duetcode.git
@@ -52,51 +60,49 @@ dt --version
 
 ## Quick start
 
-For a complete list of commands, flags, and configuration options, please see the [**Usage Guide (USAGE.md)**](USAGE.md).
+For the full command reference see the [Usage Guide (USAGE.md)](USAGE.md).
 
-### 1. Initialize in your project
+### 1. Initialize and verify
 
 ```bash
 cd your-project
-dt init
+dt init      # creates .duet/config.toml and .duet/prompts/
+dt doctor    # checks git, claude CLI, GEMINI_API_KEY, config
 ```
 
-This creates:
-- `.duet/config.toml` — configuration file
-- `.duet/prompts/` — editable prompt templates (implement, review, fix, plan)
-
-### 2. Check your setup
+### 2. Run a task
 
 ```bash
-dt doctor
+dt "add input validation to the signup form"          # interactive
+dt "add input validation to the signup form" --auto   # loop until both approve
+dt "add input validation" --writer gemini              # flip roles
 ```
 
-Verifies: git repo, claude CLI, GEMINI_API_KEY, config file, prompt templates.
+### 3. Or start a session
 
-### 3. Run a task
+Bare `dt` in an initialized repo opens an interactive session where both
+models keep their context across tasks:
 
-```bash
-dt "add input validation to the signup form"
 ```
-
-Default: Claude writes, Gemini reviews. To flip:
-
-```bash
-dt "add input validation" --writer gemini
+$ dt
+dt ❯ add a dark mode toggle
+dt ❯ now persist the preference        ← both models remember the previous task
+dt ❯ /image ~/Desktop/mock.png         ← attach a screenshot to the next task
+dt ❯ /paste                            ← attach the image on the clipboard
+dt ❯ /auto                             ← toggle autonomous looping
+dt ❯ /plan refactor the auth flow      ← plan → review → approve → execute
+dt ❯ /review                           ← review uncommitted changes
+dt ❯ /quit
 ```
 
 ### 4. Plan before executing
-
-For larger tasks, ask the AI to create a plan first:
 
 ```bash
 dt plan "refactor the authentication flow"
 ```
 
-This will:
-1. Generate a plan without modifying code
-2. Ask if you want Gemini to review the plan
-3. Ask if you want to execute the approved plan
+Generates a plan (no code changes), offers a plan review by the other model,
+then asks before executing.
 
 ### 5. Pass screenshots
 
@@ -105,22 +111,21 @@ dt "match this design" --image ./mockup.png
 dt "fix layout bug" --image ./before.png --image ./expected.png
 ```
 
-Images are base64-encoded and sent to both Claude (via stream-json stdin) and Gemini (via inlineData API).
-
 ### 6. Review existing changes
 
-Review uncommitted changes without running the full write loop. The reviewer analyzes the diff to understand what was changed and why, checks for correctness, edge cases, and potential issues:
-
 ```bash
-dt review
+dt review                          # Gemini reviews your uncommitted changes
 dt review --reviewer claude
+dt review --task "add OAuth login" # tell the reviewer what to verify against
 ```
 
-Optionally, tell the reviewer what task to verify against:
+### 7. VS Code
 
-```bash
-dt review --task "add OAuth login flow"
-```
+The [DT Duet extension](editors/vscode/) gives you a sessions sidebar, a live
+duet panel (writer stream stacked over reviewer verdicts per round), Cmd+V
+screenshot paste, button-based approvals, and keychain-stored API keys. It
+talks to `dt serve`, a JSON-lines protocol over stdio that any frontend can
+use.
 
 ## Configuration
 
@@ -129,13 +134,17 @@ dt review --task "add OAuth login flow"
 ```toml
 [claude]
 command = "claude"
-args = ["-p"]
 model = "sonnet"
-skip_permissions = false
+skip_permissions = true      # writer edits files without interactive prompts
+mode = "auto"                # "cli", "api", or "auto" (CLI with API fallback)
+api_key_env = "ANTHROPIC_API_KEY"
+api_model = "claude-sonnet-4-20250514"
+timeout_secs = 300
 
 [gemini]
 model = "gemini-3.1-pro-preview"
 api_key_env = "GEMINI_API_KEY"
+timeout_secs = 300
 
 [checks]
 # Configure these for your project's toolchain
@@ -145,7 +154,7 @@ api_key_env = "GEMINI_API_KEY"
 
 [policy]
 max_rounds = 4
-require_both_approvals = true
+auto = false                 # true = --auto by default
 allow_dirty_worktree = true
 
 [prompts]
@@ -159,66 +168,53 @@ fix = ".duet/prompts/fix.txt"
 | Section | Key | Description | Default |
 |---------|-----|-------------|---------|
 | `claude` | `command` | Path to the Claude CLI binary | `"claude"` |
-| `claude` | `model` | Claude model to use | `"sonnet"` |
-| `claude` | `skip_permissions` | Pass `--dangerously-skip-permissions` to Claude | `false` |
+| `claude` | `model` | Claude model for CLI mode | `"sonnet"` |
+| `claude` | `skip_permissions` | Pass `--dangerously-skip-permissions` so the writer can edit files unattended | `true` |
+| `claude` | `mode` | `"cli"`, `"api"`, or `"auto"` (CLI first, API fallback) | `"auto"` |
+| `claude` | `api_key_env` | Env var holding the Anthropic API key | `"ANTHROPIC_API_KEY"` |
+| `claude` | `api_model` | Model id for API mode | `"claude-sonnet-4-20250514"` |
 | `gemini` | `model` | Gemini model name | `"gemini-3.1-pro-preview"` |
-| `gemini` | `api_key_env` | Environment variable holding the API key | `"GEMINI_API_KEY"` |
-| `checks` | `test` | Test command to run | *none* (configure for your stack) |
-| `checks` | `lint` | Lint command to run | *none* (configure for your stack) |
-| `checks` | `typecheck` | Typecheck command to run | *none* (configure for your stack) |
-| `policy` | `max_rounds` | Maximum write/review rounds before failure | `4` |
-| `policy` | `require_both_approvals` | Require reviewer approval + passing checks | `true` |
-| `policy` | `allow_dirty_worktree` | Allow running with uncommitted changes | `true` |
-| `prompts` | `implementation` | Path to the implement prompt template | `".duet/prompts/implement.txt"` |
-| `prompts` | `review` | Path to the review prompt template | `".duet/prompts/review.txt"` |
-| `prompts` | `fix` | Path to the fix prompt template | `".duet/prompts/fix.txt"` |
+| `gemini` | `api_key_env` | Env var holding the API key | `"GEMINI_API_KEY"` |
+| `checks` | `test` / `lint` / `typecheck` | Commands run before each review | *none* |
+| `policy` | `max_rounds` | Round budget (auto mode may extend once, to 2×, after your clarification) | `4` |
+| `policy` | `auto` | Run autonomously by default | `false` |
+| `policy` | `allow_dirty_worktree` | Allow starting with uncommitted changes | `true` |
+| `prompts` | `implementation` / `review` / `fix` | Template paths | `.duet/prompts/…` |
 
 ### Setting up checks for your project
 
-Edit `.duet/config.toml` to match your project's toolchain. Checks are optional — if not configured, the write/review loop still works but without automated verification.
+Checks are optional — without them the loop still works, just without
+automated verification.
 
 ```toml
-# Python
-[checks]
-test = "pytest"
-lint = "ruff check ."
-typecheck = "mypy ."
+# Python                      # Node.js / TypeScript
+[checks]                      [checks]
+test = "pytest"               test = "npm test"
+lint = "ruff check ."         lint = "eslint ."
+typecheck = "mypy ."          typecheck = "tsc --noEmit"
 
-# Node.js / TypeScript
-[checks]
-test = "npm test"
-lint = "eslint ."
-typecheck = "tsc --noEmit"
-
-# Go
-[checks]
-test = "go test ./..."
-lint = "golangci-lint run"
-typecheck = "go vet ./..."
-
-# Rust
-[checks]
-test = "cargo test"
-lint = "cargo clippy -- -D warnings"
-typecheck = "cargo check"
+# Go                          # Rust
+[checks]                      [checks]
+test = "go test ./..."        test = "cargo test"
+lint = "golangci-lint run"    lint = "cargo clippy -- -D warnings"
+typecheck = "go vet ./..."    typecheck = "cargo check"
 ```
 
 ## Prompt templates
 
-The `.duet/prompts/` directory contains editable templates:
+`.duet/prompts/` contains editable templates (built-in defaults are used if a
+file is missing):
 
-- **`implement.txt`** — Sent to the writer on the first round. Variables: `{task}`, `{context}`
-- **`review.txt`** — Sent to the reviewer each round. Variables: `{task}`, `{diff}`, `{checks}`
-- **`fix.txt`** — Sent to the writer on rounds 2+ with review feedback. Variables: `{task}`, `{review_feedback}`
-- **`plan.txt`** — Sent to the writer during plan mode. Variables: `{task}`, `{context}`
+- **`implement.txt`** — writer, round 1. Variables: `{task}`, `{context}`
+- **`review.txt`** — reviewer, every code round. Variables: `{task}`, `{diff}`, `{checks}`, `{writer_notes}`
+- **`fix.txt`** — writer, rounds 2+. Variables: `{task}`, `{review_feedback}`
+- **`plan.txt`** — writer, plan mode. Variables: `{task}`, `{context}`
 
-If a template file is missing, built-in defaults are used.
+Plan review and answer review (second opinions on plans and on text answers)
+use built-in templates. All prompts forbid the models from running `git add`,
+`git commit`, or `git push` — changes stay uncommitted for you to inspect.
 
-All prompts include a safety rule: models are prohibited from running `git add`, `git commit`, or `git push`. They can only edit files and leave them uncommitted.
-
-### Reviewer output contract
-
-The reviewer must respond in this format for reliable parsing:
+The reviewer ends every review with a machine-parsed verdict line:
 
 ```
 VERDICT: APPROVED | CHANGES_REQUESTED
@@ -228,82 +224,71 @@ BLOCKERS:
 
 SUGGESTIONS:
 - <improvement>
-
-TESTS_TO_ADD:
-- <test>
-```
-
-### Writer output contract
-
-The writer must respond with:
-
-```
-SUMMARY:
-- <what was done>
-
-ADDRESSED:
-- <requirements met>
-
-UNRESOLVED:
-- <open items or "none">
 ```
 
 ## Session logs
 
-Each run creates a log folder at `.duet/sessions/{timestamp}-{task-slug}/` containing:
+Each run creates `.duet/sessions/{timestamp}-{task-slug}/`:
 
 | File | Content |
 |------|---------|
-| `prompt.md` | Original task description |
-| `state.json` | Final outcome with metadata |
-| `round-{n}/claude_out.md` | Writer's full response |
-| `round-{n}/gemini_out.md` | Reviewer's full response |
-| `round-{n}/claude.patch` | Git diff for that round |
-| `round-{n}/checks.json` | Check results (pass/fail + output) |
+| `prompt.md` | Original task |
+| `state.json` | Final outcome and metadata |
+| `round-{n}/claude_out.md` | Writer's response |
+| `round-{n}/gemini_out.md` | Reviewer's response |
+| `round-{n}/claude.patch` | Diff for that round (new files included) |
+| `round-{n}/checks.json` | Check results |
+| `round-{n}/clarification.md` | Your guidance, when the models deadlocked |
 
-Clear all sessions with `dt clear`.
+`dt clear` removes all session logs. The directory is gitignored by `dt init`.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `dt init` | Create `.duet/config.toml` and `.duet/prompts/` in the current repo |
-| `dt doctor` | Verify all dependencies and configuration |
-| `dt <task>` | Run the full write/review loop (shorthand for `dt run`) |
-| `dt run <task>` | Run the full write/review loop |
-| `dt run <task> --writer gemini` | Use Gemini as writer, Claude as reviewer |
-| `dt run <task> --image <path>` | Include screenshot(s) as context |
-| `dt plan <task>` | Plan first, then execute after approval |
-| `dt review` | Review current uncommitted changes |
-| `dt review --task "description"` | Review changes against a specific task |
-| `dt review --reviewer claude` | Use Claude as the reviewer |
-| `dt clear` | Clear all past session logs |
+| `dt` | Interactive session in an initialized repo (usage screen elsewhere) |
+| `dt <task>` | Run the write/review loop (shorthand for `dt run`) |
+| `dt <task> --auto` | Loop without prompts until both models approve |
+| `dt <task> --writer gemini` | Gemini writes, Claude reviews |
+| `dt <task> --image <path>` | Include screenshot(s) |
+| `dt <task> -c` | Continue from the previous session's context |
+| `dt plan <task>` | Plan → review → approve → execute |
+| `dt review [--task "…"] [--reviewer claude]` | Review uncommitted changes |
+| `dt init` / `dt doctor` / `dt clear` | Setup, diagnostics, log cleanup |
+| `dt serve` | JSON-lines server for GUI frontends (VS Code extension) |
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
-| `0` | Reviewer approved and all checks pass |
-| `1` | Failure: max rounds exceeded, checks failed, or error |
+| `0` | Approved with all checks passing (or task completed by your choice) |
+| `1` | Stopped without full approval, or error |
 
 ## Architecture
 
 ```
 src/
   main.rs           Entry point
-  cli.rs            Clap subcommands and dispatch
-  config.rs         duet.toml parsing
-  orchestrator.rs   Round loop: write → diff → check → review → verdict
+  cli.rs            Clap commands and dispatch
+  config.rs         .duet/config.toml parsing
+  orchestrator.rs   Round loop: write → diff → check → review → verdict,
+                    stall detection, user escalation
+  events.rs         Event enum + Sink trait; TerminalSink renders the CLI
+  serve.rs          `dt serve` JSON-lines protocol for frontends
+  repl.rs           Interactive `dt ❯` session
   adapters/
-    mod.rs          ModelAdapter trait + ImageInput
-    claude.rs       Claude CLI subprocess adapter
-    gemini.rs       Gemini REST API adapter
-  git.rs            Git operations (diff, status, branch)
+    mod.rs          ModelAdapter trait, ImageInput, history trimming
+    claude.rs       Claude CLI (session --resume) + Anthropic API adapter
+    gemini.rs       Gemini REST adapter with conversation history
+    pricing.rs      Cost estimation
+  git.rs            Diff (tracked + untracked), status, branch
   checks.rs         Test/lint/typecheck runners
-  prompts.rs        Template loading and interpolation
-  policy.rs         Verdict parsing and pass/fail evaluation
+  prompts.rs        Templates and interpolation
+  policy.rs         Verdict parsing, blocker similarity (stall detection)
   logs.rs           Per-round session logging
-  errors.rs         Typed error definitions
+  ui.rs             All terminal rendering and input
+
+editors/vscode/     VS Code extension (thin TypeScript client over dt serve)
 ```
 
 ## License

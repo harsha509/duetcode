@@ -2,10 +2,17 @@
   "name": "dt-duet",
   "displayName": "DT Duet — AI Pair Programming",
   "description": "Claude writes, Gemini reviews — run and watch the duet from VS Code.",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "publisher": "harsha509",
-  "private": true,
   "license": "MIT",
+  "icon": "media/logo.png",
+  "keywords": [
+    "ai",
+    "pair programming",
+    "code review",
+    "claude",
+    "gemini"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/harsha509/duetcode"
@@ -50,6 +57,11 @@
       {
         "command": "dt.openSession",
         "title": "DT: Open Session"
+      },
+      {
+        "command": "dt.settings",
+        "title": "DT: Settings (API keys, Claude login)",
+        "icon": "$(gear)"
       }
     ],
     "menus": {
@@ -63,6 +75,11 @@
           "command": "dt.refreshSessions",
           "when": "view == dtSessions",
           "group": "navigation"
+        },
+        {
+          "command": "dt.settings",
+          "when": "view == dtSessions",
+          "group": "navigation"
         }
       ]
     },
@@ -72,7 +89,8 @@
         "dt.binaryPath": {
           "type": "string",
           "default": "dt",
-          "description": "Path to the dt binary."
+          "scope": "machine",
+          "description": "Path to the dt binary. Machine-scoped so workspace settings cannot point it at an untrusted binary."
         },
         "dt.writer": {
           "type": "string",
@@ -82,6 +100,16 @@
           ],
           "default": "claude",
           "description": "Which model writes code (the other reviews)."
+        },
+        "dt.claudeModel": {
+          "type": "string",
+          "default": "",
+          "description": "Claude model version, e.g. \"sonnet\", \"opus\", or a full id like \"claude-opus-4-8\". Empty uses .duet/config.toml (default: sonnet). Use a full model id if you rely on Claude API mode."
+        },
+        "dt.geminiModel": {
+          "type": "string",
+          "default": "",
+          "description": "Gemini model version, e.g. \"gemini-3.1-pro-preview\" or \"gemini-2.5-flash\". Empty uses .duet/config.toml."
         }
       }
     }
