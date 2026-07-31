@@ -43,6 +43,11 @@ struct Command {
     /// or empty means the serve directory alone.
     #[serde(default)]
     dirs: Option<Vec<String>>,
+    /// Project a task or plan runs in. Lets a fix land in the project the
+    /// review was about rather than always the serve directory; omitted means
+    /// the serve directory.
+    #[serde(default)]
+    dir: Option<String>,
 }
 
 /// Serializes events as JSON lines on stdout; asks block until the frontend
@@ -118,11 +123,29 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                     }
                 };
 
+                let target = match task_target(&cmd, dir) {
+                    Ok(target) => target,
+                    Err(message) => {
+                        sink.event(Event::Error { message });
+                        continue;
+                    }
+                };
+                // Announced even for the serve directory: the writer's project
+                // is never left implicit, so it cannot silently diverge from
+                // the project a review was about.
+                sink.event(Event::ProjectStarted {
+                    name: target.label.clone(),
+                    path: target.dir.display().to_string(),
+                });
+
+                let own_config = project_config(&target, sink.as_ref());
+                let task_config = own_config.as_ref().unwrap_or(&config);
+
                 let opts = TaskOptions {
-                    config: &config,
+                    config: task_config,
                     task,
                     images: &images,
-                    repo_dir: dir,
+                    repo_dir: &target.dir,
                     continue_session: false,
                     auto: cmd.auto.unwrap_or(false),
                     plan_first: cmd.cmd == "plan",
@@ -175,6 +198,21 @@ fn review_targets(cmd: &Command, default_dir: &Path) -> Vec<ReviewTarget> {
     }
 }
 
+/// The project a task runs in: the requested one when the frontend named it,
+/// otherwise the serve directory. Rejects anything that is not a git checkout
+/// rather than writing into an unrelated folder.
+fn task_target(cmd: &Command, default_dir: &Path) -> Result<ReviewTarget, String> {
+    let Some(requested) = cmd.dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) else {
+        return Ok(ReviewTarget::new(default_dir.to_path_buf()));
+    };
+
+    let target = ReviewTarget::new(PathBuf::from(requested));
+    if !git::is_git_repo(&target.dir) {
+        return Err(format!("'{}' is not a git repository — cannot run a task there", requested));
+    }
+    Ok(target)
+}
+
 /// A project's own `.duet/config.toml` when it has one, so each project keeps
 /// its own review prompt; `None` means fall back to the serve session's config.
 fn project_config(target: &ReviewTarget, sink: &dyn Sink) -> Option<Config> {
@@ -219,9 +257,12 @@ fn run_review(
             continue;
         }
 
-        if multi {
-            sink.event(Event::Section { title: target.label.clone() });
-        }
+        // Always announced, single project or not: the frontend needs the path
+        // to aim the follow-up fix at the project the review was actually about.
+        sink.event(Event::ProjectStarted {
+            name: target.label.clone(),
+            path: target.dir.display().to_string(),
+        });
 
         let own_config = project_config(target, sink);
         let config = own_config.as_ref().unwrap_or(session_config);

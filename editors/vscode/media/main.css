@@ -118,6 +118,13 @@ pre.stream {
 
 .row { margin: 4px 0; }
 .row.section { opacity: 0.6; text-align: center; margin: 10px 0; }
+.row.project {
+  margin: 12px 0 6px;
+  padding: 4px 8px;
+  border-left: 3px solid var(--vscode-charts-blue);
+  background: var(--vscode-textBlockQuote-background);
+  font-weight: 600;
+}
 .row.info { opacity: 0.75; }
 .row.warn { color: var(--vscode-charts-yellow); }
 .row.error { color: var(--vscode-charts-red); }
@@ -186,6 +193,16 @@ pre.stream {
 }
 
 #controls label { opacity: 0.8; font-size: 12px; }
+#controls #project {
+  background: var(--vscode-dropdown-background);
+  color: var(--vscode-dropdown-foreground);
+  border: 1px solid var(--vscode-dropdown-border);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 12px;
+  max-width: 180px;
+}
+#controls #project.hidden { display: none; }
 #controls button {
   background: var(--vscode-button-secondaryBackground);
   color: var(--vscode-button-secondaryForeground);

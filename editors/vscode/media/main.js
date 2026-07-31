@@ -11,6 +11,7 @@
   const input = document.getElementById('input');
   const autoBox = document.getElementById('auto');
   const planBox = document.getElementById('plan');
+  const projectSel = document.getElementById('project');
 
   let writerName = 'claude';
   let reviewerName = 'gemini';
@@ -153,6 +154,13 @@
         currentRound = null;
         fullWidth('section', '— ' + ev.title + ' —');
         break;
+      case 'project_started':
+        currentRound = null;
+        // Point the composer at the project being reviewed, so a fix typed
+        // straight after the review runs where the findings actually are.
+        selectProject(ev.path);
+        fullWidth('project', '📁 ' + ev.name + ' — ' + ev.path);
+        break;
       case 'working':
         line(colFor(ev.actor), 'working', '● ' + ev.actor + ' — ' + ev.action);
         break;
@@ -274,6 +282,27 @@
 
   // ── composer ───────────────────────────────────────────────
 
+  /** Fill the project picker from the workspace folders the extension sent. */
+  function setProjects(projects) {
+    projectSel.innerHTML = '';
+    for (const p of projects) {
+      const opt = el('option', null, p.name);
+      opt.value = p.path;
+      projectSel.appendChild(opt);
+    }
+    projectSel.classList.toggle('hidden', projects.length < 2);
+  }
+
+  /** Select `path` if the picker knows it; ignored when it does not. */
+  function selectProject(path) {
+    for (const opt of projectSel.options) {
+      if (opt.value === path) {
+        projectSel.value = path;
+        return;
+      }
+    }
+  }
+
   function submitTask() {
     const text = input.value.trim();
     if (!text || busy) return;
@@ -284,6 +313,7 @@
       text,
       auto: autoBox.checked,
       plan: planBox.checked,
+      dir: projectSel.value || undefined,
     });
   }
 
@@ -331,6 +361,9 @@
         break;
       case 'attached':
         chips.appendChild(el('span', 'chip', '🖼 ' + msg.name));
+        break;
+      case 'projects':
+        setProjects(msg.projects);
         break;
       case 'serveExit':
         fullWidth('error', `dt serve exited (code ${msg.code}) — next task restarts it`);

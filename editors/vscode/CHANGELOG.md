@@ -5,6 +5,35 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.1.6 - 2026-07-31
+
+Requires `dt` 0.1.2 or newer.
+
+### Added
+
+- **Project picker in the composer.** In a multi-root workspace, tasks now run
+  in the project you select rather than always the first workspace folder. The
+  picker follows the review: after a review of project B, a fix typed straight
+  afterwards runs in project B.
+- **Every run announces its project.** Reviews and tasks emit the repository
+  name and absolute path into the timeline before any model output, so the
+  project a finding belongs to is never inferred.
+
+### Fixed
+
+- **The reviewer now states what it is reviewing.** Reviews open with
+  `Reviewing <repository> (<branch>) — <n> file(s): <paths>`, taken from the
+  checkout itself. Previously the reviewer was handed a bare diff with no
+  indication of which repository it came from.
+- **Findings are constrained to what the diff shows.** The reviewer is told
+  that unmarked diff lines are unchanged context and that code outside the diff
+  still exists, and is barred from reporting a symbol as undefined or left over
+  unless a `-` line actually deletes it. This removes a class of confident
+  false positives — a reviewer reading an unchanged context line and reporting
+  a `NameError` for a variable that was still assigned 236 lines above it.
+- **Writer and reviewer are given the same repository block**, so a fix cannot
+  be attempted against a different checkout than the one reviewed.
+
 ## 0.1.5 - 2026-07-31
 
 Requires `dt` 0.1.1 or newer — the `review` command gained a `dirs` field.

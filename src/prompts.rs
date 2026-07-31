@@ -26,17 +26,49 @@ pub fn build_implement_prompt(template: &str, task: &str, context: &str, previou
     render(template, &[("task", task), ("context", &context_with_session(context, previous_session))])
 }
 
+/// Guardrails against the reviewer inventing findings it cannot see. A diff
+/// shows changed hunks, not whole files, so "this symbol is undefined" is only
+/// knowable when the diff itself deletes the definition.
+pub const REVIEW_GROUND_RULES: &str = r#"REQUIRED — the first line of your reply must be exactly:
+Reviewing <repository> (<branch>) — <n> file(s): <comma-separated paths>
+taking every value from the block above. Write that line before anything else.
+
+Then, while reviewing:
+- Every file you mention must appear in the changed-files list above. If a file is not on
+  that list, it is not part of these changes — do not review it or invent findings about it.
+- You are reading a diff, not whole files. Lines with no `+`/`-` marker are unchanged
+  context, and code outside the diff still exists.
+- Never claim a symbol is undefined, removed, unused, or left over from a refactor unless a
+  `-` line in this diff actually deletes it. If you cannot see its definition, say the diff
+  is insufficient to judge and ask for the file — do not guess.
+- Cite the file path with any line number you give, and only for lines present in the diff."#;
+
+/// Appends a `{key}` section to a template that lacks the placeholder, so
+/// prompt files written before the placeholder existed still receive the
+/// content. Appended rather than prefixed: instructions closest to the end of
+/// the prompt are the ones models actually follow.
+pub fn ensure_placeholder(template: &str, key: &str, heading: &str) -> String {
+    let placeholder = format!("{{{}}}", key);
+    if template.contains(&placeholder) {
+        return template.to_string();
+    }
+    format!("{}\n\n{}\n{}\n", template, heading, placeholder)
+}
+
 pub fn build_review_prompt(
     template: &str,
     task: &str,
+    repo: &str,
     diff: &str,
     checks: &str,
     writer_notes: &str,
 ) -> String {
+    let template = ensure_placeholder(template, "repo", "REPOSITORY UNDER REVIEW:");
     render(
-        template,
+        &template,
         &[
             ("task", task),
+            ("repo", repo),
             ("diff", diff),
             ("checks", checks),
             ("writer_notes", writer_notes),
@@ -128,6 +160,12 @@ Follow this review process:
 Rules:
 - NEVER run `git add`, `git commit`, or `git push`. You are a reviewer only.
 - Be direct and honest. Do not pad your review with generic praise.
+- A diff shows changed hunks, not whole files. Unmarked lines are unchanged context and the
+  code around them still exists. Never report a symbol as undefined, removed, or left over
+  unless a `-` line in this diff deletes it — say the diff is insufficient instead.
+
+REPOSITORY UNDER REVIEW:
+{repo}
 
 At the end of your review, write one of these on its own line:
 VERDICT: APPROVED
@@ -231,8 +269,33 @@ mod tests {
 
     #[test]
     fn review_prompt_includes_writer_notes() {
-        let out = build_review_prompt(DEFAULT_REVIEW_TEMPLATE, "t", "d", "c", "my notes");
+        let out = build_review_prompt(DEFAULT_REVIEW_TEMPLATE, "t", "r", "d", "c", "my notes");
         assert!(out.contains("my notes"));
         assert!(!out.contains("{writer_notes}"));
+    }
+
+    #[test]
+    fn review_prompt_names_the_repository() {
+        let repo = "repository: agentic-testing-service";
+        let out = build_review_prompt(DEFAULT_REVIEW_TEMPLATE, "t", repo, "d", "c", "n");
+        assert!(out.contains(repo));
+        assert!(!out.contains("{repo}"));
+    }
+
+    /// Prompt files written by an older `dt init` have no `{repo}` placeholder;
+    /// the repository block must still reach the reviewer.
+    #[test]
+    fn legacy_template_without_repo_placeholder_still_gets_the_block() {
+        let legacy = "You are a reviewer.\n\nDIFF:\n{diff}\n";
+        let out = build_review_prompt(legacy, "t", "repository: my-service", "d", "c", "n");
+        assert!(out.contains("repository: my-service"));
+        assert!(out.contains("REPOSITORY UNDER REVIEW:"));
+        assert!(out.contains("You are a reviewer."));
+    }
+
+    #[test]
+    fn ensure_placeholder_leaves_templates_that_already_have_it_alone() {
+        let template = "A {repo} B";
+        assert_eq!(ensure_placeholder(template, "repo", "HEAD:"), template);
     }
 }

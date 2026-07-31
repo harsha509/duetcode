@@ -24,6 +24,9 @@ pub enum Event {
     TaskStarted { task: String, writer: String, reviewer: String, mode: String, max_rounds: usize },
     RoundStarted { round: usize, budget: usize },
     Section { title: String },
+    /// Names the checkout the following events belong to, so a frontend can
+    /// attribute a review — and aim the follow-up fix — at the right project.
+    ProjectStarted { name: String, path: String },
     Working { actor: String, action: String },
     Info { text: String },
     Warn { text: String },
@@ -90,6 +93,7 @@ impl Sink for TerminalSink {
             }
             Event::RoundStarted { round, budget } => ui::round_header(round, budget),
             Event::Section { title } => ui::section(&title),
+            Event::ProjectStarted { name, path } => ui::section(&format!("{} ({})", name, path)),
             Event::Working { actor, action } => ui::working(&actor, &action),
             Event::Info { text } => ui::info(&text),
             Event::Warn { text } => ui::warn(&text),

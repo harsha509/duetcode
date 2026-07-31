@@ -102,6 +102,65 @@ fn untracked_as_diff(dir: &Path, rel_path: &str) -> String {
     format!("{}{}", header, body)
 }
 
+/// Every path with uncommitted work, as `<status> <path>` lines. Tracked
+/// changes come from `--name-status`; untracked files are marked `?` so the
+/// list matches exactly what `git_diff` renders.
+pub fn changed_files(dir: &Path) -> Vec<String> {
+    let mut files: Vec<String> = name_status(dir, &["diff", "--name-status", "HEAD"])
+        .filter(|list| !list.is_empty())
+        .or_else(|| name_status(dir, &["diff", "--name-status"]))
+        .unwrap_or_default();
+
+    for path in untracked_files(dir).unwrap_or_default() {
+        files.push(format!("? {}", path));
+    }
+    files
+}
+
+fn name_status(dir: &Path, args: &[&str]) -> Option<Vec<String>> {
+    let output = Command::new("git").args(args).current_dir(dir).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.replace('\t', " "))
+            .collect(),
+    )
+}
+
+/// Names the checkout a model is working against — repository, absolute path,
+/// branch, and the files in play. Both the reviewer and the writer are given
+/// this same block so a finding can never be attributed to the wrong project.
+pub fn repo_identity(dir: &Path) -> String {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string());
+    let branch = current_branch(dir).unwrap_or_else(|_| "unknown".into());
+    let files = changed_files(dir);
+
+    let mut block = format!(
+        "repository: {}\npath:       {}\nbranch:     {}\n",
+        name,
+        dir.display(),
+        branch
+    );
+
+    if files.is_empty() {
+        block.push_str("changed files: none\n");
+        return block;
+    }
+
+    block.push_str(&format!("changed files ({}):\n", files.len()));
+    for file in &files {
+        block.push_str(&format!("  {}\n", file));
+    }
+    block
+}
+
 pub fn git_diff_stat(dir: &Path) -> Result<String> {
     let output = Command::new("git")
         .args(["diff", "--stat", "HEAD"])

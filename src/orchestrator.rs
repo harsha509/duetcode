@@ -207,6 +207,7 @@ pub fn review_only(
     let review_prompt = prompts::build_review_prompt(
         &review_template,
         task_context,
+        &review_repo_block(repo_dir),
         &diff,
         "",
         "(not provided — judge the diff on its own)",
@@ -603,6 +604,7 @@ fn run_review(
     let mut review_prompt = prompts::build_review_prompt(
         &session.review_template,
         opts.task,
+        &review_repo_block(opts.repo_dir),
         input.diff,
         &checks_summary,
         input.writer_notes,
@@ -803,13 +805,21 @@ fn load_prompt_template(path: &std::path::Path, default: &str, repo_dir: &Path) 
     }
 }
 
+/// The identity block plus the rules keeping the reviewer inside what the diff
+/// actually shows. Attached to every review prompt, so it reaches users whose
+/// `.duet/prompts/review.txt` predates the `{repo}` placeholder.
+fn review_repo_block(dir: &Path) -> String {
+    format!("{}\n{}", git::repo_identity(dir), prompts::REVIEW_GROUND_RULES)
+}
+
 fn build_repo_context(dir: &Path) -> Result<String> {
-    let branch = git::current_branch(dir).unwrap_or_else(|_| "unknown".into());
     let status = git::git_status(dir).unwrap_or_default();
 
-    let mut context = format!("Branch: {}\n", branch);
+    // Same identity block the reviewer is given, so the writer acts on findings
+    // about the checkout it is actually standing in.
+    let mut context = git::repo_identity(dir);
     if !status.trim().is_empty() {
-        context.push_str(&format!("Working tree status:\n{}\n", status));
+        context.push_str(&format!("working tree status:\n{}\n", status));
     }
 
     Ok(context)

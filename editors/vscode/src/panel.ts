@@ -51,7 +51,20 @@ export class DuetPanel {
       this.client.onExit((code) => this.post({ type: 'serveExit', code })),
       panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg)),
       panel.onDidDispose(() => this.dispose()),
+      // The picker must track folders added or removed after the panel opened.
+      vscode.workspace.onDidChangeWorkspaceFolders(() => this.postProjects()),
     );
+    this.postProjects();
+  }
+
+  private postProjects(): void {
+    this.post({
+      type: 'projects',
+      projects: (vscode.workspace.workspaceFolders ?? []).map((folder) => ({
+        name: folder.name,
+        path: folder.uri.fsPath,
+      })),
+    });
   }
 
   showHistory(sessionDir: string): void {
@@ -66,6 +79,9 @@ export class DuetPanel {
           cmd: msg.plan ? 'plan' : 'task',
           task: msg.text,
           auto: !!msg.auto,
+          // Set by the composer's project picker, which follows the project of
+          // the last review — so a fix lands where the findings are.
+          dir: msg.dir || undefined,
         };
         if (this.pendingImages.length > 0) {
           cmd.images = this.pendingImages;
@@ -157,6 +173,7 @@ export class DuetPanel {
     <div id="chips"></div>
     <textarea id="input" rows="2" placeholder="Describe a task for the duet…  (paste screenshots directly)"></textarea>
     <div id="controls">
+      <select id="project" class="hidden" title="Project a task runs in"></select>
       <label><input type="checkbox" id="auto" checked> auto</label>
       <label><input type="checkbox" id="plan"> plan</label>
       <button id="attach" title="Attach image">📎</button>
