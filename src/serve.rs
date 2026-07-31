@@ -3,7 +3,7 @@
 //! Commands arrive on stdin, one JSON object per line:
 //!   {"cmd":"task","task":"...","auto":true,"images":["/path.png"]}
 //!   {"cmd":"plan","task":"..."}
-//!   {"cmd":"review","task":"optional context"}
+//!   {"cmd":"review","task":"optional context","dirs":["/proj-a","/proj-b"]}
 //!   {"cmd":"answer","id":3,"value":"y"}        // reply to an "ask" event
 //!   {"cmd":"ping"} / {"cmd":"quit"}
 //!
@@ -11,15 +11,16 @@
 //! free-form logging. Adapters are constructed once per serve process, so
 //! both models keep their context across tasks — same as the terminal REPL.
 
-use crate::adapters::ImageInput;
+use crate::adapters::{ImageInput, ModelAdapter};
 use crate::cli;
+use crate::config::Config;
 use crate::events::{AskKind, Event, Sink};
 use crate::git;
 use crate::orchestrator::{self, TaskOptions};
 use anyhow::Result;
 use serde::Deserialize;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
@@ -37,6 +38,11 @@ struct Command {
     id: Option<u64>,
     #[serde(default)]
     value: Option<String>,
+    /// Projects a review covers. A multi-root workspace sends every folder so
+    /// one clean project never hides the changes sitting in another; omitted
+    /// or empty means the serve directory alone.
+    #[serde(default)]
+    dirs: Option<Vec<String>>,
 }
 
 /// Serializes events as JSON lines on stdout; asks block until the frontend
@@ -131,18 +137,7 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                     Err(e) => sink.event(Event::Error { message: format!("{:#}", e) }),
                 }
             }
-            "review" => {
-                match orchestrator::review_only(
-                    &config, reviewer.as_mut(), dir, cmd.task.as_deref(), sink.as_ref(),
-                ) {
-                    Ok(r) => sink.event(Event::TaskDone {
-                        success: r.success,
-                        rounds: r.rounds,
-                        message: r.message,
-                    }),
-                    Err(e) => sink.event(Event::Error { message: format!("{:#}", e) }),
-                }
-            }
+            "review" => run_review(&config, reviewer.as_mut(), dir, &cmd, sink.as_ref()),
             other => {
                 sink.event(Event::Error { message: format!("unknown command '{}'", other) });
             }
@@ -151,6 +146,174 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
 
     sink.event(Event::Bye);
     Ok(())
+}
+
+/// One project a review covers: where it lives and how the UI labels it.
+struct ReviewTarget {
+    dir: PathBuf,
+    label: String,
+}
+
+impl ReviewTarget {
+    fn new(dir: PathBuf) -> Self {
+        let label = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        Self { dir, label }
+    }
+}
+
+/// Every project the frontend asked for, falling back to the serve directory
+/// when it sent none (plain `dt serve` clients and single-folder workspaces).
+fn review_targets(cmd: &Command, default_dir: &Path) -> Vec<ReviewTarget> {
+    match cmd.dirs.as_deref() {
+        Some(dirs) if !dirs.is_empty() => {
+            dirs.iter().map(|dir| ReviewTarget::new(PathBuf::from(dir))).collect()
+        }
+        _ => vec![ReviewTarget::new(default_dir.to_path_buf())],
+    }
+}
+
+/// A project's own `.duet/config.toml` when it has one, so each project keeps
+/// its own review prompt; `None` means fall back to the serve session's config.
+fn project_config(target: &ReviewTarget, sink: &dyn Sink) -> Option<Config> {
+    if !Config::config_path(&target.dir).exists() {
+        return None;
+    }
+    match Config::load(&target.dir) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            sink.event(Event::Warn {
+                text: format!("{} — {:#}, using the session config", target.label, e),
+            });
+            None
+        }
+    }
+}
+
+/// Outcome tally across the reviewed projects.
+#[derive(Default)]
+struct ReviewTally {
+    reviewed: usize,
+    approved: usize,
+    failures: Vec<String>,
+}
+
+/// Reviews every requested project in turn. Projects that are not git repos or
+/// have nothing uncommitted are skipped rather than failing the run, so a clean
+/// first folder never hides the changes sitting in a second one.
+fn run_review(
+    session_config: &Config,
+    reviewer: &mut dyn ModelAdapter,
+    default_dir: &Path,
+    cmd: &Command,
+    sink: &dyn Sink,
+) {
+    let targets = review_targets(cmd, default_dir);
+    let multi = targets.len() > 1;
+    let mut tally = ReviewTally::default();
+
+    for target in &targets {
+        if !has_changes_to_review(target, multi, sink) {
+            continue;
+        }
+
+        if multi {
+            sink.event(Event::Section { title: target.label.clone() });
+        }
+
+        let own_config = project_config(target, sink);
+        let config = own_config.as_ref().unwrap_or(session_config);
+
+        match orchestrator::review_only(config, reviewer, &target.dir, cmd.task.as_deref(), sink) {
+            Ok(result) => {
+                tally.reviewed += 1;
+                if result.success {
+                    tally.approved += 1;
+                }
+            }
+            Err(e) => {
+                let message = format!("{} — {:#}", target.label, e);
+                // Warn rather than Error: later projects are still coming, and
+                // an Error would end the run in the UI.
+                if multi {
+                    sink.event(Event::Warn { text: message.clone() });
+                }
+                tally.failures.push(if multi { message } else { format!("{:#}", e) });
+            }
+        }
+    }
+
+    emit_review_outcome(&targets, &tally, sink);
+}
+
+/// True when the project is a git repo with something uncommitted. Skips are
+/// announced only in multi-project runs, where the reason is not obvious.
+fn has_changes_to_review(target: &ReviewTarget, multi: bool, sink: &dyn Sink) -> bool {
+    if !git::is_git_repo(&target.dir) {
+        if multi {
+            sink.event(Event::Warn {
+                text: format!("{} — not a git repository, skipped", target.label),
+            });
+        }
+        return false;
+    }
+
+    match git::git_diff(&target.dir) {
+        Ok(diff) if diff.trim().is_empty() => {
+            if multi {
+                sink.event(Event::Info {
+                    text: format!("{} — no uncommitted changes, skipped", target.label),
+                });
+            }
+            false
+        }
+        Ok(_) => true,
+        Err(e) => {
+            sink.event(Event::Warn {
+                text: format!("{} — could not read changes: {:#}", target.label, e),
+            });
+            false
+        }
+    }
+}
+
+fn emit_review_outcome(targets: &[ReviewTarget], tally: &ReviewTally, sink: &dyn Sink) {
+    if tally.reviewed == 0 {
+        let message = if tally.failures.is_empty() {
+            nothing_to_review_message(targets)
+        } else {
+            tally.failures.join("; ")
+        };
+        sink.event(Event::Error { message });
+        return;
+    }
+
+    sink.event(Event::TaskDone {
+        success: tally.approved == tally.reviewed && tally.failures.is_empty(),
+        rounds: tally.reviewed,
+        message: review_summary(tally),
+    });
+}
+
+fn nothing_to_review_message(targets: &[ReviewTarget]) -> String {
+    if targets.len() == 1 {
+        return "no uncommitted changes to review".to_string();
+    }
+    let names: Vec<&str> = targets.iter().map(|t| t.label.as_str()).collect();
+    format!("no uncommitted changes to review in any workspace project ({})", names.join(", "))
+}
+
+fn review_summary(tally: &ReviewTally) -> String {
+    if tally.reviewed == 1 && tally.failures.is_empty() {
+        return if tally.approved == 1 { "approved".into() } else { "changes requested by AI".into() };
+    }
+    let mut summary = format!("{}/{} projects approved", tally.approved, tally.reviewed);
+    if !tally.failures.is_empty() {
+        summary.push_str(&format!(", {} failed", tally.failures.len()));
+    }
+    summary
 }
 
 /// Routes stdin lines: `answer` commands unblock a pending ask; everything

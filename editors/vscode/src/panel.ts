@@ -77,7 +77,11 @@ export class DuetPanel {
         break;
       }
       case 'review':
-        this.client.send({ cmd: 'review', task: msg.text || undefined });
+        this.client.send({
+          cmd: 'review',
+          task: msg.text || undefined,
+          dirs: workspaceProjectDirs(),
+        });
         break;
       case 'answer':
         this.client.send({ cmd: 'answer', id: msg.id, value: msg.value });
@@ -157,7 +161,7 @@ export class DuetPanel {
       <label><input type="checkbox" id="plan"> plan</label>
       <button id="attach" title="Attach image">📎</button>
       <button id="settings" title="Settings — API keys, Claude login">⚙</button>
-      <button id="review" title="Review uncommitted changes">review</button>
+      <button id="review" title="Review uncommitted changes in every workspace project">review</button>
       <button id="send">Send</button>
     </div>
   </footer>
@@ -172,6 +176,15 @@ export class DuetPanel {
       d.dispose();
     }
   }
+}
+
+/**
+ * Every project in the workspace, so a review covers all of them instead of
+ * only the folder `dt serve` was spawned in. Read at send time, so folders
+ * added after activation are included.
+ */
+function workspaceProjectDirs(): string[] {
+  return (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
 }
 
 interface RoundData {
