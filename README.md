@@ -2,7 +2,7 @@
 
 AI pair programming CLI — one model writes code, another reviews it, with you in control.
 
-`dt` orchestrates Claude and Gemini in a structured write/review cycle. One model implements a task, the other reviews the diff against your tests and linters, and the loop continues until the reviewer approves and all checks pass. Run it interactively (you gate each round), fully automatic (`--auto`, the models iterate until mutual approval and only escalate to you if they deadlock), as a persistent session, or from the [VS Code extension](editors/vscode/).
+`dt` orchestrates Claude and Gemini in a structured write/review cycle. One model implements a task, the other reviews the diff against your tests and linters, and the loop continues until the reviewer approves and all checks pass. Run it interactively (you gate each round), fully automatic (`--auto`, the models iterate until mutual approval and only escalate to you if they deadlock), as a persistent session, or from the [VS Code extension](https://marketplace.visualstudio.com/items?itemName=harsha509.dt-duet).
 
 ## How it works
 
@@ -121,11 +121,15 @@ dt review --task "add OAuth login" # tell the reviewer what to verify against
 
 ### 7. VS Code
 
-The [DT Duet extension](editors/vscode/) gives you a sessions sidebar, a live
-duet panel (writer stream stacked over reviewer verdicts per round), Cmd+V
-screenshot paste, button-based approvals, and keychain-stored API keys. It
-talks to `dt serve`, a JSON-lines protocol over stdio that any frontend can
-use.
+Install **[DT Duet](https://marketplace.visualstudio.com/items?itemName=harsha509.dt-duet)**
+from the VS Code Marketplace, or search "DT Duet" in the Extensions view.
+
+It gives you a sessions sidebar, a live duet panel (writer stream stacked
+over reviewer verdicts per round), Cmd+V screenshot paste, button-based
+approvals, and keychain-stored API keys. It talks to `dt serve`, a
+JSON-lines protocol over stdio that any frontend can use — the extension
+still needs the `dt` binary installed above. Source lives in
+[`editors/vscode/`](editors/vscode/).
 
 ## Configuration
 

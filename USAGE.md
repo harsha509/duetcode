@@ -96,7 +96,7 @@ Deletes all session logs.
 
 ### `dt serve`
 
-Runs dt as a JSON-lines server on stdin/stdout for GUI frontends — this is what the [VS Code extension](editors/vscode/) talks to. Commands in (`task`, `plan`, `review`, `answer`, `ping`, `quit`), events out (`round_started`, `stream_chunk`, `verdict`, `ask`, `task_done`, …). Adapters persist across tasks, so context carries exactly like the interactive session.
+Runs dt as a JSON-lines server on stdin/stdout for GUI frontends — this is what the [VS Code extension](https://marketplace.visualstudio.com/items?itemName=harsha509.dt-duet) talks to. Commands in (`task`, `plan`, `review`, `answer`, `ping`, `quit`), events out (`round_started`, `stream_chunk`, `verdict`, `ask`, `task_done`, …). Adapters persist across tasks, so context carries exactly like the interactive session.
 
 ---
 
