@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "AI pair programming CLI — one model writes, another reviews, in a loop until approval"
 license = "MIT"
-repository = "https://github.com/sriharsha/duetcode"
+repository = "https://github.com/harsha509/duetcode"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }

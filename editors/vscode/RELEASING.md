@@ -51,8 +51,11 @@ search like any other extension.
 
 - [ ] `npm run compile` clean
 - [ ] Version bumped in `package.json` (or use `vsce publish patch`)
+- [ ] `CHANGELOG.md` has an entry for the new version — it renders as the
+      marketplace *Changelog* tab
 - [ ] README.md reads well — it *is* the marketplace page
-- [ ] `vsce ls` shows only `out/`, `media/`, `package.json`, `README.md`, `LICENSE`
+- [ ] `vsce ls` shows only `out/` (no `.map`), `media/`, `package.json`,
+      `README.md`, `CHANGELOG.md`, `LICENSE`
 - [ ] Commit + tag the release in git (vsce does not touch git)
 
 ## Notes

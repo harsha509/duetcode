@@ -1,6 +1,45 @@
 import * as vscode from 'vscode';
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 
+/** How users install the `dt` binary the extension drives. */
+const INSTALL_COMMAND = 'cargo install --git https://github.com/harsha509/duetcode.git';
+
+const COPY_COMMAND = 'Copy Install Command';
+const OPEN_SETTINGS = 'Open DT Settings';
+
+/** Node surfaces a missing executable as ENOENT on the spawn error event. */
+function isMissingBinary(err: NodeJS.ErrnoException): boolean {
+  return err.code === 'ENOENT';
+}
+
+function startupErrorMessage(err: NodeJS.ErrnoException, binPath: string): string {
+  if (isMissingBinary(err)) {
+    return (
+      `'${binPath}' not found — DT Duet needs the dt binary. Install it with ` +
+      `\`${INSTALL_COMMAND}\`, then set dt.binaryPath (e.g. ~/.cargo/bin/dt) ` +
+      `if it is still off VS Code's PATH.`
+    );
+  }
+  return `failed to start '${binPath}': ${err.message} — set dt.binaryPath in settings`;
+}
+
+/**
+ * The timeline may be scrolled away when the spawn fails, so the install
+ * instruction also goes out as a notification the user cannot miss.
+ */
+async function offerInstallInstructions(binPath: string): Promise<void> {
+  const choice = await vscode.window.showErrorMessage(
+    `DT Duet could not find the dt binary ('${binPath}'). Install it with: ${INSTALL_COMMAND}`,
+    COPY_COMMAND,
+    OPEN_SETTINGS,
+  );
+  if (choice === COPY_COMMAND) {
+    await vscode.env.clipboard.writeText(INSTALL_COMMAND);
+  } else if (choice === OPEN_SETTINGS) {
+    await vscode.commands.executeCommand('dt.settings');
+  }
+}
+
 /** Spawn options read fresh from settings each time the server starts. */
 export interface ServeOptions {
   binPath: string;
@@ -92,12 +131,15 @@ export class ServeClient implements vscode.Disposable {
     proc.stderr.setEncoding('utf8');
     proc.stderr.on('data', () => {});
 
-    proc.on('error', (err) => {
+    proc.on('error', (err: NodeJS.ErrnoException) => {
       this.proc = undefined;
       this._onEvent.fire({
         event: 'error',
-        message: `failed to start '${opts.binPath}': ${err.message} — set dt.binaryPath in settings`,
+        message: startupErrorMessage(err, opts.binPath),
       });
+      if (isMissingBinary(err)) {
+        void offerInstallInstructions(opts.binPath);
+      }
     });
     proc.on('exit', (code) => {
       this.proc = undefined;
