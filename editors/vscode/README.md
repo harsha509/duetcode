@@ -28,14 +28,15 @@ tests and linters, and you watch both sides of the conversation live.
 
 - The `dt` binary — `cargo install --git https://github.com/harsha509/duetcode`
   (set `dt.binaryPath` if it's not on VS Code's PATH, e.g. `~/.cargo/bin/dt`).
-- A workspace initialized with `dt init`.
+- A git repository — the extension offers to run `dt init` for you the first
+  time you start a task in a project that is not set up yet.
 - Gemini API key — add it via the ⚙ gear (stored in the keychain) or export
   `GEMINI_API_KEY`.
 - Claude CLI authenticated (`claude` → `/login`), or an Anthropic API key.
 
 ## Quick start
 
-1. Open a `dt init`-ed project.
+1. Open a git project (accept the `dt init` prompt if it appears).
 2. Click the DT Duet icon in the activity bar.
 3. Hit **+** (New Task), type what you want, press Enter.
 4. Watch Claude write and Gemini review; answer prompts with the buttons.

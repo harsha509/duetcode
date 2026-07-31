@@ -5,6 +5,21 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.1.7 - 2026-08-01
+
+Requires `dt` 0.1.2 or newer.
+
+### Added
+
+- **Projects are set up on first use.** A project without `.duet/config.toml`
+  made `dt serve` exit at startup, which the panel reported only as
+  `dt serve exited (code 1) — next task restarts it`. That restart could never
+  succeed: the missing config does not change between spawns, so every attempt
+  failed the same way. Before the first task, every git project in the
+  workspace that lacks a config is now offered `dt init` in a single prompt,
+  listing the projects and what the command writes. Declining is remembered per
+  project, so the prompt does not return for a project you keep uninitialized.
+
 ## 0.1.6 - 2026-07-31
 
 Requires `dt` 0.1.2 or newer.
