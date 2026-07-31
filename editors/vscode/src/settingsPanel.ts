@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { ServeClient } from './serveClient';
 import { SECRET_ANTHROPIC, SECRET_GEMINI } from './settings';
+import { fetchClaudeModels, fetchGeminiModels } from './modelCatalog';
 
 /**
  * Full-page settings webview (Cline-style form) replacing the old QuickPick:
@@ -79,6 +80,53 @@ export class SettingsPanel {
         );
         break;
       }
+      case 'refreshModels':
+        await this.refreshModels();
+        break;
+    }
+  }
+
+  /** Fetch the latest models from each provider using the stored keys and push
+   *  them into the form's datalists. Claude only refreshes when an Anthropic
+   *  API key is stored (the CLI can't list models); Gemini uses its key. */
+  private async refreshModels(): Promise<void> {
+    const [anthropicKey, geminiKey] = await Promise.all([
+      this.ctx.secrets.get(SECRET_ANTHROPIC),
+      this.ctx.secrets.get(SECRET_GEMINI),
+    ]);
+
+    const [gemini, claude] = await Promise.all([
+      SettingsPanel.discover('Gemini', geminiKey, fetchGeminiModels,
+        'add a Gemini API key above to refresh'),
+      SettingsPanel.discover('Claude', anthropicKey, fetchClaudeModels,
+        'CLI mode tracks the sonnet/opus/haiku aliases — run `claude update`; add an Anthropic API key to list full ids'),
+    ]);
+
+    await this.panel.webview.postMessage({
+      type: 'models',
+      gemini: gemini.models,
+      claude: claude.models,
+      note: `${gemini.note}  ·  ${claude.note}`,
+    });
+  }
+
+  /** Fetch one provider's models, mapping the no-key and failure cases to a
+   *  human-readable note rather than throwing. */
+  private static async discover(
+    label: string,
+    apiKey: string | undefined,
+    fetchModels: (key: string) => Promise<string[]>,
+    noKeyHint: string,
+  ): Promise<{ models?: string[]; note: string }> {
+    if (!apiKey) {
+      return { note: `${label}: ${noKeyHint}` };
+    }
+    try {
+      const models = await fetchModels(apiKey);
+      return { models, note: `${label}: ${models.length} models` };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return { note: `${label}: refresh failed — ${message}` };
     }
   }
 
@@ -126,7 +174,11 @@ export class SettingsPanel {
   <h1>DT Duet Settings</h1>
 
   <section>
-    <h2>Models</h2>
+    <div class="section-head">
+      <h2>Models</h2>
+      <button id="refreshModels" class="link" title="Fetch the latest available models from each provider">⟳ Refresh</button>
+    </div>
+    <p id="modelsStatus" class="hint hidden"></p>
 
     <div class="field">
       <label for="writer">Writer</label>

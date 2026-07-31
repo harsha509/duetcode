@@ -2,7 +2,7 @@
   "name": "dt-duet",
   "displayName": "DT Duet — AI Pair Programming",
   "description": "Claude writes, Gemini reviews — run and watch the duet from VS Code.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "harsha509",
   "license": "MIT",
   "icon": "media/logo.png",

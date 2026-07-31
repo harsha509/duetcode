@@ -10,10 +10,32 @@
   const geminiKey = $('geminiKey');
   const binaryPath = $('binaryPath');
   const savedNote = $('savedNote');
+  const refreshModels = $('refreshModels');
+  const modelsStatus = $('modelsStatus');
 
   function setKeyStatus(el, stored) {
     el.textContent = stored ? 'stored ✓' : 'not set';
     el.classList.toggle('stored', stored);
+  }
+
+  function showStatus(text) {
+    modelsStatus.textContent = text;
+    modelsStatus.classList.toggle('hidden', !text);
+  }
+
+  /** Replace a datalist's options with the fetched model ids. */
+  function fillDatalist(id, values) {
+    const dl = $(id);
+    if (!dl || !values || !values.length) {
+      return;
+    }
+    dl.replaceChildren(
+      ...values.map((v) => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        return opt;
+      }),
+    );
   }
 
   window.addEventListener('message', (e) => {
@@ -30,7 +52,18 @@
       geminiKey.value = '';
       savedNote.classList.remove('hidden');
       setTimeout(() => savedNote.classList.add('hidden'), 3000);
+    } else if (msg.type === 'models') {
+      refreshModels.disabled = false;
+      fillDatalist('geminiModels', msg.gemini);
+      fillDatalist('claudeModels', msg.claude);
+      showStatus(msg.note);
     }
+  });
+
+  refreshModels.addEventListener('click', () => {
+    refreshModels.disabled = true;
+    showStatus('Fetching latest models…');
+    vscode.postMessage({ type: 'refreshModels' });
   });
 
   $('save').addEventListener('click', () => {

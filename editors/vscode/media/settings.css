@@ -29,6 +29,34 @@ h2 {
   border-bottom: 1px solid var(--vscode-panel-border);
 }
 
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.section-head h2 {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+button.link {
+  padding: 2px 6px;
+  color: var(--vscode-textLink-foreground);
+  background: transparent;
+  font-size: 12px;
+}
+
+button.link:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.15));
+}
+
+button.link:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .field { margin: 14px 0; }
 
 .field label {
