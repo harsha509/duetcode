@@ -392,7 +392,7 @@ fn cmd_init(dir: &Path) -> Result<()> {
 
     if gitignore_path.exists() {
         let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
-        if !content.contains(".duet/sessions/") {
+        if needs_sessions_ignore_entry(&content) {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
@@ -410,6 +410,17 @@ fn cmd_init(dir: &Path) -> Result<()> {
     println!("Run {} to verify your setup.", "dt doctor".cyan());
 
     Ok(())
+}
+
+/// Whether `.gitignore` still needs a session-directory rule. A plain
+/// `.contains(".duet/sessions/")` misses the broader `.duet/` rule that already
+/// covers everything beneath it, so `dt init` appended a duplicate on every run
+/// and left the working tree dirty.
+fn needs_sessions_ignore_entry(content: &str) -> bool {
+    !content.lines().any(|line| {
+        let rule = line.split('#').next().unwrap_or_default().trim();
+        matches!(rule, ".duet" | ".duet/" | ".duet/sessions" | ".duet/sessions/")
+    })
 }
 
 fn cmd_doctor(dir: &Path, verbose: bool) -> Result<()> {
@@ -559,4 +570,38 @@ fn write_default_prompt(dir: &Path, name: &str, content: &str) -> Result<()> {
         println!("  {} created prompts/{}", "✓".green(), name);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broader_duet_rule_already_covers_sessions() {
+        assert!(!needs_sessions_ignore_entry("target/\n.duet/\n"));
+        assert!(!needs_sessions_ignore_entry(".duet\n"));
+    }
+
+    #[test]
+    fn explicit_sessions_rule_is_not_duplicated() {
+        assert!(!needs_sessions_ignore_entry("target/\n.duet/sessions/\n"));
+    }
+
+    #[test]
+    fn trailing_comments_and_whitespace_do_not_hide_the_rule() {
+        assert!(!needs_sessions_ignore_entry("  .duet/   # runtime dir\n"));
+    }
+
+    #[test]
+    fn gitignore_without_any_duet_rule_still_gets_one() {
+        assert!(needs_sessions_ignore_entry("target/\nnode_modules/\n"));
+    }
+
+    /// `.duetsomething` and `.duet/config.toml` are different rules and must not
+    /// be mistaken for one that covers the sessions directory.
+    #[test]
+    fn similar_but_narrower_rules_do_not_count() {
+        assert!(needs_sessions_ignore_entry(".duetfoo/\n"));
+        assert!(needs_sessions_ignore_entry(".duet/config.toml\n"));
+    }
 }

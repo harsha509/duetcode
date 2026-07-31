@@ -416,9 +416,7 @@ impl ClaudeAdapter {
         let get_str = |key: &str| -> Option<&str> {
             input.and_then(|v| v.get(key)).and_then(|v| v.as_str())
         };
-        let truncate = |s: &str, max: usize| -> String {
-            if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
-        };
+        let truncate = truncate_chars;
 
         match tool {
             "Read" => {
@@ -662,6 +660,18 @@ impl ClaudeAdapter {
     }
 }
 
+/// Truncates to `max` *characters*, never bytes. Tool arguments are arbitrary
+/// user text — a non-ASCII path, a CJK search pattern — and slicing one at a
+/// byte index that lands mid-character panics. `panic = "abort"` in the release
+/// profile turns that into a killed `dt` process, losing the session.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
 fn build_content(prompt: &str, images: &[ImageInput]) -> serde_json::Value {
     if images.is_empty() {
         return serde_json::json!([{ "type": "text", "text": prompt }]);
@@ -718,7 +728,9 @@ impl ModelAdapter for ClaudeAdapter {
             return self.run_api(prompt, images);
         }
         match self.run_cli(prompt, images) {
-            Err(e) if self.api_key.is_some() && self.config.mode == "auto" => {
+            // Case-insensitive to match the constructor, which lowercases
+            // `mode` before deciding whether to build the API agent.
+            Err(e) if self.api_key.is_some() && self.config.mode.eq_ignore_ascii_case("auto") => {
                 eprintln!("  {} CLI failed ({:#}) — falling back to API", "↻".yellow(), e);
                 self.run_api(prompt, images)
             }
@@ -732,5 +744,42 @@ impl ModelAdapter for ClaudeAdapter {
 
     fn streams_output(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_ascii_is_returned_unchanged() {
+        assert_eq!(truncate_chars("cargo test", 60), "cargo test");
+    }
+
+    #[test]
+    fn long_ascii_is_cut_and_marked() {
+        assert_eq!(truncate_chars("abcdefghij", 4), "abcd…");
+    }
+
+    /// The panic this replaces: `&s[..max]` where `max` lands inside a
+    /// multibyte character aborts the process.
+    #[test]
+    fn multibyte_boundaries_do_not_panic() {
+        assert_eq!(truncate_chars("検索パターンをここに入れる長い文字列", 4), "検索パタ…");
+        assert_eq!(truncate_chars("grep 'résumé' in café", 7), "grep 'r…");
+    }
+
+    /// A CJK pattern is 3 bytes per character, so a byte-based limit of 30 cut
+    /// after 10 characters; a character-based one must keep all 30.
+    #[test]
+    fn character_limit_is_not_a_byte_limit() {
+        let cjk = "検".repeat(30);
+        assert_eq!(truncate_chars(&cjk, 30), cjk);
+        assert!(!truncate_chars(&cjk, 30).ends_with('…'));
+    }
+
+    #[test]
+    fn zero_max_yields_only_the_ellipsis() {
+        assert_eq!(truncate_chars("abc", 0), "…");
     }
 }

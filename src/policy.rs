@@ -56,27 +56,66 @@ fn word_set(items: &[String]) -> HashSet<String> {
         .collect()
 }
 
+/// This gate fails closed: anything that is not unambiguously an approval is a
+/// rejection, because a false Approved ends the loop and reports a rejected
+/// change to the user as a success.
 fn parse_verdict_line(lines: &[&str]) -> Verdict {
     for line in lines.iter().rev() {
         let upper = line.to_uppercase();
         if upper.contains("VERDICT:") || upper.contains("VERDICT :") {
-            if upper.contains("APPROVED") && !upper.contains("CHANGES_REQUESTED") {
-                return Verdict::Approved;
-            }
-            if upper.contains("CHANGES_REQUESTED") || upper.contains("CHANGES REQUESTED") {
+            // Rejections are tested first: "NOT APPROVED" also contains "APPROVED".
+            if upper.contains("CHANGES_REQUESTED")
+                || upper.contains("CHANGES REQUESTED")
+                || upper.contains("NOT APPROVED")
+            {
                 return Verdict::ChangesRequested;
+            }
+            if upper.contains("APPROVED") {
+                return Verdict::Approved;
             }
         }
     }
 
-    for line in lines.iter().rev().take(5) {
-        let upper = line.to_uppercase();
-        if upper.contains("APPROVED") && !upper.contains("NOT APPROVED") {
-            return Verdict::Approved;
-        }
+    // No verdict line. Only a line that is *nothing but* the word counts —
+    // prose such as "this cannot be approved until…" merely contains it.
+    if lines.iter().rev().take(5).any(|line| is_bare_approval(line)) {
+        return Verdict::Approved;
     }
 
     Verdict::ChangesRequested
+}
+
+/// True for a line whose entire content is the word "approved", ignoring
+/// markdown emphasis and punctuation — `APPROVED`, `**Approved**`, `Approved.`
+fn is_bare_approval(line: &str) -> bool {
+    let words: String = line
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    words.trim().eq_ignore_ascii_case("approved")
+}
+
+/// Strips one markdown list marker — `-`, `*`, `+`, `1.` or `1)` — returning
+/// the item text. Reviewers pick their own bullet style, and a blocker missed
+/// here is a blocker the stall detector and the escalation summary never see.
+fn strip_list_marker(line: &str) -> Option<&str> {
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = line.strip_prefix(marker) {
+            return Some(rest.trim());
+        }
+    }
+
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        let rest = &line[digits..];
+        for marker in [". ", ") "] {
+            if let Some(item) = rest.strip_prefix(marker) {
+                return Some(item.trim());
+            }
+        }
+    }
+
+    None
 }
 
 fn parse_list_section(lines: &[&str], header: &str) -> Vec<String> {
@@ -93,11 +132,11 @@ fn parse_list_section(lines: &[&str], header: &str) -> Vec<String> {
         }
 
         if in_section {
-            if line.trim().is_empty() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            if line.starts_with("- ") || line.starts_with("* ") {
-                let item = line.trim_start_matches("- ").trim_start_matches("* ").trim();
+            if let Some(item) = strip_list_marker(trimmed) {
                 if !item.is_empty() && item.to_lowercase() != "none" {
                     items.push(item.to_string());
                 }
@@ -145,6 +184,51 @@ mod tests {
         let a = vec!["missing null check in foo() function".to_string()];
         let b = vec!["the foo() function is missing a null check".to_string()];
         assert!(blockers_similar(&a, &b));
+    }
+
+    /// A reviewer that discusses approval in prose without emitting a verdict
+    /// line must never be read as approving. Each of these ends the loop and
+    /// reports success to the user if the fallback matches on the word alone.
+    #[test]
+    fn prose_mentioning_approval_is_not_an_approval() {
+        for review in [
+            "This cannot be approved until the null check is added.",
+            "I would have approved this, but the tests are missing.",
+            "This is not yet approved.",
+            "Changes are needed before this can be approved.",
+        ] {
+            assert_eq!(
+                parse_verdict(review).verdict,
+                Verdict::ChangesRequested,
+                "wrongly approved: {review}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_not_approved_verdict_is_changes_requested() {
+        let v = parse_verdict("VERDICT: NOT APPROVED");
+        assert_eq!(v.verdict, Verdict::ChangesRequested);
+    }
+
+    /// A bare approval with no `VERDICT:` line is still an approval.
+    #[test]
+    fn bare_approval_line_still_approves() {
+        for review in ["Looks good.\n\nAPPROVED", "Fine by me.\n\n**APPROVED**", "Ship it.\nApproved."] {
+            assert_eq!(parse_verdict(review).verdict, Verdict::Approved, "missed: {review}");
+        }
+    }
+
+    /// Reviewers indent bullets under the header or use numbered lists. Dropping
+    /// those leaves `blockers` empty, which silently disables stall detection.
+    #[test]
+    fn blockers_survive_indentation_and_numbering() {
+        let review = "BLOCKERS:\n  - indented blocker\n1. numbered blocker\n- plain blocker\n\nVERDICT: CHANGES_REQUESTED";
+        let v = parse_verdict(review);
+        assert_eq!(
+            v.blockers,
+            vec!["indented blocker", "numbered blocker", "plain blocker"]
+        );
     }
 
     #[test]

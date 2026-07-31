@@ -551,6 +551,18 @@ fn build_writer_prompt(
     prompt
 }
 
+/// Whether this round produced code worth sending to the reviewer.
+///
+/// Both arguments are whole-worktree diffs, which is why neither condition
+/// alone is enough. A tree that was already dirty when the round began is not
+/// the writer's work — reviewing it attributes someone else's edits to the
+/// writer — so an unchanged diff means "no code this round" even when the tree
+/// is dirty. And a writer that reverts the tree back to clean leaves an empty
+/// diff, which a reviewer can only rubber-stamp.
+fn wrote_reviewable_code(diff_before: &str, diff_after: &str) -> bool {
+    diff_after != diff_before && !diff_after.trim().is_empty()
+}
+
 fn writer_diff_outcome(
     opts: &TaskOptions,
     reviewer_name: &str,
@@ -560,10 +572,8 @@ fn writer_diff_outcome(
     sink: &dyn Sink,
 ) -> Result<DiffOutcome> {
     let diff_after = git::git_diff(opts.repo_dir)?;
-    let changed = diff_after != diff_before;
-    let has_uncommitted = !diff_after.trim().is_empty();
 
-    if !changed && !has_uncommitted {
+    if !wrote_reviewable_code(diff_before, &diff_after) {
         return Ok(DiffOutcome::NoChanges);
     }
 
@@ -827,4 +837,42 @@ fn build_repo_context(dir: &Path) -> Result<String> {
 
 fn ok_result(rounds: usize, message: &str) -> OrchestratorResult {
     OrchestratorResult { success: true, rounds, message: message.into() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DIFF: &str = "diff --git a/src/lib.rs b/src/lib.rs\n+fn added() {}\n";
+    const STALE: &str = "diff --git a/.gitignore b/.gitignore\n+.duet/sessions/\n";
+
+    #[test]
+    fn new_code_is_reviewable() {
+        assert!(wrote_reviewable_code("", DIFF));
+    }
+
+    #[test]
+    fn further_edits_on_top_of_existing_work_are_reviewable() {
+        assert!(wrote_reviewable_code(STALE, &format!("{}{}", STALE, DIFF)));
+    }
+
+    #[test]
+    fn clean_tree_and_no_edits_is_not_reviewable() {
+        assert!(!wrote_reviewable_code("", ""));
+    }
+
+    /// A prose answer leaves the worktree exactly as it found it. If the tree
+    /// was already dirty, that pre-existing diff belongs to whoever made it —
+    /// routing it to the code reviewer reviews the wrong thing entirely.
+    #[test]
+    fn untouched_pre_existing_changes_are_not_the_writers_work() {
+        assert!(!wrote_reviewable_code(STALE, STALE));
+    }
+
+    /// Reverting the tree back to clean changes the diff but leaves nothing to
+    /// review; an empty diff can only ever be approved.
+    #[test]
+    fn revert_back_to_clean_is_not_reviewable() {
+        assert!(!wrote_reviewable_code(STALE, ""));
+    }
 }
