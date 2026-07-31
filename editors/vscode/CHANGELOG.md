@@ -5,7 +5,7 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.1.4] - 2026-07-31
+## 0.1.4 - 2026-07-31
 
 First public release on the VS Code Marketplace.
 
@@ -33,5 +33,3 @@ First public release on the VS Code Marketplace.
   written to `settings.json`.
 - **Machine-scoped `dt.binaryPath`** — a cloned repository's workspace
   settings cannot redirect the extension at an untrusted binary.
-
-[0.1.4]: https://github.com/harsha509/duetcode/releases/tag/vscode-v0.1.4
