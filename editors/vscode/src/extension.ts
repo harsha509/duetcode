@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { ensureInitialized } from './init';
 import { DuetPanel } from './panel';
 import { ServeClient } from './serveClient';
 import { SessionsProvider } from './sessions';
@@ -23,6 +24,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     },
     root ?? process.cwd(),
     () => secretEnv(ctx),
+    (binPath) => ensureInitialized(ctx, binPath),
   );
   ctx.subscriptions.push(client);
 

@@ -68,6 +68,8 @@ export class ServeClient implements vscode.Disposable {
     private readonly cwd: string,
     /** Extra env (API keys from SecretStorage) injected at spawn time. */
     private readonly envProvider: () => Promise<Record<string, string>> = async () => ({}),
+    /** Runs before each spawn, to set up projects the server would bail on. */
+    private readonly prepare: (binPath: string) => Promise<void> = async () => {},
   ) {}
 
   /** Kill the server; the next send() respawns it with fresh secrets. */
@@ -94,8 +96,9 @@ export class ServeClient implements vscode.Disposable {
     if (this.proc) {
       return;
     }
-    const extraEnv = await this.envProvider();
     const opts = this.optionsProvider();
+    await this.prepare(opts.binPath);
+    const extraEnv = await this.envProvider();
     const args = ['serve', '--writer', opts.writer];
     if (opts.claudeModel) {
       args.push('--claude-model', opts.claudeModel);
