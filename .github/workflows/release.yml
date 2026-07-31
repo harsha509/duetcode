@@ -9,6 +9,11 @@ jobs:
   build-and-release:
     name: Build and Release
     runs-on: ${{ matrix.os }}
+    # The repository default for GITHUB_TOKEN is read-only, which made
+    # softprops/action-gh-release fail with 403 on every tag. Requested here
+    # rather than by widening the repository default, so only this job can write.
+    permissions:
+      contents: write
     strategy:
       matrix:
         include:
