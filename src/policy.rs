@@ -136,6 +136,19 @@ fn strip_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
         .then(|| rest.trim_matches(|c: char| c.is_whitespace() || c == '*'))
 }
 
+/// True for the placeholder a reviewer writes when a section is empty. The
+/// prompt asks for a bare `none`, but reviewers dress it up — `` `none` ``,
+/// **None**, "None." — and a decorated placeholder read as a real item is a
+/// blocker that never existed, which fails the run and feeds the stall
+/// detector a finding no one can fix.
+fn is_nothing_to_report(item: &str) -> bool {
+    let bare: String = item
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect();
+    matches!(bare.trim().to_lowercase().as_str(), "none" | "no blockers" | "no suggestions")
+}
+
 /// Strips one markdown list marker — `-`, `*`, `+`, `1.` or `1)` — returning
 /// the item text. Reviewers pick their own bullet style, and a blocker missed
 /// here is a blocker the stall detector and the escalation summary never see.
@@ -178,7 +191,7 @@ fn parse_list_section(lines: &[&str], header: &str) -> Vec<String> {
                 continue;
             }
             if let Some(item) = strip_list_marker(trimmed) {
-                if !item.is_empty() && item.to_lowercase() != "none" {
+                if !item.is_empty() && !is_nothing_to_report(item) {
                     items.push(item.to_string());
                 }
             } else if upper.contains(':')
@@ -257,6 +270,17 @@ mod tests {
     fn bare_approval_line_still_approves() {
         for review in ["Looks good.\n\nAPPROVED", "Fine by me.\n\n**APPROVED**", "Ship it.\nApproved."] {
             assert_eq!(parse_verdict(review).verdict, Verdict::Approved, "missed: {review}");
+        }
+    }
+
+    /// An empty section is written every way but the one asked for. Reading a
+    /// decorated placeholder as an item invents a blocker nobody can fix, which
+    /// fails the run and then stalls it.
+    #[test]
+    fn a_dressed_up_empty_section_yields_no_blockers() {
+        for empty in ["- none", "- `none`", "- **None**", "- None.", "- no blockers"] {
+            let review = format!("BLOCKERS:\n{}\n\nVERDICT: APPROVED", empty);
+            assert!(parse_verdict(&review).blockers.is_empty(), "counted as a blocker: {empty}");
         }
     }
 

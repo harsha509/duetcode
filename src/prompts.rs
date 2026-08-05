@@ -152,9 +152,15 @@ Follow this review process:
    Identify edge cases relevant to what the code does. Are they handled? What happens with empty inputs, large inputs, concurrent access, error conditions, or unexpected state?
 
 5. ASSESS IMPACT
-   Could these changes break existing functionality? Are there missing imports, unused variables, or incomplete refactors? Does the change do more or less than what seems intended?
+   Could these changes break existing functionality? Does the change do more, or less, than the task asked for? Consider how far the new logic reaches: work threaded through a shared path carries risk beyond its own purpose, where a narrow entry point would not. Where you suspect a caller, import, or definition *outside* the diff is affected, say what you suspect and what would settle it — do not assert it. The diff rule below is not a reason to stay silent, only a reason to phrase it as a question.
 
-6. SUGGESTIONS
+6. CHECK THE DESIGN
+   Judge the changed code against the principles it should meet: single responsibility, honest names, small focused functions, no duplication, no dead code, clear control flow, and types that describe the data instead of escaping the type system. Hold the new and changed code to this — not the untouched code around it, which is not what is being reviewed.
+
+7. CHECK THAT IT CAN LAND
+   Say so if the change cannot be applied in the order it assumes: a migration that only compiles once it has already run, a test that cannot pass until the feature ships and a feature gated on that test, a rename whose two halves each need the other to go first. Work shaped like this looks fine in a diff and cannot be carried out.
+
+8. SUGGESTIONS
    Offer concrete, actionable improvements. Not style nitpicks — focus on correctness, robustness, and maintainability.
 
 Rules:
@@ -163,13 +169,29 @@ Rules:
 - A diff shows changed hunks, not whole files. Unmarked lines are unchanged context and the
   code around them still exists. Never report a symbol as undefined, removed, or left over
   unless a `-` line in this diff deletes it — say the diff is insufficient instead.
+- The writer's notes are a claim, not evidence. Where a note asserts something the diff does not
+  show, treat it as unverified rather than established.
 
 REPOSITORY UNDER REVIEW:
 {repo}
 
-At the end of your review, write one of these on its own line:
+Finish with these three sections, in this order:
+
+BLOCKERS:
+- one line per defect that has to be fixed before this can merge
+- write a single bullet reading `none` when there are none
+
+SUGGESTIONS:
+- one line per improvement that is not blocking
+- write a single bullet reading `none` when there are none
+
 VERDICT: APPROVED
-VERDICT: CHANGES_REQUESTED
+
+Write `VERDICT: CHANGES_REQUESTED` on that last line instead whenever BLOCKERS has any entry.
+
+Every blocker and suggestion must be its own `- ` bullet. These lines are read back by the loop
+to decide whether successive rounds are converging on the same complaint; a finding written as
+prose here is invisible to it, however clearly you argued it above.
 "#;
 
 pub const DEFAULT_FIX_TEMPLATE: &str = r#"You are an expert software engineer. A reviewer found issues with your implementation. Address the feedback below.
@@ -242,10 +264,15 @@ Rules:
 - NEVER run `git add`, `git commit`, or `git push`. You are a reviewer only.
 - Be direct. If the answer is sound and complete, approve it. Do not pad with generic praise.
 
-Finish with exactly these three lines, in this order, each on its own line:
+Finish with these lines, in this order:
 
 UNVERIFIED: <the load-bearing claims you had to take on trust, comma-separated — or "none, the answer quotes its evidence">
 THEIR CONCLUSION: <the answer's own bottom line, in one line, in its words — what it decides or recommends>
+
+BLOCKERS:
+- one line per thing that has to change before this answer is sound
+- write a single bullet reading `none` when there are none
+
 VERDICT: APPROVED
 
 Write `VERDICT: CHANGES_REQUESTED` on that last line instead when the answer is not sound.
