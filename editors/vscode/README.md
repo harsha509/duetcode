@@ -26,8 +26,17 @@ tests and linters, and you watch both sides of the conversation live.
 
 ## Requirements
 
-- The `dt` binary — `cargo install --git https://github.com/harsha509/duetcode`
-  (set `dt.binaryPath` if it's not on VS Code's PATH, e.g. `~/.cargo/bin/dt`).
+- The `dt` binary, at the version matching this extension — the CLI and the
+  extension share a version number and are released together:
+
+  ```bash
+  cargo install --git https://github.com/harsha509/duetcode --tag <version> --force
+  ```
+
+  Take the newest tag from the
+  [releases page](https://github.com/harsha509/duetcode/releases). `--force` is
+  what makes an upgrade actually replace an older `dt`. Set `dt.binaryPath` if
+  it is not on VS Code's PATH, e.g. `~/.cargo/bin/dt`.
 - A git repository — the extension offers to run `dt init` for you the first
   time you start a task in a project that is not set up yet.
 - Gemini API key — add it via the ⚙ gear (stored in the keychain) or export

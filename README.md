@@ -41,8 +41,28 @@ You give a task
 ### Using Cargo (recommended)
 
 ```bash
-cargo install --git https://github.com/harsha509/duetcode.git
+cargo install --git https://github.com/harsha509/duetcode --tag <version>
 ```
+
+Use the newest tag from the [releases page](https://github.com/harsha509/duetcode/releases)
+— for example `--tag v0.2.0`. Without `--tag` you get whatever is on `main`,
+which may include unreleased work.
+
+Every release also carries prebuilt Linux and macOS binaries, if you would
+rather not build from source.
+
+### Upgrading
+
+```bash
+cargo install --git https://github.com/harsha509/duetcode --tag <version> --force
+```
+
+`--force` is required. Without it cargo sees that `dt` is already installed and
+stops, so the upgrade silently does nothing.
+
+The first `dt` run in a project after an upgrade brings its `.duet/prompts/`
+up to date with the new binary — replacing copies you have not edited, and
+leaving the ones you have.
 
 ### From source
 
