@@ -116,6 +116,12 @@ pre.stream {
 .blocker { color: var(--vscode-charts-red); margin: 2px 0; }
 .suggestion { color: var(--vscode-charts-yellow); margin: 2px 0; }
 
+/* Severity tint, applied only to the lines that label a finding. Body prose
+   keeps the default colour so the tint still means something. */
+pre.stream .pl.issue { color: var(--vscode-charts-red); font-weight: 600; }
+pre.stream .pl.warn { color: var(--vscode-charts-yellow); }
+pre.stream .pl.ok { color: var(--vscode-charts-green); }
+
 .row { margin: 4px 0; }
 .row.section { opacity: 0.6; text-align: center; margin: 10px 0; }
 .row.project {

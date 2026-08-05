@@ -121,8 +121,84 @@
     scrollDown();
   }
 
-  function renderMarkdownish(target, cls, text) {
-    const pre = el('pre', cls, text);
+  // ── severity colouring ─────────────────────────────────────
+
+  // A model's prose arrives as one long block and reads as a wall. Only lines
+  // that *announce* something are tinted — a heading, or a list item with a
+  // bold lead-in, the shapes reviewers use to label a finding — so the colour
+  // marks findings instead of shouting every sentence that says "error".
+  // Order matters: the clearing patterns are tested first, so "no bugs found"
+  // is not filed under bugs.
+  const SEVERITY = [
+    ['ok', /\bno\s+(?:known\s+)?(?:bugs?|issues?|blockers?|problems?|findings?)\b|\bverified\b|\bno action\b|\blooks good\b|\bapproved\b|\ball (?:checks )?pass(?:ed|ing)?\b|✓/i],
+    ['issue', /\bblock(?:ing|er|ers|ed)\b|\bcritical\b|\bmust fix\b|\bbugs?\b|\bbroken\b|\bregressions?\b|\bsecurity\b|\bcrash(?:es|ing)?\b|\bdata loss\b|\bfail(?:s|ed|ure|ing)?\b|\bchanges[ _]requested\b|\brequest changes\b|\bincorrect\b|✗/i],
+    ['warn', /\bshould[- ]fix\b|\bwarn(?:ing)?\b|\bcaution\b|\brisks?\b|\bminor\b|\bnit\b|\bconsider\b|\bsuggestions?\b|\bscope creep\b|\bstale\b|\bunverified\b|\bmissing\b/i],
+  ];
+
+  function severityOf(text) {
+    for (const [cls, re] of SEVERITY) {
+      if (re.test(text)) {
+        return cls;
+      }
+    }
+    return '';
+  }
+
+  /** Heading level, or 0 for anything else. */
+  function headingLevel(line) {
+    const m = /^\s{0,3}(#{1,6})\s/.exec(line);
+    return m ? m[1].length : 0;
+  }
+
+  /** A list item whose lead-in is bold — how reviewers label a finding. */
+  function isFinding(line) {
+    return /^\s*(?:[-*+]|\d+[.)])\s+\*\*/.test(line);
+  }
+
+  /**
+   * Repaints a block of prose, one span per line, tinted by severity.
+   *
+   * A finding is usually named under its section rather than in its own words
+   * ("### 1. GZip compression was silently deleted" under "## Blocking"), so a
+   * classified heading lends its severity to everything nested beneath it. The
+   * section ends at the next heading of the same or shallower level, which is
+   * where the reviewer stopped talking about it.
+   *
+   * Inheritance escalates and never clears: `ok` is not handed down, because a
+   * line painted green by its neighbours is a claim that there is nothing to do
+   * here — the one claim this must never invent. A clean-sounding heading over
+   * a list of problems ("Key Highlights Verified") leaves those items plain.
+   */
+  function fillProse(pre, text) {
+    pre.textContent = '';
+    let section = null; // { level, severity } of the enclosing tinted heading
+
+    const inherited = () => (section && section.severity !== 'ok' ? section.severity : '');
+
+    for (const raw of text.split('\n')) {
+      const level = headingLevel(raw);
+      let severity = '';
+
+      if (level > 0) {
+        severity = severityOf(raw);
+        if (severity) {
+          section = { level, severity };
+        } else if (section && level > section.level) {
+          severity = inherited();
+        } else {
+          section = null;
+        }
+      } else if (isFinding(raw)) {
+        severity = severityOf(raw) || inherited();
+      }
+
+      pre.appendChild(el('span', severity ? 'pl ' + severity : 'pl', raw + '\n'));
+    }
+  }
+
+  function renderProse(target, cls, text) {
+    const pre = el('pre', cls);
+    fillProse(pre, text);
     target.appendChild(pre);
     scrollDown();
   }
@@ -187,11 +263,18 @@
         scrollDown();
         break;
       }
-      case 'stream_end':
+      case 'stream_end': {
+        // Tinted once the text is whole: a chunk can split a line anywhere, so
+        // classifying mid-stream would colour half a heading.
+        const pre = streams[ev.model];
+        if (pre) {
+          fillProse(pre, pre.textContent);
+        }
         delete streams[ev.model];
         break;
+      }
       case 'response':
-        renderMarkdownish(colFor(ev.model), 'stream', ev.text);
+        renderProse(colFor(ev.model), 'stream', ev.text);
         break;
       case 'check':
         line(colFor(reviewerName), ev.passed ? 'check ok' : 'check bad',
@@ -259,8 +342,8 @@
 
     for (const r of data.rounds) {
       newRound(r.round === 0 ? 'planning' : r.round, '');
-      if (r.writer) renderMarkdownish(colFor(writerName), 'stream', r.writer);
-      if (r.reviewer) renderMarkdownish(colFor(reviewerName), 'stream', r.reviewer);
+      if (r.writer) renderProse(colFor(writerName), 'stream', r.writer);
+      if (r.reviewer) renderProse(colFor(reviewerName), 'stream', r.reviewer);
       if (Array.isArray(r.checks)) {
         for (const c of r.checks) {
           line(currentRound.reviewerCol, c.passed ? 'check ok' : 'check bad',
