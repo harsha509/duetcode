@@ -5,6 +5,28 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.1.8 - 2026-08-05
+
+Requires `dt` 0.1.2 or newer.
+
+### Fixed
+
+- **Every workspace project's sessions are listed.** The sidebar read
+  `.duet/sessions` from the first workspace folder only, while a task runs in the
+  project the composer picked and writes its session under *that* repository. In
+  a multi-root workspace the other projects' sessions were therefore never shown
+  — and when the first folder had none, the panel looked empty and the history
+  looked lost, though every session was on disk the whole time. Sessions from all
+  folders are now listed, grouped under a node per project so it is clear which
+  repository each run belongs to. A single-folder workspace keeps the flat list
+  it had.
+
+- **A project added to the workspace is watched.** The file watcher that
+  refreshes the tree covered the first folder only and was created once at
+  startup, so sessions recorded in any other project appeared only after a window
+  reload. Every folder is watched now, and the set is rebuilt when folders are
+  added or removed.
+
 ## 0.1.7 - 2026-08-01
 
 Requires `dt` 0.1.2 or newer.
