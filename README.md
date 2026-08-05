@@ -35,8 +35,13 @@ You give a task
 
 - [Rust](https://rustup.rs/) (1.80+)
 - [Claude Code CLI](https://claude.ai/download) installed and authenticated
-- A [Gemini API key](https://aistudio.google.com/apikey) exported as `GEMINI_API_KEY`
+- [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`npm i -g @google/gemini-cli`),
+  or a [Gemini API key](https://aistudio.google.com/apikey) exported as `GEMINI_API_KEY`
 - Git
+
+Install the Gemini CLI if you can. Only the CLI can open the files it is
+reviewing — over the API the reviewer is a bare HTTPS call with no tools, and
+its verdict can never be more than an opinion on the text it was handed.
 
 ### Using Cargo (recommended)
 
@@ -45,7 +50,7 @@ cargo install --git https://github.com/harsha509/duetcode --tag <version>
 ```
 
 Use the newest tag from the [releases page](https://github.com/harsha509/duetcode/releases)
-— for example `--tag v0.2.2`. Without `--tag` you get whatever is on `main`,
+— for example `--tag v0.2.3`. Without `--tag` you get whatever is on `main`,
 which may include unreleased work.
 
 Every release also carries prebuilt Linux and macOS binaries, if you would
@@ -87,7 +92,7 @@ For the full command reference see the [Usage Guide (USAGE.md)](USAGE.md).
 ```bash
 cd your-project
 dt init      # creates .duet/config.toml and .duet/prompts/
-dt doctor    # checks git, claude CLI, GEMINI_API_KEY, config
+dt doctor    # checks git, claude CLI, gemini CLI / GEMINI_API_KEY, config
 ```
 
 ### 2. Run a task
@@ -166,6 +171,8 @@ api_model = "claude-sonnet-4-20250514"
 timeout_secs = 300
 
 [gemini]
+command = "gemini"
+mode = "auto"                # "cli", "api", or "auto" (CLI with API fallback)
 model = "gemini-3.1-pro-preview"
 api_key_env = "GEMINI_API_KEY"
 timeout_secs = 300
@@ -197,7 +204,9 @@ fix = ".duet/prompts/fix.txt"
 | `claude` | `mode` | `"cli"`, `"api"`, or `"auto"` (CLI first, API fallback) | `"auto"` |
 | `claude` | `api_key_env` | Env var holding the Anthropic API key | `"ANTHROPIC_API_KEY"` |
 | `claude` | `api_model` | Model id for API mode | `"claude-sonnet-4-20250514"` |
-| `gemini` | `model` | Gemini model name | `"gemini-3.1-pro-preview"` |
+| `gemini` | `command` | Path to the Gemini CLI binary | `"gemini"` |
+| `gemini` | `mode` | `"cli"`, `"api"`, or `"auto"` (CLI first, API fallback). Only the CLI can read the code it reviews | `"auto"` |
+| `gemini` | `model` | Gemini model name, used by both transports | `"gemini-3.1-pro-preview"` |
 | `gemini` | `api_key_env` | Env var holding the API key | `"GEMINI_API_KEY"` |
 | `checks` | `test` / `lint` / `typecheck` | Commands run before each review | *none* |
 | `policy` | `max_rounds` | Round budget (auto mode may extend once, to 2×, after your clarification) | `4` |

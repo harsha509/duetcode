@@ -5,6 +5,25 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.3 - 2026-08-05
+
+Requires `dt` 0.2.3. The extension itself is unchanged — it shares a version
+number with the CLI — but the review button behaves very differently, because
+the reviewer behind it can now read your code.
+
+### Changed
+
+- **The review button's verdict is now based on the code.** Reviewing an answer
+  used to send the reviewer nothing but the text and tell it that it could not
+  open a file, so a question that changed no code came back approved in about a
+  second having checked nothing. With the Gemini CLI installed
+  (`npm i -g @google/gemini-cli`), the reviewer opens the files the answer cites
+  and reports what it read — the panel shows each file as it is opened, the way
+  it already shows the writer's.
+- **A review that could check nothing is refused rather than approved.** When
+  the reviewer has no file access and there is nothing uncommitted, the run ends
+  `NO REVIEW` instead of returning an approval nothing supports.
+
 ## 0.2.2 - 2026-08-05
 
 Requires `dt` 0.2.2. The panel no longer interrupts a task to ask whether to

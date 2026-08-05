@@ -298,11 +298,18 @@ pub fn answer_review_only(
     sink: &dyn Sink,
 ) -> Result<OrchestratorResult> {
     let diff = git::git_diff(repo_dir).unwrap_or_default();
+    if is_unreviewable(reviewer, &diff) {
+        sink.event(Event::Warn { text: unreviewable_warning(reviewer.name()) });
+        return Ok(unreviewed_result(0, UNREVIEWABLE_MESSAGE.into(), None));
+    }
+
     let mut prompt = prompts::build_answer_review_prompt(
         prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE,
         task,
         answer,
         &changes_block(&diff),
+        access_block(reviewer),
+        &git::repo_identity(repo_dir),
     );
     if let Some(text) = instruction.map(str::trim).filter(|t| !t.is_empty()) {
         prompt.push_str(&format!("\n\nUSER INSTRUCTION (authoritative):\n{}", text));
@@ -472,6 +479,19 @@ fn execute_loop(
                 sink.event(Event::Info {
                     text: format!("{} answered without making code changes", writer.name()),
                 });
+
+                // Checked before the prompt: asking the user to spend a
+                // reviewer call that cannot check anything wastes the call
+                // whichever way they answer.
+                if is_unreviewable(reviewer, &tree_diff) {
+                    sink.event(Event::Warn { text: unreviewable_warning(reviewer.name()) });
+                    costs.summary();
+                    return Ok(unreviewed_result(
+                        round,
+                        UNREVIEWABLE_MESSAGE.into(),
+                        Some(writer_response.clone()),
+                    ));
+                }
 
                 if !wants_review(opts, reviewer.name(), "review this answer", sink) {
                     costs.summary();
@@ -804,6 +824,8 @@ fn run_answer_review(
         opts.task,
         input.writer_notes,
         &changes_block(input.diff),
+        access_block(reviewer),
+        &git::repo_identity(opts.repo_dir),
     );
     if let Some(text) = input.clarification {
         prompt.push_str(&format!("\n\nUSER CLARIFICATION (authoritative):\n{}", text));
@@ -979,6 +1001,51 @@ const ANSWER_REVIEW_DIFF_BYTES: usize = 40_000;
 /// The working tree an answer is judged against, trimmed to the cap. Says so
 /// plainly when there is nothing, so the reviewer judges the prose alone
 /// instead of assuming evidence it was never given.
+/// Told to the user, and returned as the run's message, when a review was
+/// refused for want of anything to check.
+const UNREVIEWABLE_MESSAGE: &str =
+    "unreviewable — the reviewer cannot read files and there are no changes to judge the answer against";
+
+/// The access rules that match what this reviewer can actually do.
+fn access_block(reviewer: &dyn ModelAdapter) -> &'static str {
+    if reviewer.can_read_files() {
+        prompts::ANSWER_REVIEW_ACCESS_TOOLS
+    } else {
+        prompts::ANSWER_REVIEW_ACCESS_NONE
+    }
+}
+
+/// True when a review could only ever be a rubber stamp: the reviewer has no
+/// tools to open the code with, and there is no diff to judge the answer
+/// against either. It would have nothing but the answer's own prose, and an
+/// approval drawn from that says only that the answer reads well.
+///
+/// Callers refuse the review outright rather than spending a model call on it.
+fn is_unreviewable(reviewer: &dyn ModelAdapter, diff: &str) -> bool {
+    !reviewer.can_read_files() && diff.trim().is_empty()
+}
+
+fn unreviewable_warning(reviewer_name: &str) -> String {
+    format!(
+        "{} has no file access and there is nothing uncommitted, so it could only judge the \
+         wording of the answer — skipping the review rather than returning an approval it \
+         cannot support. {}",
+        reviewer_name,
+        install_hint(reviewer_name),
+    )
+}
+
+/// How to give *this* reviewer file access. Either model can hold the reviewer
+/// seat — `--writer gemini` puts Claude in it — so naming the wrong CLI would
+/// send the user to install something they are not using.
+fn install_hint(reviewer_name: &str) -> &'static str {
+    match reviewer_name {
+        "gemini" => "Install the gemini CLI (`npm i -g @google/gemini-cli`) so the reviewer can read the code.",
+        "claude" => "Install the Claude Code CLI, or set [claude] mode = \"cli\", so the reviewer can read the code.",
+        _ => "Give the reviewer a CLI transport so it can read the code.",
+    }
+}
+
 fn changes_block(diff: &str) -> String {
     if diff.trim().is_empty() {
         return "(nothing uncommitted in the working tree — judge the answer on its own)".into();
@@ -1130,6 +1197,73 @@ mod tests {
 
     fn dirs(paths: &[&str]) -> Vec<PathBuf> {
         paths.iter().map(PathBuf::from).collect()
+    }
+
+    /// A reviewer that fails the test if it is ever called. The gate's whole
+    /// value is that the call does not happen.
+    struct Reviewer {
+        reads_files: bool,
+    }
+
+    impl ModelAdapter for Reviewer {
+        fn generate(&mut self, _: &str, _: &[ImageInput]) -> Result<(String, UsageStats)> {
+            panic!("the reviewer must not be called when there is nothing to review");
+        }
+
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn can_read_files(&self) -> bool {
+            self.reads_files
+        }
+    }
+
+    /// The reported bug: a reviewer with no file access, judging an answer with
+    /// no diff behind it, has nothing but the prose — and approved it anyway.
+    #[test]
+    fn a_blind_reviewer_with_no_diff_cannot_review() {
+        assert!(is_unreviewable(&Reviewer { reads_files: false }, ""));
+        assert!(is_unreviewable(&Reviewer { reads_files: false }, "  \n "));
+    }
+
+    /// Either kind of evidence is enough to go ahead: tools to read the code,
+    /// or a diff to read instead.
+    #[test]
+    fn evidence_of_either_kind_allows_the_review() {
+        assert!(!is_unreviewable(&Reviewer { reads_files: true }, ""));
+        assert!(!is_unreviewable(&Reviewer { reads_files: false }, "+ fn added() {}"));
+    }
+
+    /// Telling a tool-capable reviewer it cannot open files is what produced
+    /// the split-second approval, so the two must never come apart.
+    #[test]
+    fn the_access_block_follows_the_reviewers_actual_capability() {
+        assert_eq!(
+            access_block(&Reviewer { reads_files: true }),
+            prompts::ANSWER_REVIEW_ACCESS_TOOLS
+        );
+        assert_eq!(
+            access_block(&Reviewer { reads_files: false }),
+            prompts::ANSWER_REVIEW_ACCESS_NONE
+        );
+    }
+
+    /// The refusal has to tell the user how to get a real review.
+    #[test]
+    fn the_refusal_names_the_reviewer_and_the_fix() {
+        let warning = unreviewable_warning("gemini");
+        assert!(warning.contains("gemini"));
+        assert!(warning.contains("npm i -g @google/gemini-cli"));
+    }
+
+    /// Either model can hold the reviewer seat — `--writer gemini` puts Claude
+    /// there — so the fix offered must be for the reviewer actually in use.
+    #[test]
+    fn the_fix_offered_matches_the_reviewer_in_the_seat() {
+        assert!(unreviewable_warning("claude").contains("Claude Code CLI"));
+        assert!(!unreviewable_warning("claude").contains("gemini-cli"));
+        assert!(!unreviewable_warning("gemini").contains("Claude Code CLI"));
     }
 
     /// The workspace lists every project including the one being written to;

@@ -8,6 +8,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.3 - 2026-08-05
+
+The reviewer could not read code. Reviewing an answer, it was handed the prose
+and told in as many words that it could not open a file — so it approved
+answers in a second flat, having checked nothing. It can read now.
+
+### Added
+
+- **Gemini runs as a CLI, with tools.** `[gemini] mode` takes `"cli"`, `"api"`,
+  or `"auto"` (the default: CLI when it is on `PATH`, API otherwise), matching
+  how `[claude]` already works. In CLI mode the reviewer runs inside the
+  checkout under `--approval-mode plan` — read-only, so it can open and search
+  the code but never edit what it is judging — and sibling projects come along
+  via `--include-directories`, so a review can follow a claim across the repos
+  in a workspace. Every file it opens is reported as it happens, the same way
+  the writer's reads already are.
+- **A review with nothing to check is refused rather than answered.** When the
+  reviewer has no file access *and* there is no diff behind the answer, the run
+  now ends `NO REVIEW` and the reviewer is never called. Previously that was
+  precisely the case that returned `APPROVED`.
+
+### Changed
+
+- **The reviewer is told what it can actually do.** The answer-review prompt
+  carried one fixed line — "You cannot open a repository, a file … and you
+  cannot run anything" — which was true of the API transport and false of the
+  CLI. It now matches the reviewer in use, and a reviewer with tools is told to
+  go and look: at the files the answer cites, and at what the answer left out.
+- **Reviews declare what they opened.** A new `FILES READ:` line lists the files
+  the reviewer actually read, so a review that inspected nothing says so instead
+  of passing quietly.
+- **`dt doctor` treats the CLI and the API key as alternatives.** A missing
+  `GEMINI_API_KEY` was a hard failure even with the CLI installed. Only having
+  neither is a failure now; having just the key warns that the reviewer will run
+  without file access.
+
+### Fixed
+
+- **A long review can no longer hang.** The CLI's stderr was left unread until
+  after its stdout had been consumed to the end. Once a talkative run filled
+  that pipe the CLI would block writing to it, stop producing stdout, and the
+  two processes would wait on each other forever. It is drained as it arrives.
+- **A killed CLI says what happened.** A process killed by a signal has no exit
+  code, and the failure was reported as `exited with -1: no output`, which
+  names nothing. A SIGKILL — in practice the machine running out of memory
+  under a heavy `node` process — now says so.
+- **The offer of a fix matches the reviewer.** A refused review always advised
+  installing the Gemini CLI, including when Claude held the reviewer seat under
+  `--writer gemini`, sending the user to install something they were not using.
+
 ## 0.2.2 - 2026-08-05
 
 A reviewer call is the expensive half of a run, and the loop used to interrupt

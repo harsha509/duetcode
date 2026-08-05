@@ -41,6 +41,18 @@ pub struct ClaudeConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GeminiConfig {
+    #[serde(default = "default_gemini_command")]
+    pub command: String,
+    /// "cli", "api", or "auto" (try CLI, fall back to API).
+    ///
+    /// Only the CLI can read the checkout it is judging. In API mode the model
+    /// is a bare HTTPS call with no tools, so a review can never be more than
+    /// an opinion on the prose it was handed.
+    #[serde(default = "default_gemini_mode")]
+    pub mode: String,
+    /// Model name for both transports: the CLI accepts the same concrete names
+    /// as the API (`gemini-3.1-pro-preview`) alongside its own aliases (`pro`,
+    /// `flash`), so one key serves both.
     #[serde(default = "default_gemini_model")]
     pub model: String,
     #[serde(default = "default_gemini_api_key_env")]
@@ -85,6 +97,8 @@ fn default_claude_model() -> String { "sonnet".into() }
 fn default_claude_mode() -> String { "auto".into() }
 fn default_claude_api_key_env() -> String { "ANTHROPIC_API_KEY".into() }
 fn default_claude_api_model() -> String { "claude-sonnet-4-20250514".into() }
+fn default_gemini_command() -> String { "gemini".into() }
+fn default_gemini_mode() -> String { "auto".into() }
 fn default_gemini_model() -> String { "gemini-3.1-pro-preview".into() }
 fn default_gemini_api_key_env() -> String { "GEMINI_API_KEY".into() }
 fn default_timeout_secs() -> u64 { 300 }
@@ -111,6 +125,8 @@ impl Default for ClaudeConfig {
 impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
+            command: default_gemini_command(),
+            mode: default_gemini_mode(),
             model: default_gemini_model(),
             api_key_env: default_gemini_api_key_env(),
             timeout_secs: default_timeout_secs(),

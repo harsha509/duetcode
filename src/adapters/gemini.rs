@@ -1,50 +1,399 @@
-use super::{pricing, ImageInput, ModelAdapter, UsageStats};
+use super::{pricing, readable_extras, ImageInput, ModelAdapter, UsageStats};
 use crate::config::GeminiConfig;
 use crate::events::{Event, Sink};
 use crate::ui;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::Colorize;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
+/// Read-only tool access: the CLI may open and search the checkout but cannot
+/// edit it. A reviewer that could write would be free to "fix" what it is
+/// judging, and the diff it reported on would no longer be the one it read.
+const APPROVAL_MODE: &str = "plan";
+
 pub struct GeminiAdapter {
-    model: String,
-    api_key: String,
+    config: GeminiConfig,
+    /// True when calls go through the `gemini` CLI, which carries file tools.
+    /// False for the bare HTTPS transport, which has none.
+    use_cli: bool,
+    verbose: bool,
+    api_key: Option<String>,
     agent: ureq::Agent,
     /// Conversation history in Gemini `contents` format, so each review
-    /// remembers what it said in earlier rounds.
+    /// remembers what it said in earlier rounds. API transport only — in CLI
+    /// mode the CLI keeps the conversation itself and `--resume` recalls it.
     history: Vec<serde_json::Value>,
+    working_dir: PathBuf,
+    /// Sibling projects the CLI may read besides `working_dir`.
+    readable_dirs: Vec<PathBuf>,
+    /// CLI session ids keyed by the checkout they belong to, for the same
+    /// reason the Claude adapter keys them: resuming project A's session from
+    /// project B inherits a conversation about the wrong checkout.
+    sessions: HashMap<PathBuf, String>,
     sink: Arc<dyn Sink>,
 }
 
+struct CliOutput {
+    text: String,
+    usage: UsageStats,
+    session_id: Option<String>,
+}
+
+/// One CLI invocation, successful or not. The session id is reported either
+/// way: the CLI announces it in `init` before doing any work, so a run that
+/// dies later still leaves a resumable session behind.
+struct CliAttempt {
+    session_id: Option<String>,
+    result: Result<CliOutput>,
+}
+
+impl CliAttempt {
+    fn failed(error: anyhow::Error) -> Self {
+        Self { session_id: None, result: Err(error) }
+    }
+
+    /// True when the CLI got as far as announcing its session, which means a
+    /// `--resume` was accepted.
+    fn connected(&self) -> bool {
+        self.session_id.is_some()
+    }
+}
+
+/// Whether a failed run means the stored session is unusable and the call
+/// should be retried from a fresh one. Only a resume the CLI actually rejected
+/// qualifies, and that shows up as a run that never announced a session id.
+fn should_restart_session(was_resuming: bool, connected: bool) -> bool {
+    was_resuming && !connected
+}
+
 impl GeminiAdapter {
-    pub fn new(config: &GeminiConfig, sink: Arc<dyn Sink>) -> Result<Self> {
-        let api_key = std::env::var(&config.api_key_env).map_err(|_| {
-            anyhow::anyhow!(
-                "{} not set — export it or add to your shell profile",
+    pub fn new(
+        config: &GeminiConfig,
+        working_dir: &Path,
+        verbose: bool,
+        sink: Arc<dyn Sink>,
+    ) -> Result<Self> {
+        let mode = config.mode.to_lowercase();
+        let cli_available = mode != "api" && Self::check_cli_available(&config.command);
+        let api_key = std::env::var(&config.api_key_env).ok().filter(|k| !k.trim().is_empty());
+
+        let use_cli = match mode.as_str() {
+            "cli" => {
+                if !cli_available {
+                    anyhow::bail!(
+                        "[gemini] mode = \"cli\" but '{}' is not on PATH — \
+                         install it with `npm i -g @google/gemini-cli`, or set mode = \"auto\"",
+                        config.command
+                    );
+                }
+                true
+            }
+            "api" => false,
+            _ => cli_available,
+        };
+
+        // The CLI carries its own authentication, so the key is required only
+        // when calls actually go over the API.
+        if !use_cli && api_key.is_none() {
+            anyhow::bail!(
+                "{} not set — export it, or install the gemini CLI so the reviewer \
+                 can read the code it is judging",
                 config.api_key_env
-            )
-        })?;
+            );
+        }
 
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(30))
             .timeout_read(Duration::from_secs(config.timeout_secs))
             .build();
 
+        if verbose {
+            if use_cli {
+                eprintln!("  {} gemini mode: CLI ({})", "[verbose]".dimmed(), config.command);
+            } else {
+                eprintln!("  {} gemini mode: API (direct, no file access)", "[verbose]".dimmed());
+            }
+        }
+
         Ok(Self {
-            model: config.model.clone(),
+            config: config.clone(),
+            use_cli,
+            verbose,
             api_key,
             agent,
             history: Vec::new(),
+            working_dir: working_dir.to_path_buf(),
+            readable_dirs: Vec::new(),
+            sessions: HashMap::new(),
             sink,
         })
     }
 
     pub fn is_key_available(config: &GeminiConfig) -> bool {
-        std::env::var(&config.api_key_env).is_ok()
+        std::env::var(&config.api_key_env).map(|k| !k.trim().is_empty()).unwrap_or(false)
+    }
+
+    pub fn is_cli_available(config: &GeminiConfig) -> bool {
+        Self::check_cli_available(&config.command)
+    }
+
+    fn check_cli_available(command: &str) -> bool {
+        Command::new("which")
+            .arg(command)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// True when a failed CLI call may be retried over the API: only in `auto`
+    /// mode, and only with a key to retry with. An explicit `mode = "cli"` must
+    /// fail loudly rather than quietly downgrade to a reviewer that cannot read.
+    fn can_fall_back_to_api(&self) -> bool {
+        self.config.mode.eq_ignore_ascii_case("auto") && self.api_key.is_some()
+    }
+
+    /// The stored session for the checkout the adapter currently points at.
+    fn current_session(&self) -> Option<&String> {
+        self.sessions.get(&self.working_dir)
+    }
+
+    /// Remembers the session this run belongs to, so the next round in the same
+    /// project resumes it — whether or not this run succeeded.
+    fn record_session(&mut self, attempt: &CliAttempt) {
+        if let Some(id) = &attempt.session_id {
+            self.sessions.insert(self.working_dir.clone(), id.clone());
+        }
+    }
+
+    fn run_cli(&mut self, prompt: &str) -> Result<(String, UsageStats)> {
+        let was_resuming = self.current_session().is_some();
+        let attempt = self.spawn_cli(prompt);
+        let connected = attempt.connected();
+        self.record_session(&attempt);
+
+        if !should_restart_session(was_resuming, connected) {
+            let CliOutput { text, usage, .. } = attempt.result?;
+            return Ok((text, usage));
+        }
+
+        // The stored session was rejected. Drop it and start clean rather than
+        // failing a round over a session id the CLI no longer recognises.
+        self.sessions.remove(&self.working_dir);
+        let retry = self.spawn_cli(prompt);
+        self.record_session(&retry);
+        let CliOutput { text, usage, .. } = retry.result?;
+        Ok((text, usage))
+    }
+
+    fn spawn_cli(&self, prompt: &str) -> CliAttempt {
+        let mut cmd = Command::new(&self.config.command);
+        cmd.arg("-m")
+            .arg(&self.config.model)
+            .arg("-o")
+            .arg("stream-json")
+            .arg("--approval-mode")
+            .arg(APPROVAL_MODE)
+            // Without this the CLI silently downgrades --approval-mode to
+            // "default" in an untrusted folder and then refuses to run at all.
+            .arg("--skip-trust")
+            .current_dir(&self.working_dir);
+
+        // Repeated flags rather than one comma-separated value: a project path
+        // is free to contain a comma, and splitting on it would invent a
+        // directory that does not exist.
+        let extra = readable_extras(&self.readable_dirs, &self.working_dir);
+        for dir in &extra {
+            cmd.arg("--include-directories").arg(dir);
+        }
+        if let Some(id) = self.current_session() {
+            cmd.arg("-r").arg(id);
+        }
+
+        cmd.arg("-p")
+            .arg(prompt)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if self.verbose {
+            let siblings: String = extra
+                .iter()
+                .map(|dir| format!(" --include-directories {}", dir.display()))
+                .collect();
+            eprintln!(
+                "  {} {} -m {} -o stream-json --approval-mode {}{}{} -p <prompt> (in {})",
+                "[verbose]".dimmed(),
+                self.config.command,
+                self.config.model,
+                APPROVAL_MODE,
+                siblings,
+                if self.current_session().is_some() { " -r <session>" } else { "" },
+                self.working_dir.display(),
+            );
+        }
+
+        let mut child = match cmd
+            .spawn()
+            .with_context(|| format!("failed to execute '{}'", self.config.command))
+        {
+            Ok(child) => child,
+            Err(e) => return CliAttempt::failed(e),
+        };
+
+        self.finish_cli(&mut child)
+    }
+
+    fn finish_cli(&self, child: &mut Child) -> CliAttempt {
+        // Drained on its own thread, started before stdout is read. Left until
+        // afterwards it would deadlock a long review: once the CLI fills the
+        // stderr pipe it blocks writing, so it stops producing stdout, and both
+        // processes wait on each other forever.
+        let stderr_drain = drain_stderr(child);
+
+        let output = match self.stream_cli_json(child) {
+            Ok(output) => output,
+            Err(e) => return CliAttempt::failed(e),
+        };
+        // Read off the parsed output, so a failure below still reports it.
+        let session_id = output.session_id.clone();
+
+        let status = match child.wait().context("failed to wait for gemini") {
+            Ok(status) => status,
+            Err(e) => return CliAttempt { session_id, result: Err(e) },
+        };
+        let stderr = stderr_drain.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+
+        if self.verbose && !stderr.is_empty() {
+            eprintln!("  {} stderr: {}", "[verbose]".dimmed(), stderr.trim());
+        }
+
+        if !status.success() {
+            return CliAttempt {
+                session_id,
+                result: Err(anyhow::anyhow!(
+                    "gemini CLI {}",
+                    describe_status(&status, &stderr, &output.text)
+                )),
+            };
+        }
+
+        CliAttempt { session_id, result: Ok(output) }
+    }
+
+    /// Parses the CLI's newline-delimited JSON events. Shapes are those the
+    /// installed CLI actually emits: `init`, `message` (with `delta` chunks for
+    /// the assistant), `tool_use`, `tool_result`, `error`, `result`.
+    fn stream_cli_json(&self, child: &mut Child) -> Result<CliOutput> {
+        let stdout_pipe = child.stdout.take().context("failed to capture gemini stdout")?;
+        let reader = BufReader::new(stdout_pipe);
+
+        let mut text = String::new();
+        let mut started = false;
+        let mut session_id: Option<String> = None;
+        let mut model_name = self.config.model.clone();
+        let mut input_tokens: u64 = 0;
+        let mut output_tokens: u64 = 0;
+        let start = std::time::Instant::now();
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("  {} stream read error: {}", "✗".red(), e);
+                    break;
+                }
+            };
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let event: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            match event.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "init" => {
+                    if let Some(id) = event.get("session_id").and_then(|v| v.as_str()) {
+                        session_id = Some(id.to_string());
+                    }
+                    if let Some(model) = event.get("model").and_then(|v| v.as_str()) {
+                        eprintln!("  {} connected (model: {})", "●".green(), model);
+                    }
+                    self.sink.event(Event::Thinking { model: "gemini".into() });
+                }
+                "message" => {
+                    if let Some(chunk) = assistant_chunk(&event) {
+                        self.emit_chunk(&mut started, chunk);
+                        text.push_str(chunk);
+                    }
+                }
+                "tool_use" => {
+                    let tool = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("tool");
+                    let desc = describe_tool_action(tool, event.get("parameters"));
+                    self.sink.event(Event::ToolAction { model: "gemini".into(), desc });
+                }
+                "tool_result" => {
+                    if event.get("status").and_then(|v| v.as_str()) == Some("error") {
+                        eprintln!("  {} tool failed", "✗".red());
+                    }
+                }
+                "error" => {
+                    if let Some(message) = error_message(&event) {
+                        self.sink.event(Event::Warn { text: format!("gemini: {}", message) });
+                    }
+                }
+                "result" => {
+                    let stats = parse_result_stats(&event);
+                    input_tokens = stats.input_tokens;
+                    output_tokens = stats.output_tokens;
+                    if let Some(resolved) = stats.model {
+                        model_name = resolved;
+                    }
+                }
+                other => {
+                    if self.verbose {
+                        eprintln!(
+                            "  {} {} ({:.0}s)",
+                            "·".dimmed(),
+                            other,
+                            start.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            }
+        }
+
+        self.sink.event(Event::StreamEnd { model: "gemini".into() });
+
+        let elapsed = start.elapsed().as_secs_f64();
+        eprintln!("  {} finished ({:.1}s)", "●".green(), elapsed);
+        ui::stream_footer();
+
+        let usage = UsageStats {
+            cost_usd: pricing::compute_cost(&model_name, input_tokens, output_tokens),
+            input_tokens,
+            output_tokens,
+            model: model_name,
+        };
+
+        Ok(CliOutput { text, usage, session_id })
+    }
+
+    fn emit_chunk(&self, started: &mut bool, text: &str) {
+        if !*started {
+            self.sink.event(Event::StreamStart { model: "gemini".into() });
+            *started = true;
+        }
+        self.sink.event(Event::StreamChunk { model: "gemini".into(), text: text.to_string() });
     }
 
     fn build_parts(prompt: &str, images: &[ImageInput]) -> Vec<serde_json::Value> {
@@ -63,11 +412,20 @@ impl GeminiAdapter {
     }
 
     fn model_path(&self) -> String {
-        if self.model.starts_with('/') {
-            self.model.clone()
+        if self.config.model.starts_with('/') {
+            self.config.model.clone()
         } else {
-            format!("/{}", self.model)
+            format!("/{}", self.config.model)
         }
+    }
+
+    /// The key for an API call. Present whenever this transport is reachable —
+    /// the constructor refuses API-only mode without one, and the auto-mode
+    /// fallback checks for one before retrying.
+    fn require_api_key(&self) -> Result<&str> {
+        self.api_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("{} not set — cannot reach the Gemini API", self.config.api_key_env)
+        })
     }
 
     fn stream_generate(
@@ -104,14 +462,14 @@ impl GeminiAdapter {
     }
 
     fn exchange(&self, url: &str, body: &serde_json::Value) -> Result<(String, UsageStats)> {
-        eprintln!("  {} streaming from {}", "●".green(), self.model);
+        eprintln!("  {} streaming from {}", "●".green(), self.config.model);
         eprintln!("  {} thinking...", "◌".cyan());
 
         let start = std::time::Instant::now();
 
         // Key goes in a header so it never shows up in URLs or error output.
         let response = self.agent.post(url)
-            .set("x-goog-api-key", &self.api_key)
+            .set("x-goog-api-key", self.require_api_key()?)
             .send_json(body)
             .map_err(|e| match e {
                 ureq::Error::Status(code, response) => {
@@ -191,7 +549,7 @@ impl GeminiAdapter {
         self.sink.event(Event::StreamEnd { model: "gemini".into() });
 
         let elapsed = start.elapsed().as_secs_f64();
-        let cost_usd = pricing::compute_cost(&self.model, input_tokens, output_tokens);
+        let cost_usd = pricing::compute_cost(&self.config.model, input_tokens, output_tokens);
 
         eprintln!(
             "  {} finished ({:.1}s, {} chunks)",
@@ -212,7 +570,7 @@ impl GeminiAdapter {
             input_tokens,
             output_tokens,
             cost_usd,
-            model: self.model.clone(),
+            model: self.config.model.clone(),
         };
 
         Ok((collected, usage))
@@ -225,7 +583,40 @@ impl ModelAdapter for GeminiAdapter {
         prompt: &str,
         images: &[ImageInput],
     ) -> Result<(String, UsageStats)> {
-        self.stream_generate(prompt, images)
+        if !self.use_cli {
+            return self.stream_generate(prompt, images);
+        }
+
+        // `-p` carries text only. Images are rare here — the reviewer never
+        // sends any — so rather than dropping them silently, hand the call to
+        // the API transport, which does support them.
+        if !images.is_empty() && self.api_key.is_some() {
+            return self.stream_generate(prompt, images);
+        }
+        if !images.is_empty() {
+            self.sink.event(Event::Warn {
+                text: format!(
+                    "{} image(s) dropped — the gemini CLI takes text prompts only, and no {} \
+                     is set to send them over the API instead",
+                    images.len(),
+                    self.config.api_key_env
+                ),
+            });
+        }
+
+        match self.run_cli(prompt) {
+            Ok(result) => Ok(result),
+            Err(e) if self.can_fall_back_to_api() => {
+                self.sink.event(Event::Warn {
+                    text: format!(
+                        "gemini CLI failed ({:#}) — falling back to the API, which cannot read files",
+                        e
+                    ),
+                });
+                self.stream_generate(prompt, images)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn name(&self) -> &str {
@@ -235,10 +626,338 @@ impl ModelAdapter for GeminiAdapter {
     fn streams_output(&self) -> bool {
         true
     }
+
+    /// Sessions are keyed by checkout, so moving here looks up this project's
+    /// own session rather than resuming a conversation about another one.
+    fn set_working_dir(&mut self, dir: &Path) {
+        self.working_dir = dir.to_path_buf();
+    }
+
+    fn set_readable_dirs(&mut self, dirs: &[PathBuf]) {
+        self.readable_dirs = dirs.to_vec();
+    }
+
+    /// Only the CLI carries tools; the API path is a bare generateContent call.
+    fn can_read_files(&self) -> bool {
+        self.use_cli
+    }
+}
+
+/// The assistant's own text from a `message` event. The prompt is echoed back
+/// as a `user` message, and counting that as output would put the reviewer's
+/// own instructions into its answer.
+fn assistant_chunk(event: &serde_json::Value) -> Option<&str> {
+    if event.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+        return None;
+    }
+    event.get("content").and_then(|v| v.as_str()).filter(|c| !c.is_empty())
+}
+
+/// Token counts and the model the CLI actually used, from a `result` event.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResultStats {
+    input_tokens: u64,
+    output_tokens: u64,
+    /// The concrete model the CLI resolved to, which may differ from the alias
+    /// that was requested — `pro` reports back as `gemini-3.1-pro-preview`.
+    /// Pricing needs the resolved name, not the alias.
+    model: Option<String>,
+}
+
+fn parse_result_stats(event: &serde_json::Value) -> ResultStats {
+    let Some(stats) = event.get("stats") else {
+        return ResultStats::default();
+    };
+    let count = |key: &str| stats.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+
+    ResultStats {
+        input_tokens: count("input_tokens"),
+        output_tokens: count("output_tokens"),
+        model: stats
+            .get("models")
+            .and_then(|m| m.as_object())
+            .and_then(|m| m.keys().next())
+            .cloned(),
+    }
+}
+
+/// One-line description of a CLI tool call, for the activity line the user
+/// sees. Names are the gemini CLI's own tool identifiers.
+fn describe_tool_action(tool: &str, params: Option<&serde_json::Value>) -> String {
+    let get_str = |key: &str| -> Option<&str> {
+        params.and_then(|v| v.get(key)).and_then(|v| v.as_str())
+    };
+
+    match tool {
+        "read_file" | "read_many_files" => match get_str("file_path").or_else(|| get_str("path")) {
+            Some(path) => format!("reading {}", path),
+            None => "reading files".to_string(),
+        },
+        "search_file_content" => {
+            let pattern = get_str("pattern").unwrap_or("?");
+            match get_str("path") {
+                Some(path) => format!("searching '{}' in {}", truncate_chars(pattern, 30), path),
+                None => format!("searching '{}'", truncate_chars(pattern, 40)),
+            }
+        }
+        "glob" => match get_str("pattern") {
+            Some(pattern) => format!("finding files matching '{}'", truncate_chars(pattern, 40)),
+            None => "finding files".to_string(),
+        },
+        "list_directory" => match get_str("path") {
+            Some(path) => format!("listing {}", path),
+            None => "listing directory".to_string(),
+        },
+        "run_shell_command" => match get_str("command") {
+            Some(cmd) => format!("running `{}`", truncate_chars(cmd.trim(), 60)),
+            None => "running command".to_string(),
+        },
+        "google_web_search" => match get_str("query") {
+            Some(query) => format!("searching web: {}", truncate_chars(query, 50)),
+            None => "searching the web".to_string(),
+        },
+        "web_fetch" => match get_str("url").or_else(|| get_str("prompt")) {
+            Some(url) => format!("fetching {}", truncate_chars(url, 60)),
+            None => "fetching URL".to_string(),
+        },
+        other => format!("using {}", other),
+    }
+}
+
+/// Truncates to `max` *characters*, never bytes: tool arguments are arbitrary
+/// text, and slicing one at a byte index that lands mid-character panics —
+/// which `panic = "abort"` in the release profile turns into a killed process.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// How the CLI ended, in words. A process killed by a signal has no exit code
+/// at all, and reporting that as `-1` describes nothing — the signal is the
+/// whole explanation, and a SIGKILL with no output is almost always the machine
+/// running out of memory rather than anything the CLI did.
+fn describe_status(status: &std::process::ExitStatus, stderr: &str, output: &str) -> String {
+    use std::os::unix::process::ExitStatusExt;
+
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exited with {}: {}", code, describe_exit(code, stderr, output)),
+        (None, Some(9)) => format!(
+            "was killed (SIGKILL) — usually the machine running out of memory{}",
+            trailing_detail(stderr, output)
+        ),
+        (None, Some(signal)) => format!(
+            "was killed by signal {}{}",
+            signal,
+            trailing_detail(stderr, output)
+        ),
+        (None, None) => format!("ended abnormally{}", trailing_detail(stderr, output)),
+    }
+}
+
+/// Whatever the process managed to say before dying, or nothing at all.
+fn trailing_detail(stderr: &str, output: &str) -> String {
+    let detail = first_non_empty(stderr, output);
+    if detail == "no output" {
+        String::new()
+    } else {
+        format!(": {}", detail)
+    }
+}
+
+fn first_non_empty<'a>(stderr: &'a str, output: &'a str) -> &'a str {
+    if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else if !output.trim().is_empty() {
+        output.trim()
+    } else {
+        "no output"
+    }
+}
+
+/// Turns a CLI exit into something a user can act on. The documented codes are
+/// 0/1/42/53; 55 (untrusted folder) is not documented but is what an
+/// unreadable checkout actually returns, so it is named explicitly.
+fn describe_exit(code: i32, stderr: &str, output: &str) -> String {
+    let detail = first_non_empty(stderr, output);
+
+    match code {
+        42 => format!("invalid prompt or arguments — {}", detail),
+        53 => format!("turn limit exceeded — {}", detail),
+        55 => format!("workspace not trusted — {}", detail),
+        _ => detail.to_string(),
+    }
+}
+
+fn error_message(event: &serde_json::Value) -> Option<String> {
+    event
+        .get("message")
+        .and_then(|v| v.as_str())
+        .or_else(|| event.pointer("/error/message").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+/// Starts reading the child's stderr immediately, on its own thread, and hands
+/// back a handle to the collected text. Call before reading stdout: a pipe that
+/// nobody drains fills up and stalls the process writing into it.
+fn drain_stderr(child: &mut Child) -> Option<std::thread::JoinHandle<String>> {
+    let pipe = child.stderr.take()?;
+    Some(std::thread::spawn(move || {
+        BufReader::new(pipe)
+            .lines()
+            .map_while(Result::ok)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }))
 }
 
 fn extract_api_error(response: &str) -> Option<String> {
     let json: serde_json::Value = serde_json::from_str(response).ok()?;
     let message = json.get("error")?.get("message")?.as_str()?;
     Some(message.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).expect("test fixture must be valid JSON")
+    }
+
+    /// Fixtures are lines the installed CLI actually emitted (v0.53.1), not
+    /// shapes read off documentation — the field names are what this parser
+    /// depends on, so they are pinned to observed output.
+    const REAL_RESULT: &str = r#"{"type":"result","timestamp":"2026-08-05T17:53:45.174Z","status":"success","stats":{"total_tokens":43498,"input_tokens":20846,"output_tokens":62,"cached":8089,"input":12757,"duration_ms":153348,"tool_calls":2,"models":{"gemini-3.1-pro-preview":{"total_tokens":43498,"input_tokens":20846,"output_tokens":62}}}}"#;
+
+    #[test]
+    fn result_stats_come_from_the_named_token_fields() {
+        let stats = parse_result_stats(&event(REAL_RESULT));
+        assert_eq!(stats.input_tokens, 20846);
+        assert_eq!(stats.output_tokens, 62);
+        // Not `input` (12757), which is a different count sitting beside it.
+        assert_eq!(stats.model.as_deref(), Some("gemini-3.1-pro-preview"));
+    }
+
+    /// A `result` without stats must not fail the run: the answer is already
+    /// collected by then, and a missing count is worth less than the review.
+    #[test]
+    fn a_result_without_stats_is_not_an_error() {
+        assert_eq!(parse_result_stats(&event(r#"{"type":"result"}"#)), ResultStats::default());
+    }
+
+    /// The CLI resolves aliases, so the model that priced the call is the one
+    /// it reports back — `pro` bills as `gemini-3.1-pro-preview`.
+    #[test]
+    fn the_resolved_model_is_what_gets_priced() {
+        let stats = parse_result_stats(&event(REAL_RESULT));
+        let model = stats.model.unwrap();
+        assert!(pricing::compute_cost(&model, 1_000_000, 0).is_some());
+    }
+
+    #[test]
+    fn only_the_assistants_own_text_is_collected() {
+        let assistant = event(r#"{"type":"message","role":"assistant","content":"372","delta":true}"#);
+        assert_eq!(assistant_chunk(&assistant), Some("372"));
+
+        // The prompt echoed back — collecting it would put the review's own
+        // instructions into the review.
+        let user = event(r#"{"type":"message","role":"user","content":"How many lines?"}"#);
+        assert_eq!(assistant_chunk(&user), None);
+
+        let empty = event(r#"{"type":"message","role":"assistant","content":""}"#);
+        assert_eq!(assistant_chunk(&empty), None);
+    }
+
+    /// The whole point of the CLI reviewer is that the user can see it reading.
+    #[test]
+    fn a_file_read_is_described_by_its_path() {
+        let params = serde_json::json!({ "file_path": "src/prompts.rs" });
+        assert_eq!(describe_tool_action("read_file", Some(&params)), "reading src/prompts.rs");
+
+        let grep = serde_json::json!({ "pattern": "formatCreditErrorMessage" });
+        assert_eq!(
+            describe_tool_action("search_file_content", Some(&grep)),
+            "searching 'formatCreditErrorMessage'"
+        );
+    }
+
+    #[test]
+    fn an_unknown_tool_is_still_named() {
+        assert_eq!(describe_tool_action("update_topic", None), "using update_topic");
+    }
+
+    /// 55 is undocumented but is exactly what an untrusted checkout returns,
+    /// and "exited with 55" alone tells the user nothing they can act on.
+    #[test]
+    fn exit_codes_are_explained() {
+        assert!(describe_exit(55, "not trusted", "").contains("workspace not trusted"));
+        assert!(describe_exit(53, "", "").contains("turn limit"));
+        assert!(describe_exit(42, "", "").contains("invalid prompt"));
+        assert_eq!(describe_exit(1, "boom", ""), "boom");
+    }
+
+    /// Falls back through stderr, then stdout, so the error is never empty.
+    #[test]
+    fn an_exit_with_no_stderr_reports_whatever_was_printed() {
+        assert_eq!(describe_exit(1, "  ", "partial output"), "partial output");
+        assert_eq!(describe_exit(1, "", ""), "no output");
+    }
+
+    /// A signal death has no exit code, and "exited with -1" names nothing the
+    /// user can act on. Observed in practice: the CLI is a heavy node process
+    /// and the OS kills it under memory pressure, leaving no output at all.
+    #[test]
+    fn a_signal_death_is_named_rather_than_reported_as_minus_one() {
+        use std::os::unix::process::ExitStatusExt;
+        let killed = std::process::ExitStatus::from_raw(9);
+
+        let described = describe_status(&killed, "", "");
+        assert!(described.contains("SIGKILL"), "got: {}", described);
+        assert!(described.contains("out of memory"), "got: {}", described);
+        assert!(!described.contains("-1"), "got: {}", described);
+    }
+
+    #[test]
+    fn an_ordinary_exit_code_still_reports_its_code() {
+        use std::os::unix::process::ExitStatusExt;
+        // Wait-status encoding: the exit code sits in the high byte.
+        let exited = std::process::ExitStatus::from_raw(42 << 8);
+        assert!(describe_status(&exited, "bad flag", "").contains("exited with 42"));
+    }
+
+    /// Only a rejected resume justifies burning a second call.
+    #[test]
+    fn only_a_rejected_resume_restarts_the_session() {
+        assert!(should_restart_session(true, false));
+        assert!(!should_restart_session(true, true));
+        assert!(!should_restart_session(false, false));
+    }
+
+    /// A truncated tool argument must not slice a multi-byte character in half:
+    /// `panic = "abort"` would turn that into a killed process mid-review.
+    #[test]
+    fn tool_arguments_truncate_on_character_boundaries() {
+        assert_eq!(truncate_chars("日本語のパターン", 3), "日本語…");
+        assert_eq!(truncate_chars("short", 40), "short");
+    }
+
+    /// An explicit `mode = "cli"` must not silently degrade to the API
+    /// transport — that is precisely the reviewer the user asked to stop using.
+    #[test]
+    fn cli_mode_without_the_binary_names_the_fix() {
+        let config = GeminiConfig {
+            command: "definitely-not-a-real-binary-xyz".into(),
+            mode: "cli".into(),
+            ..GeminiConfig::default()
+        };
+        let sink: Arc<dyn Sink> = Arc::new(crate::events::TerminalSink::new(false));
+        let message = match GeminiAdapter::new(&config, Path::new("."), false, sink) {
+            Err(e) => format!("{:#}", e),
+            Ok(_) => panic!("a missing CLI in cli mode must fail"),
+        };
+        assert!(message.contains("npm i -g @google/gemini-cli"), "got: {}", message);
+    }
 }

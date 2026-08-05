@@ -399,6 +399,10 @@ struct ReviewTally {
     reviewed: usize,
     approved: usize,
     failures: Vec<String>,
+    /// Projects where the review was refused because the reviewer had nothing
+    /// it could check. Kept apart from `reviewed`, which would otherwise report
+    /// a review that never happened.
+    unreviewable: Vec<String>,
 }
 
 /// Reviews every requested project in turn. Projects that are not git repos or
@@ -456,6 +460,15 @@ fn run_review(
         };
 
         match review {
+            // A refused review is not a review: the reason was already warned
+            // about, and counting it would let the summary claim otherwise.
+            Ok(result) if result.outcome == Outcome::Unreviewed => {
+                tally.unreviewable.push(if multi {
+                    format!("{} — {}", target.label, result.message)
+                } else {
+                    result.message
+                });
+            }
             Ok(result) => {
                 tally.reviewed += 1;
                 if result.outcome == Outcome::Approved {
@@ -510,6 +523,16 @@ fn has_changes_to_review(target: &ReviewTarget, multi: bool, sink: &dyn Sink) ->
 
 fn emit_review_outcome(targets: &[ReviewTarget], tally: &ReviewTally, sink: &dyn Sink) {
     if tally.reviewed == 0 {
+        // Refusing a review that could not check anything is neither a failure
+        // nor "nothing to review" — there was something, and it was declined.
+        if tally.failures.is_empty() && !tally.unreviewable.is_empty() {
+            sink.event(Event::TaskDone {
+                outcome: Outcome::Unreviewed,
+                rounds: 0,
+                message: tally.unreviewable.join("; "),
+            });
+            return;
+        }
         let message = if tally.failures.is_empty() {
             nothing_to_review_message(targets)
         } else {
@@ -536,12 +559,15 @@ fn nothing_to_review_message(targets: &[ReviewTarget]) -> String {
 }
 
 fn review_summary(tally: &ReviewTally) -> String {
-    if tally.reviewed == 1 && tally.failures.is_empty() {
+    if tally.reviewed == 1 && tally.failures.is_empty() && tally.unreviewable.is_empty() {
         return if tally.approved == 1 { "approved".into() } else { "changes requested by AI".into() };
     }
     let mut summary = format!("{}/{} projects approved", tally.approved, tally.reviewed);
     if !tally.failures.is_empty() {
         summary.push_str(&format!(", {} failed", tally.failures.len()));
+    }
+    if !tally.unreviewable.is_empty() {
+        summary.push_str(&format!(", {} unreviewable", tally.unreviewable.len()));
     }
     summary
 }

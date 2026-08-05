@@ -26,6 +26,13 @@ fn total_bytes(history: &[serde_json::Value]) -> usize {
     history.iter().map(|v| v.to_string().len()).sum()
 }
 
+/// Sibling projects to hand a CLI: everything readable except the working
+/// directory it already owns, and nothing that has since vanished — a stale
+/// workspace entry must not make every spawn fail.
+pub(crate) fn readable_extras<'a>(readable: &'a [PathBuf], working_dir: &Path) -> Vec<&'a PathBuf> {
+    readable.iter().filter(|dir| dir.as_path() != working_dir && dir.is_dir()).collect()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UsageStats {
     pub input_tokens: u64,
@@ -106,6 +113,16 @@ pub trait ModelAdapter {
     /// task in a multi-root workspace consult its sibling repos instead of
     /// reasoning from the one checkout it happens to write to.
     fn set_readable_dirs(&mut self, _dirs: &[PathBuf]) {}
+
+    /// Whether this adapter can open the files it is reasoning about. False for
+    /// API-only transports, which see nothing but the prompt text.
+    ///
+    /// A reviewer is told what it may claim to have checked based on this, and
+    /// a review with no file access and no diff is refused outright rather than
+    /// allowed to return an approval it had no way to earn.
+    fn can_read_files(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

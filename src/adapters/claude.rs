@@ -1,4 +1,4 @@
-use super::{pricing, ImageInput, ModelAdapter, UsageStats};
+use super::{pricing, readable_extras, ImageInput, ModelAdapter, UsageStats};
 use crate::config::ClaudeConfig;
 use crate::events::{Event, Sink};
 use crate::ui;
@@ -21,13 +21,6 @@ use std::time::Duration;
 /// dropping the id costs the task everything it had already done.
 fn should_restart_session(was_resuming: bool, connected: bool) -> bool {
     was_resuming && !connected
-}
-
-/// Sibling projects to hand the CLI: everything readable except the working
-/// directory it already owns, and nothing that has since vanished — a stale
-/// workspace entry must not make every spawn fail.
-fn readable_extras<'a>(readable: &'a [PathBuf], working_dir: &Path) -> Vec<&'a PathBuf> {
-    readable.iter().filter(|dir| dir.as_path() != working_dir && dir.is_dir()).collect()
 }
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -863,6 +856,11 @@ impl ModelAdapter for ClaudeAdapter {
 
     fn set_readable_dirs(&mut self, dirs: &[PathBuf]) {
         self.readable_dirs = dirs.to_vec();
+    }
+
+    /// Only the CLI carries tools; the API path is a bare messages call.
+    fn can_read_files(&self) -> bool {
+        !self.use_api
     }
 }
 

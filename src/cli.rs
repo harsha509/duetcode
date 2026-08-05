@@ -300,7 +300,8 @@ pub(crate) fn setup_task(
 
     let claude: Box<dyn ModelAdapter> =
         Box::new(ClaudeAdapter::new(&config.claude, dir, verbose, sink.clone()));
-    let gemini: Box<dyn ModelAdapter> = Box::new(GeminiAdapter::new(&config.gemini, sink)?);
+    let gemini: Box<dyn ModelAdapter> =
+        Box::new(GeminiAdapter::new(&config.gemini, dir, verbose, sink)?);
 
     let (writer, reviewer) = match writer_name.to_lowercase().as_str() {
         "claude" => (claude, gemini),
@@ -356,7 +357,7 @@ fn cmd_review(dir: &Path, reviewer_name: &str, task: Option<&str>, verbose: bool
     let config = Config::load(dir).context("failed to load config")?;
 
     let mut reviewer: Box<dyn ModelAdapter> = match reviewer_name.to_lowercase().as_str() {
-        "gemini" => Box::new(GeminiAdapter::new(&config.gemini, sink.clone())?),
+        "gemini" => Box::new(GeminiAdapter::new(&config.gemini, dir, verbose, sink.clone())?),
         "claude" => Box::new(ClaudeAdapter::new(&config.claude, dir, verbose, sink.clone())),
         other => anyhow::bail!("unknown reviewer '{}' — use 'claude' or 'gemini'", other),
     };
@@ -519,16 +520,51 @@ fn cmd_doctor(dir: &Path, verbose: bool) -> Result<()> {
         .map(|c| c.gemini.clone())
         .unwrap_or_default();
 
-    if GeminiAdapter::is_key_available(&gemini_config) {
-        println!("  {} {} is set", "✓".green(), gemini_config.api_key_env);
+    let gemini_cli_ok = GeminiAdapter::is_cli_available(&gemini_config);
+    let gemini_key_ok = GeminiAdapter::is_key_available(&gemini_config);
+
+    if gemini_cli_ok {
+        println!("  {} {} CLI found", "✓".green(), gemini_config.command);
     } else {
         println!(
-            "  {} {} — not set",
+            "  {} {} CLI — not found (npm i -g @google/gemini-cli)",
+            "~".yellow(),
+            gemini_config.command
+        );
+    }
+
+    if gemini_key_ok {
+        println!("  {} {} is set", "✓".green(), gemini_config.api_key_env);
+    } else {
+        println!("  {} {} — not set", "~".yellow(), gemini_config.api_key_env);
+    }
+
+    // Either transport is enough to run. Only having neither is a failure.
+    if !gemini_cli_ok && !gemini_key_ok {
+        println!(
+            "  {} gemini unusable — install the CLI or set {}",
             "✗".red(),
             gemini_config.api_key_env
         );
         all_ok = false;
+    } else if !gemini_cli_ok {
+        println!(
+            "  {} gemini will run API-only — it cannot read the code it reviews",
+            "!".yellow()
+        );
     }
+
+    // Lowercased to match how the adapter resolves it, so `mode = "API"` is not
+    // reported as one thing and run as another.
+    let gemini_mode = gemini_config.mode.to_lowercase();
+    println!("  {} gemini mode: {} ({})", "ℹ".cyan(),
+        gemini_mode,
+        match gemini_mode.as_str() {
+            "api" => "always use API",
+            "cli" => "always use CLI",
+            _ => if gemini_cli_ok { "using CLI, API as fallback" } else { "using API directly" },
+        }
+    );
 
     let prompts_dir = dir.join(".duet").join("prompts");
     for name in &["implement.txt", "review.txt", "fix.txt"] {

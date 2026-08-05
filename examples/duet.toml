@@ -5,6 +5,8 @@ model = "sonnet"
 skip_permissions = false
 
 [gemini]
+command = "gemini"
+mode = "auto"
 model = "gemini-3.1-pro-preview"
 api_key_env = "GEMINI_API_KEY"
 

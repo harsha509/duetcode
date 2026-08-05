@@ -94,9 +94,69 @@ pub fn build_plan_review_prompt(template: &str, task: &str, plan: &str) -> Strin
 /// `changes` is the working tree the answer is about. An answer leaves no diff
 /// of its own, so without it the reviewer can only judge the prose; with it the
 /// reviewer can check the answer against the code it describes.
-pub fn build_answer_review_prompt(template: &str, task: &str, answer: &str, changes: &str) -> String {
-    render(template, &[("task", task), ("answer", answer), ("changes", changes)])
+///
+/// `access` states what the reviewer may actually do — see
+/// [`ANSWER_REVIEW_ACCESS_TOOLS`] and [`ANSWER_REVIEW_ACCESS_NONE`]. Getting it
+/// wrong in either direction ruins the review: a reviewer with tools that is
+/// told it has none will not open a single file, and one without tools that is
+/// told it has them will invent what it "found".
+pub fn build_answer_review_prompt(
+    template: &str,
+    task: &str,
+    answer: &str,
+    changes: &str,
+    access: &str,
+    repo: &str,
+) -> String {
+    render(
+        template,
+        &[
+            ("task", task),
+            ("answer", answer),
+            ("changes", changes),
+            ("access", access),
+            ("repo", repo),
+        ],
+    )
 }
+
+/// Access rules for a reviewer running inside the checkout with read-only
+/// tools. Its whole point is the instruction to *go and look*: the reviewer
+/// this replaced was told it could not, and so approved answers it had no way
+/// to check.
+pub const ANSWER_REVIEW_ACCESS_TOOLS: &str = r#"What you can and cannot check:
+- You are running inside the repository described above, with read-only tools. Use them. Open the
+  files the answer cites and read the lines it points at. A claim you could have checked and did
+  not is a claim you failed to review.
+- Go looking for what the answer left out, not only for what it got wrong: the call site it never
+  mentions, the other branch, the caller that makes its conclusion moot. An answer can be accurate
+  in every line it wrote and still be wrong about the codebase.
+- A cited path that does not exist, or a cited line that says something other than what the answer
+  claims, is a blocker. Name the file and say what you found there instead.
+- You cannot edit anything, and must not try. Never run `git add`, `git commit`, or `git push`.
+- Never write "verified", "confirmed", or "I checked" about a claim you did not actually open the
+  file to check. Restating a claim is not verifying it, and reporting verification you did not
+  perform is a failed review however correct the claim later turns out to be."#;
+
+/// Access rules for an API-only reviewer, which has no tools and can see
+/// nothing but this prompt.
+pub const ANSWER_REVIEW_ACCESS_NONE: &str = r#"What you can and cannot check:
+- The question, the answer, and the changes above are everything you have. You cannot open a
+  repository, a file, a pull request, or a URL, and you cannot run anything.
+- Check the answer against those changes wherever they bear on it. An answer that describes,
+  judges, or draws conclusions about this code can be contradicted by it: say so when the diff
+  does not support what the answer claims, and say so when the answer misses something the diff
+  plainly shows.
+- The changes are a diff, not whole files. Unmarked lines are unchanged context and the code
+  around them still exists — never call a symbol undefined or removed unless a `-` line deletes
+  it. Where the diff is too narrow to settle a claim, say that instead of guessing.
+- Never write "verified", "confirmed", "I checked", or any equivalent about a claim whose evidence
+  is neither quoted in the answer nor visible in the changes above. Restating a claim is not
+  verifying it. Reporting verification you did not perform is a failed review, however correct the
+  claim later turns out to be.
+- You can still judge reasoning: conclusions that do not follow from the evidence given, internal
+  contradictions, parts of the question left unanswered, and claims asserted with more confidence
+  than their stated support carries."#;
 
 pub fn build_answer_fix_prompt(template: &str, task: &str, review_feedback: &str) -> String {
     render(
@@ -248,6 +308,9 @@ pub const DEFAULT_ANSWER_REVIEW_TEMPLATE: &str = r#"You are a senior engineer gi
 
 TASK / QUESTION: {task}
 
+REPOSITORY UNDER REVIEW:
+{repo}
+
 THEIR ANSWER:
 {answer}
 
@@ -256,23 +319,7 @@ CHANGES THE ANSWER IS ABOUT:
 
 Assess whether the reasoning is sound, internally consistent, and actually answers the question. Flag anything wrong, contradictory, or missing. Do not make any code changes.
 
-What you can and cannot check:
-- The question, the answer, and the changes above are everything you have. You cannot open a
-  repository, a file, a pull request, or a URL, and you cannot run anything.
-- Check the answer against those changes wherever they bear on it. An answer that describes,
-  judges, or draws conclusions about this code can be contradicted by it: say so when the diff
-  does not support what the answer claims, and say so when the answer misses something the diff
-  plainly shows.
-- The changes are a diff, not whole files. Unmarked lines are unchanged context and the code
-  around them still exists — never call a symbol undefined or removed unless a `-` line deletes
-  it. Where the diff is too narrow to settle a claim, say that instead of guessing.
-- Never write "verified", "confirmed", "I checked", or any equivalent about a claim whose evidence
-  is neither quoted in the answer nor visible in the changes above. Restating a claim is not
-  verifying it. Reporting verification you did not perform is a failed review, however correct the
-  claim later turns out to be.
-- You can still judge reasoning: conclusions that do not follow from the evidence given, internal
-  contradictions, parts of the question left unanswered, and claims asserted with more confidence
-  than their stated support carries.
+{access}
 
 Rules:
 - NEVER run `git add`, `git commit`, or `git push`. You are a reviewer only.
@@ -280,6 +327,7 @@ Rules:
 
 Finish with these lines, in this order:
 
+FILES READ: <every file you actually opened, comma-separated — or "none">
 UNVERIFIED: <the load-bearing claims you had to take on trust, comma-separated — or "none, the answer quotes its evidence">
 THEIR CONCLUSION: <the answer's own bottom line, in one line, in its words — what it decides or recommends>
 
@@ -357,11 +405,46 @@ mod tests {
     #[test]
     fn answer_review_prompt_carries_the_changes() {
         let out = build_answer_review_prompt(
-            DEFAULT_ANSWER_REVIEW_TEMPLATE, "t", "their answer", "+ fn added() {}",
+            DEFAULT_ANSWER_REVIEW_TEMPLATE,
+            "t",
+            "their answer",
+            "+ fn added() {}",
+            ANSWER_REVIEW_ACCESS_NONE,
+            "repository: my-service",
         );
         assert!(out.contains("their answer"));
         assert!(out.contains("+ fn added() {}"));
+        assert!(out.contains("repository: my-service"));
         assert!(!out.contains("{changes}"));
+        assert!(!out.contains("{access}"));
+        assert!(!out.contains("{repo}"));
+    }
+
+    /// A reviewer with tools must be told to use them. The template this
+    /// replaced said the opposite to every reviewer, tools or not, which is why
+    /// answers came back approved with nothing opened.
+    #[test]
+    fn access_block_matches_what_the_reviewer_can_actually_do() {
+        let with_tools = build_answer_review_prompt(
+            DEFAULT_ANSWER_REVIEW_TEMPLATE, "t", "a", "d", ANSWER_REVIEW_ACCESS_TOOLS, "r",
+        );
+        assert!(with_tools.contains("read-only tools. Use them."));
+        assert!(!with_tools.contains("You cannot open a"));
+
+        let without = build_answer_review_prompt(
+            DEFAULT_ANSWER_REVIEW_TEMPLATE, "t", "a", "d", ANSWER_REVIEW_ACCESS_NONE, "r",
+        );
+        assert!(without.contains("You cannot open a"));
+        assert!(!without.contains("read-only tools. Use them."));
+    }
+
+    /// A review that opened nothing has to say so on the record.
+    #[test]
+    fn answer_review_prompt_demands_the_files_read() {
+        let out = build_answer_review_prompt(
+            DEFAULT_ANSWER_REVIEW_TEMPLATE, "t", "a", "d", ANSWER_REVIEW_ACCESS_TOOLS, "r",
+        );
+        assert!(out.contains("FILES READ:"));
     }
 
     #[test]
