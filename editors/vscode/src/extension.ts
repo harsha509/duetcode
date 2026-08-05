@@ -9,7 +9,7 @@ import { SettingsPanel } from './settingsPanel';
 export function activate(ctx: vscode.ExtensionContext): void {
   const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
-  const provider = new SessionsProvider(root);
+  const provider = new SessionsProvider();
   ctx.subscriptions.push(vscode.window.registerTreeDataProvider('dtSessions', provider));
 
   const client = new ServeClient(
@@ -49,15 +49,45 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dt.settings', () => SettingsPanel.createOrShow(ctx, client)),
   );
 
-  if (root) {
-    const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(root, '.duet/sessions/**'),
-    );
-    watcher.onDidCreate(() => provider.refresh());
-    watcher.onDidChange(() => provider.refresh());
-    watcher.onDidDelete(() => provider.refresh());
-    ctx.subscriptions.push(watcher);
-  }
+  ctx.subscriptions.push(watchSessions(provider));
+}
+
+/**
+ * Refreshes the sessions tree when any workspace folder records one. Watching
+ * only the first folder leaves a task run in a second project invisible until
+ * the window is reloaded, so every folder gets a watcher — and the set is
+ * rebuilt whenever folders are added or removed.
+ */
+function watchSessions(provider: SessionsProvider): vscode.Disposable {
+  let watchers: vscode.FileSystemWatcher[] = [];
+
+  const rebuild = (): void => {
+    for (const watcher of watchers) {
+      watcher.dispose();
+    }
+    watchers = (vscode.workspace.workspaceFolders ?? []).map((folder) => {
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(folder, '.duet/sessions/**'),
+      );
+      watcher.onDidCreate(() => provider.refresh());
+      watcher.onDidChange(() => provider.refresh());
+      watcher.onDidDelete(() => provider.refresh());
+      return watcher;
+    });
+  };
+
+  rebuild();
+  const folderChange = vscode.workspace.onDidChangeWorkspaceFolders(() => {
+    rebuild();
+    provider.refresh();
+  });
+
+  return new vscode.Disposable(() => {
+    folderChange.dispose();
+    for (const watcher of watchers) {
+      watcher.dispose();
+    }
+  });
 }
 
 export function deactivate(): void {}
