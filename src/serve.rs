@@ -22,9 +22,10 @@ use crate::cli;
 use crate::config::Config;
 use crate::events::{AskKind, Event, Sink};
 use crate::git;
-use crate::orchestrator::{self, TaskOptions};
+use crate::orchestrator::{self, Outcome, TaskOptions};
 use anyhow::Result;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,6 +119,11 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
     // was started in — which is exactly how the plain CLI behaves.
     let mut workspace: Vec<PathBuf> = vec![dir.to_path_buf()];
 
+    // Answers still waiting for a review, per project. A task that answers
+    // instead of writing code leaves no diff, so the review command would have
+    // nothing to judge unless the answer is kept here until it is reviewed.
+    let mut pending_answers: HashMap<PathBuf, PendingAnswer> = HashMap::new();
+
     for cmd in cmd_rx {
         match cmd.cmd.as_str() {
             "ping" => sink.event(Event::Pong),
@@ -179,19 +185,44 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                     continue_session: false,
                     auto: cmd.auto.unwrap_or(false),
                     plan_first: cmd.cmd == "plan",
+                    // The panel has a review button, so the loop never stops to
+                    // ask: the user spends a reviewer call when they want one.
+                    review_on_demand: true,
                 };
 
                 match orchestrator::run(&opts, writer.as_mut(), reviewer.as_mut(), sink.as_ref()) {
-                    Ok(r) => sink.event(Event::TaskDone {
-                        success: r.success,
-                        rounds: r.rounds,
-                        message: r.message,
-                    }),
+                    Ok(r) => {
+                        // A reviewed run, or one that changed code, leaves
+                        // nothing pending — the diff is what a later review
+                        // should judge, not an answer from a task ago.
+                        match r.answer {
+                            Some(answer) => {
+                                let pending =
+                                    PendingAnswer { task: task.to_string(), answer };
+                                pending_answers.insert(project_key(&target.dir), pending);
+                            }
+                            None => {
+                                pending_answers.remove(&project_key(&target.dir));
+                            }
+                        }
+                        sink.event(Event::TaskDone {
+                            outcome: r.outcome,
+                            rounds: r.rounds,
+                            message: r.message,
+                        });
+                    }
                     Err(e) => sink.event(Event::Error { message: format!("{:#}", e) }),
                 }
             }
             "review" => {
-                run_review(&config, reviewer.as_mut(), &workspace, &cmd, sink.as_ref());
+                run_review(
+                    &config,
+                    reviewer.as_mut(),
+                    &workspace,
+                    &cmd,
+                    &pending_answers,
+                    sink.as_ref(),
+                );
             }
             other => {
                 sink.event(Event::Error { message: format!("unknown command '{}'", other) });
@@ -348,6 +379,20 @@ fn project_config(target: &ReviewTarget, sink: &dyn Sink) -> Option<Config> {
     }
 }
 
+/// An answer a task produced and no reviewer has judged yet, with the question
+/// it answered — a review of an answer is only meaningful against its question.
+struct PendingAnswer {
+    task: String,
+    answer: String,
+}
+
+/// Keys a pending answer by a path that compares equal however a frontend
+/// spells it: `/w/api` and `/w/api/` are one project, and a lookup that missed
+/// would silently review the diff instead of the answer waiting on it.
+fn project_key(dir: &Path) -> PathBuf {
+    dir.components().collect()
+}
+
 /// Outcome tally across the reviewed projects.
 #[derive(Default)]
 struct ReviewTally {
@@ -359,11 +404,16 @@ struct ReviewTally {
 /// Reviews every requested project in turn. Projects that are not git repos or
 /// have nothing uncommitted are skipped rather than failing the run, so a clean
 /// first folder never hides the changes sitting in a second one.
+///
+/// A project whose last task answered instead of writing code is reviewed as an
+/// answer: the reviewer judges what the writer concluded, against the diff it
+/// concluded it about. Reviewing that diff cold would judge the wrong thing.
 fn run_review(
     session_config: &Config,
     reviewer: &mut dyn ModelAdapter,
     workspace: &[PathBuf],
     cmd: &Command,
+    pending_answers: &HashMap<PathBuf, PendingAnswer>,
     sink: &dyn Sink,
 ) {
     let targets = review_targets(cmd, workspace);
@@ -371,7 +421,8 @@ fn run_review(
     let mut tally = ReviewTally::default();
 
     for target in &targets {
-        if !has_changes_to_review(target, multi, sink) {
+        let pending = pending_answers.get(&project_key(&target.dir));
+        if pending.is_none() && !has_changes_to_review(target, multi, sink) {
             continue;
         }
 
@@ -392,10 +443,22 @@ fn run_review(
         let own_config = project_config(target, sink);
         let config = own_config.as_ref().unwrap_or(session_config);
 
-        match orchestrator::review_only(config, reviewer, &target.dir, cmd.task.as_deref(), sink) {
+        let review = match pending {
+            Some(p) => orchestrator::answer_review_only(
+                reviewer,
+                &target.dir,
+                &p.task,
+                &p.answer,
+                cmd.task.as_deref(),
+                sink,
+            ),
+            None => orchestrator::review_only(config, reviewer, &target.dir, cmd.task.as_deref(), sink),
+        };
+
+        match review {
             Ok(result) => {
                 tally.reviewed += 1;
-                if result.success {
+                if result.outcome == Outcome::Approved {
                     tally.approved += 1;
                 }
             }
@@ -456,8 +519,9 @@ fn emit_review_outcome(targets: &[ReviewTarget], tally: &ReviewTally, sink: &dyn
         return;
     }
 
+    let all_approved = tally.approved == tally.reviewed && tally.failures.is_empty();
     sink.event(Event::TaskDone {
-        success: tally.approved == tally.reviewed && tally.failures.is_empty(),
+        outcome: if all_approved { Outcome::Approved } else { Outcome::Stopped },
         rounds: tally.reviewed,
         message: review_summary(tally),
     });
@@ -594,6 +658,20 @@ mod tests {
 
     /// A pasted path usually carries the trailing separator, and it names the
     /// same project either way.
+    /// The task command and the review command name the same project through
+    /// different fields, so the pending answer must survive a path spelled with
+    /// a trailing separator — otherwise the button reviews the wrong thing.
+    #[test]
+    fn a_pending_answer_is_found_however_the_path_is_spelled() {
+        let mut pending = HashMap::new();
+        pending.insert(
+            project_key(Path::new("/w/api")),
+            PendingAnswer { task: "t".into(), answer: "a".into() },
+        );
+        assert!(pending.contains_key(&project_key(Path::new("/w/api/"))));
+        assert!(!pending.contains_key(&project_key(Path::new("/w/web"))));
+    }
+
     #[test]
     fn a_pasted_path_matches_despite_a_trailing_separator() {
         let chosen =

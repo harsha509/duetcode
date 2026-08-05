@@ -333,13 +333,16 @@ fn cmd_task(dir: &Path, args: TaskArgs) -> Result<()> {
         continue_session: args.continue_session,
         auto: args.auto || config.policy.auto,
         plan_first: args.plan_first,
+        // A terminal has no review button to fall back on: ask, or the work
+        // would never get a second opinion at all.
+        review_on_demand: false,
     };
 
     let result = orchestrator::run(&opts, writer.as_mut(), reviewer.as_mut(), sink.as_ref())?;
 
-    ui::final_line(result.success, result.rounds, writer.name(), reviewer.name(), &result.message);
+    ui::final_line(result.outcome, result.rounds, writer.name(), reviewer.name(), &result.message);
 
-    if result.success { Ok(()) } else { std::process::exit(1); }
+    if result.outcome.success() { Ok(()) } else { std::process::exit(1); }
 }
 
 fn cmd_review(dir: &Path, reviewer_name: &str, task: Option<&str>, verbose: bool) -> Result<()> {
@@ -360,7 +363,7 @@ fn cmd_review(dir: &Path, reviewer_name: &str, task: Option<&str>, verbose: bool
 
     let result = orchestrator::review_only(&config, reviewer.as_mut(), dir, task, sink.as_ref())?;
 
-    if result.success {
+    if result.outcome.success() {
         println!("\n{}", "Final Result: APPROVED".green().bold());
     } else {
         println!("\n{}", "Final Result: CHANGES NEEDED".red().bold());

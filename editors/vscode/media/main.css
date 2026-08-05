@@ -67,6 +67,9 @@ body {
   border-radius: 6px;
   padding: 6px 10px;
   overflow-x: hidden;
+  /* Lets a wide code block scroll inside its own card instead of stretching
+     the column to the width of its longest line. */
+  min-width: 0;
 }
 
 .col:empty { display: none; }
@@ -85,12 +88,71 @@ body {
 .col.writer .col-head { color: var(--vscode-charts-green); }
 .col.reviewer .col-head { color: var(--vscode-charts-purple); }
 
-pre.stream {
+/* Prose wraps; code does not. `pre.stream` is the raw sink chunks land in
+   while a model is still talking, `pre.prose` the laid-out result. */
+pre.stream,
+pre.prose {
   white-space: pre-wrap;
   word-break: break-word;
   font-family: var(--vscode-editor-font-family);
   font-size: 12px;
   margin: 4px 0;
+}
+
+/* A fenced block, set apart from the prose around it: its own surface, its own
+   border, and a horizontal scroll of its own so long lines never wrap into
+   something that reads like a sentence. */
+.code {
+  margin: 8px 0;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: var(--vscode-textCodeBlock-background, var(--vscode-editorWidget-background));
+  overflow: hidden;
+}
+
+.code-lang {
+  padding: 3px 10px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+pre.code-body {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  white-space: pre;
+  tab-size: 4;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* Syntax tint. Chart colours rather than fixed hues, so a block stays legible
+   in whatever theme the editor is wearing. */
+.tok.com { color: var(--vscode-descriptionForeground); font-style: italic; }
+.tok.str { color: var(--vscode-charts-orange); }
+.tok.kw { color: var(--vscode-charts-purple); }
+.tok.num { color: var(--vscode-charts-green); }
+.tok.fn { color: var(--vscode-charts-yellow); }
+.tok.typ { color: var(--vscode-charts-blue); }
+
+.dl.add { color: var(--vscode-charts-green); }
+.dl.del { color: var(--vscode-charts-red); }
+.dl.hunk { color: var(--vscode-charts-blue); }
+.dl.meta { opacity: 0.55; }
+
+/* A symbol named mid-sentence, marked so it is not read as a word. Editor
+   variables give it the same colour VS Code gives inline code elsewhere. */
+code.inline {
+  font-family: var(--vscode-editor-font-family);
+  font-size: 11.5px;
+  padding: 0 4px;
+  border-radius: 3px;
+  color: var(--vscode-textPreformat-foreground);
+  background: var(--vscode-textPreformat-background, var(--vscode-textCodeBlock-background));
 }
 
 .working { opacity: 0.85; margin: 3px 0; }
@@ -118,9 +180,9 @@ pre.stream {
 
 /* Severity tint, applied only to the lines that label a finding. Body prose
    keeps the default colour so the tint still means something. */
-pre.stream .pl.issue { color: var(--vscode-charts-red); font-weight: 600; }
-pre.stream .pl.warn { color: var(--vscode-charts-yellow); }
-pre.stream .pl.ok { color: var(--vscode-charts-green); }
+pre.prose .pl.issue { color: var(--vscode-charts-red); font-weight: 600; }
+pre.prose .pl.warn { color: var(--vscode-charts-yellow); }
+pre.prose .pl.ok { color: var(--vscode-charts-green); }
 
 .row { margin: 4px 0; }
 .row.section { opacity: 0.6; text-align: center; margin: 10px 0; }
@@ -135,6 +197,7 @@ pre.stream .pl.ok { color: var(--vscode-charts-green); }
 .row.warn { color: var(--vscode-charts-yellow); }
 .row.error { color: var(--vscode-charts-red); }
 .row.success { color: var(--vscode-charts-green); font-weight: 600; }
+.row.neutral { color: var(--vscode-descriptionForeground); font-weight: 600; }
 .row.cost { opacity: 0.6; font-size: 12px; }
 .row.changes {
   font-family: var(--vscode-editor-font-family);

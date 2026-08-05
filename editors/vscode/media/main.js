@@ -19,6 +19,14 @@
   let streams = {}; // model -> <pre> currently receiving chunks
   let busy = false;
 
+  // How each run outcome closes the timeline. 'unreviewed' is deliberately
+  // neutral: the user declined the review, which is neither pass nor fail.
+  const OUTCOME_STYLES = {
+    approved: { cls: 'success', label: 'SUCCESS' },
+    unreviewed: { cls: 'neutral', label: 'NO REVIEW' },
+    stopped: { cls: 'warn', label: 'STOPPED' },
+  };
+
   // ── helpers ────────────────────────────────────────────────
 
   function el(tag, cls, text) {
@@ -155,8 +163,193 @@
     return /^\s*(?:[-*+]|\d+[.)])\s+\*\*/.test(line);
   }
 
+  // ── code blocks ────────────────────────────────────────────
+
+  // Prose and code arrive as one monospace wall, which reads as neither. A
+  // fenced block becomes its own card — labelled, tinted, scrolling rather than
+  // wrapping — so what is being *shown* is told apart from what is being said.
+
+  const FENCE = /^\s{0,3}(`{3,}|~{3,})[ \t]*([\w+#.-]*)[ \t]*$/;
+
+  /** Model text as an ordered run of prose and fenced code parts. */
+  function splitFences(text) {
+    const parts = [];
+    let prose = [];
+    let code = null;
+
+    const flushProse = () => {
+      if (prose.length) {
+        parts.push({ code: false, text: prose.join('\n') });
+        prose = [];
+      }
+    };
+
+    for (const raw of text.split('\n')) {
+      const fence = FENCE.exec(raw);
+      if (code) {
+        // Only the same fence character closes a block, so a ``` inside a ~~~
+        // block stays content — which is how a model quotes markdown at us.
+        if (fence && fence[1][0] === code.mark[0] && fence[1].length >= code.mark.length) {
+          parts.push({ code: true, lang: code.lang, text: code.lines.join('\n') });
+          code = null;
+        } else {
+          code.lines.push(raw);
+        }
+        continue;
+      }
+      if (fence) {
+        flushProse();
+        code = { mark: fence[1], lang: fence[2].toLowerCase(), lines: [] };
+        continue;
+      }
+      prose.push(raw);
+    }
+
+    // An unclosed fence is ordinary in a cut-off or still-streaming answer:
+    // render what arrived rather than dropping it.
+    if (code) parts.push({ code: true, lang: code.lang, text: code.lines.join('\n') });
+    flushProse();
+    return parts;
+  }
+
+  // Two comment styles cover nearly everything a model writes here, so each
+  // language maps to a family rather than carrying its own grammar. Highlighting
+  // is meant to make structure visible, not to be a compiler.
+  const FAMILY = {
+    js: 'c', jsx: 'c', ts: 'c', tsx: 'c', javascript: 'c', typescript: 'c', java: 'c',
+    c: 'c', h: 'c', cpp: 'c', 'c++': 'c', cc: 'c', cs: 'c', csharp: 'c', go: 'c', golang: 'c',
+    rust: 'c', rs: 'c', swift: 'c', kotlin: 'c', kt: 'c', scala: 'c', php: 'c', dart: 'c',
+    css: 'c', scss: 'c', proto: 'c',
+    py: 'hash', python: 'hash', sh: 'hash', bash: 'hash', zsh: 'hash', shell: 'hash',
+    console: 'hash', rb: 'hash', ruby: 'hash', yaml: 'hash', yml: 'hash', toml: 'hash',
+    ini: 'hash', conf: 'hash', dockerfile: 'hash', makefile: 'hash', make: 'hash', perl: 'hash',
+    json: 'json', json5: 'json',
+    diff: 'diff', patch: 'diff',
+    text: 'plain', txt: 'plain', log: 'plain', plain: 'plain', output: 'plain',
+  };
+
+  const words = (s) => new Set(s.split(' '));
+
+  const SPECS = {
+    c: {
+      line: '//',
+      block: true,
+      kw: words('as async await break case catch class const continue default defer delete do' +
+        ' else enum export extends extern false final finally fn for func function go if impl' +
+        ' implements import in instanceof interface let loop match mod move mut new null nullptr' +
+        ' override package private protected pub public return self static struct super switch' +
+        ' this throw throws trait true try type typeof union unsafe use using var virtual void' +
+        ' where while yield'),
+    },
+    hash: {
+      line: '#',
+      block: false,
+      kw: words('and as assert async await break case class continue def del do done elif else' +
+        ' esac except export False fi finally for from global if import in is lambda local nil' +
+        ' None not or pass raise readonly return self source then True try unless until unset' +
+        ' when while with yield'),
+    },
+    json: { line: null, block: false, kw: words('true false null') },
+    plain: { plain: true },
+  };
+
+  /** One scanner per family, built on first use and reused across blocks. */
+  function scannerFor(spec) {
+    if (!spec.re) {
+      const alts = [];
+      if (spec.block) alts.push('/\\*[\\s\\S]*?(?:\\*/|$)');
+      if (spec.line) alts.push(spec.line.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&') + '[^\\n]*');
+      alts.push('"(?:\\\\.|[^"\\\\\\n])*"?');
+      alts.push("'(?:\\\\.|[^'\\\\\\n])*'?");
+      alts.push('`(?:\\\\.|[^`\\\\])*`?');
+      alts.push('\\b\\d[\\w.]*');
+      alts.push('[A-Za-z_$][\\w$]*');
+      spec.re = new RegExp(alts.join('|'), 'g');
+    }
+    spec.re.lastIndex = 0;
+    return spec.re;
+  }
+
+  function tokenClass(token, spec, code, end) {
+    const head = token[0];
+    if (head === '/' || (spec.line && token.startsWith(spec.line))) return 'com';
+    if (head === '"' || head === "'" || head === '`') return 'str';
+    if (head >= '0' && head <= '9') return 'num';
+    if (spec.kw.has(token)) return 'kw';
+    // A name followed by `(` is being called or defined; a capitalised one is a
+    // type. Both are landmarks when skimming a block for what it does.
+    if (/^\s*\(/.test(code.slice(end, end + 8))) return 'fn';
+    if (head >= 'A' && head <= 'Z') return 'typ';
+    return '';
+  }
+
+  /** Diffs are the one thing reviewed here, so their lines carry the colour. */
+  function highlightDiff(code, frag) {
+    for (const raw of code.split('\n')) {
+      let cls = '';
+      if (/^(\+\+\+|---|diff |index |new file|deleted file|similarity|rename )/.test(raw)) {
+        cls = 'meta';
+      } else if (raw.startsWith('@@')) cls = 'hunk';
+      else if (raw.startsWith('+')) cls = 'add';
+      else if (raw.startsWith('-')) cls = 'del';
+      frag.appendChild(el('span', cls ? 'dl ' + cls : 'dl', raw + '\n'));
+    }
+  }
+
+  function highlight(code, lang) {
+    const frag = document.createDocumentFragment();
+    const family = FAMILY[lang] || 'c';
+    if (family === 'diff') {
+      highlightDiff(code, frag);
+      return frag;
+    }
+
+    const spec = SPECS[family];
+    if (spec.plain) {
+      frag.appendChild(document.createTextNode(code));
+      return frag;
+    }
+
+    const re = scannerFor(spec);
+    let last = 0;
+    let m;
+    while ((m = re.exec(code)) !== null) {
+      if (m.index > last) frag.appendChild(document.createTextNode(code.slice(last, m.index)));
+      const cls = tokenClass(m[0], spec, code, re.lastIndex);
+      frag.appendChild(cls ? el('span', 'tok ' + cls, m[0]) : document.createTextNode(m[0]));
+      last = re.lastIndex;
+      // A zero-width match would spin forever; nothing in the scanner can
+      // produce one, but the loop must not depend on that.
+      if (re.lastIndex === m.index) re.lastIndex++;
+    }
+    if (last < code.length) frag.appendChild(document.createTextNode(code.slice(last)));
+    return frag;
+  }
+
+  function codeCard(part) {
+    const card = el('div', 'code');
+    if (part.lang) card.appendChild(el('div', 'code-lang', part.lang));
+    const body = el('pre', 'code-body');
+    body.appendChild(highlight(part.text, part.lang));
+    card.appendChild(body);
+    return card;
+  }
+
+  /** Inline `code` inside a prose line, so a symbol is not read as a word. */
+  function fillInline(span, raw) {
+    let last = 0;
+    const re = /`([^`\n]+)`/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      if (m.index > last) span.appendChild(document.createTextNode(raw.slice(last, m.index)));
+      span.appendChild(el('code', 'inline', m[1]));
+      last = re.lastIndex;
+    }
+    span.appendChild(document.createTextNode(raw.slice(last) + '\n'));
+  }
+
   /**
-   * Repaints a block of prose, one span per line, tinted by severity.
+   * Paints one run of prose, one span per line, tinted by severity.
    *
    * A finding is usually named under its section rather than in its own words
    * ("### 1. GZip compression was silently deleted" under "## Blocking"), so a
@@ -168,12 +361,14 @@
    * line painted green by its neighbours is a claim that there is nothing to do
    * here — the one claim this must never invent. A clean-sounding heading over
    * a list of problems ("Key Highlights Verified") leaves those items plain.
+   *
+   * `state` carries the enclosing section across the code blocks that split a
+   * run, so a fenced example under a heading does not end its section.
    */
-  function fillProse(pre, text) {
-    pre.textContent = '';
-    let section = null; // { level, severity } of the enclosing tinted heading
-
-    const inherited = () => (section && section.severity !== 'ok' ? section.severity : '');
+  function proseRun(text, state) {
+    const pre = el('pre', 'prose');
+    const inherited = () =>
+      (state.section && state.section.severity !== 'ok' ? state.section.severity : '');
 
     for (const raw of text.split('\n')) {
       const level = headingLevel(raw);
@@ -182,24 +377,36 @@
       if (level > 0) {
         severity = severityOf(raw);
         if (severity) {
-          section = { level, severity };
-        } else if (section && level > section.level) {
+          state.section = { level, severity };
+        } else if (state.section && level > state.section.level) {
           severity = inherited();
         } else {
-          section = null;
+          state.section = null;
         }
       } else if (isFinding(raw)) {
         severity = severityOf(raw) || inherited();
       }
 
-      pre.appendChild(el('span', severity ? 'pl ' + severity : 'pl', raw + '\n'));
+      const span = el('span', severity ? 'pl ' + severity : 'pl');
+      fillInline(span, raw);
+      pre.appendChild(span);
+    }
+    return pre;
+  }
+
+  /** Repaints `block` as prose runs and code cards. */
+  function fillProse(block, text) {
+    block.textContent = '';
+    const state = { section: null };
+    for (const part of splitFences(text)) {
+      block.appendChild(part.code ? codeCard(part) : proseRun(part.text, state));
     }
   }
 
-  function renderProse(target, cls, text) {
-    const pre = el('pre', cls);
-    fillProse(pre, text);
-    target.appendChild(pre);
+  function renderProse(target, text) {
+    const block = el('div', 'block');
+    fillProse(block, text);
+    target.appendChild(block);
     scrollDown();
   }
 
@@ -264,17 +471,21 @@
         break;
       }
       case 'stream_end': {
-        // Tinted once the text is whole: a chunk can split a line anywhere, so
-        // classifying mid-stream would colour half a heading.
+        // Laid out once the text is whole: a chunk can split a line — or a
+        // fence — anywhere, so classifying mid-stream would colour half a
+        // heading and card half a code block. The raw <pre> the chunks landed
+        // in is replaced by the formatted block it turned out to be.
         const pre = streams[ev.model];
         if (pre) {
-          fillProse(pre, pre.textContent);
+          const block = el('div', 'block');
+          fillProse(block, pre.textContent);
+          pre.replaceWith(block);
         }
         delete streams[ev.model];
         break;
       }
       case 'response':
-        renderProse(colFor(ev.model), 'stream', ev.text);
+        renderProse(colFor(ev.model), ev.text);
         break;
       case 'check':
         line(colFor(reviewerName), ev.passed ? 'check ok' : 'check bad',
@@ -314,11 +525,12 @@
       case 'ask':
         showAsk(ev.id, ev.kind, ev.question);
         break;
-      case 'task_done':
-        fullWidth(ev.success ? 'success' : 'warn',
-          `${ev.success ? 'SUCCESS' : 'STOPPED'} — ${ev.message} (${ev.rounds} rounds)`);
+      case 'task_done': {
+        const style = OUTCOME_STYLES[ev.outcome] ?? OUTCOME_STYLES.stopped;
+        fullWidth(style.cls, `${style.label} — ${ev.message} (${ev.rounds} rounds)`);
         setBusy(false);
         break;
+      }
       case 'error':
         fullWidth('error', '✗ ' + ev.message);
         setBusy(false);
@@ -342,8 +554,8 @@
 
     for (const r of data.rounds) {
       newRound(r.round === 0 ? 'planning' : r.round, '');
-      if (r.writer) renderProse(colFor(writerName), 'stream', r.writer);
-      if (r.reviewer) renderProse(colFor(reviewerName), 'stream', r.reviewer);
+      if (r.writer) renderProse(colFor(writerName), r.writer);
+      if (r.reviewer) renderProse(colFor(reviewerName), r.reviewer);
       if (Array.isArray(r.checks)) {
         for (const c of r.checks) {
           line(currentRound.reviewerCol, c.passed ? 'check ok' : 'check bad',

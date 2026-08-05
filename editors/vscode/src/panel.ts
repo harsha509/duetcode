@@ -182,7 +182,7 @@ export class DuetPanel {
       <label><input type="checkbox" id="plan"> plan</label>
       <button id="attach" title="Attach image">📎</button>
       <button id="settings" title="Settings — API keys, Claude login">⚙</button>
-      <button id="review" title="Review uncommitted changes in every workspace project">review</button>
+      <button id="review" title="Second opinion on the last answer, or on the uncommitted changes, in every workspace project">review</button>
       <button id="send">Send</button>
     </div>
   </footer>

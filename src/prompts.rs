@@ -91,8 +91,11 @@ pub fn build_plan_review_prompt(template: &str, task: &str, plan: &str) -> Strin
     render(template, &[("task", task), ("plan", plan)])
 }
 
-pub fn build_answer_review_prompt(template: &str, task: &str, answer: &str) -> String {
-    render(template, &[("task", task), ("answer", answer)])
+/// `changes` is the working tree the answer is about. An answer leaves no diff
+/// of its own, so without it the reviewer can only judge the prose; with it the
+/// reviewer can check the answer against the code it describes.
+pub fn build_answer_review_prompt(template: &str, task: &str, answer: &str, changes: &str) -> String {
+    render(template, &[("task", task), ("answer", answer), ("changes", changes)])
 }
 
 pub fn build_answer_fix_prompt(template: &str, task: &str, review_feedback: &str) -> String {
@@ -248,14 +251,25 @@ TASK / QUESTION: {task}
 THEIR ANSWER:
 {answer}
 
+CHANGES THE ANSWER IS ABOUT:
+{changes}
+
 Assess whether the reasoning is sound, internally consistent, and actually answers the question. Flag anything wrong, contradictory, or missing. Do not make any code changes.
 
 What you can and cannot check:
-- The question and the answer above are everything you have. You cannot open a repository, a file,
-  a pull request, or a URL, and you cannot run anything.
+- The question, the answer, and the changes above are everything you have. You cannot open a
+  repository, a file, a pull request, or a URL, and you cannot run anything.
+- Check the answer against those changes wherever they bear on it. An answer that describes,
+  judges, or draws conclusions about this code can be contradicted by it: say so when the diff
+  does not support what the answer claims, and say so when the answer misses something the diff
+  plainly shows.
+- The changes are a diff, not whole files. Unmarked lines are unchanged context and the code
+  around them still exists — never call a symbol undefined or removed unless a `-` line deletes
+  it. Where the diff is too narrow to settle a claim, say that instead of guessing.
 - Never write "verified", "confirmed", "I checked", or any equivalent about a claim whose evidence
-  is not quoted in the answer itself. Restating a claim is not verifying it. Reporting verification
-  you did not perform is a failed review, however correct the claim later turns out to be.
+  is neither quoted in the answer nor visible in the changes above. Restating a claim is not
+  verifying it. Reporting verification you did not perform is a failed review, however correct the
+  claim later turns out to be.
 - You can still judge reasoning: conclusions that do not follow from the evidence given, internal
   contradictions, parts of the question left unanswered, and claims asserted with more confidence
   than their stated support carries.
@@ -336,6 +350,18 @@ mod tests {
         assert!(out.contains("repository: my-service"));
         assert!(out.contains("REPOSITORY UNDER REVIEW:"));
         assert!(out.contains("You are a reviewer."));
+    }
+
+    /// The answer is judged against the code it is about, so the reviewer can
+    /// contradict it instead of taking every claim on trust.
+    #[test]
+    fn answer_review_prompt_carries_the_changes() {
+        let out = build_answer_review_prompt(
+            DEFAULT_ANSWER_REVIEW_TEMPLATE, "t", "their answer", "+ fn added() {}",
+        );
+        assert!(out.contains("their answer"));
+        assert!(out.contains("+ fn added() {}"));
+        assert!(!out.contains("{changes}"));
     }
 
     #[test]

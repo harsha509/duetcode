@@ -107,6 +107,8 @@ fn run_task(
         continue_session: false,
         auto,
         plan_first: spec.plan_first,
+        // Same as the one-shot CLI: the prompt is the only way to a review here.
+        review_on_demand: false,
     };
     orchestrator::run(&opts, writer, reviewer, sink)
 }
@@ -188,5 +190,5 @@ fn expand_path(raw: &str) -> PathBuf {
 }
 
 fn report(result: &OrchestratorResult, writer: &str, reviewer: &str) {
-    ui::final_line(result.success, result.rounds, writer, reviewer, &result.message);
+    ui::final_line(result.outcome, result.rounds, writer, reviewer, &result.message);
 }

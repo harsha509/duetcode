@@ -2,6 +2,7 @@
 //! formatting concerns and the CLI has one consistent voice.
 
 use crate::adapters::UsageStats;
+use crate::orchestrator::Outcome;
 use colored::Colorize;
 use std::io::Write;
 
@@ -234,8 +235,14 @@ pub fn read_line(prompt: &str) -> Option<String> {
     }
 }
 
-pub fn final_line(success: bool, rounds: usize, writer: &str, reviewer: &str, message: &str) {
-    let status = if success { "SUCCESS".green().bold() } else { "STOPPED".red().bold() };
+pub fn final_line(outcome: Outcome, rounds: usize, writer: &str, reviewer: &str, message: &str) {
+    let status = match outcome {
+        Outcome::Approved => "SUCCESS".green().bold(),
+        // Neither pass nor fail: uncolored, so a declined review does not read
+        // as an approval or a failure.
+        Outcome::Unreviewed => "NO REVIEW".bold(),
+        Outcome::Stopped => "STOPPED".red().bold(),
+    };
     println!("\n{} rounds={}, writer={}, reviewer={}", status, rounds, writer, reviewer);
     println!("{}\n", message);
 }

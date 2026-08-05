@@ -7,12 +7,36 @@ use crate::logs::{RunSummary, SessionLog};
 use crate::policy::{self, ReviewVerdict, Verdict};
 use crate::prompts;
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+/// How a run ended. `Unreviewed` is neither a pass nor a failure: the writer
+/// finished and the user declined the review, so there is no verdict to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Approved,
+    Unreviewed,
+    Stopped,
+}
+
+impl Outcome {
+    /// Whether the run ended without anything going wrong — the exit-code test.
+    /// A declined review is not a failure.
+    pub fn success(self) -> bool {
+        !matches!(self, Outcome::Stopped)
+    }
+}
+
 pub struct OrchestratorResult {
-    pub success: bool,
+    pub outcome: Outcome,
     pub rounds: usize,
     pub message: String,
+    /// The answer the run ended on, when the writer answered instead of
+    /// changing code and no reviewer ever judged it. A frontend holds this so
+    /// its own review action has something to judge: an answer leaves no diff,
+    /// and a diff review would judge the wrong thing.
+    pub answer: Option<String>,
 }
 
 /// Everything a task run needs, bundled so call sites stay small.
@@ -29,6 +53,12 @@ pub struct TaskOptions<'a> {
     pub continue_session: bool,
     pub auto: bool,
     pub plan_first: bool,
+    /// True when the caller offers review as its own action — the VS Code
+    /// panel's review button. The loop then never asks whether to review: it
+    /// hands the work back unreviewed and lets the user spend a reviewer call
+    /// when they want one. A terminal, which has no such button, leaves this
+    /// false and keeps the prompt.
+    pub review_on_demand: bool,
 }
 
 // ── Internal types ──
@@ -108,8 +138,13 @@ struct ReviewInput<'a> {
 }
 
 enum DiffOutcome {
-    NoChanges,
-    UserSkipped,
+    /// The writer wrote no reviewable code this round, carrying the working
+    /// tree as it stands — which is what an answer is about, and is not
+    /// necessarily what was there before the round.
+    NoChanges(String),
+    /// The writer changed code and no review was run on it — either the user
+    /// said no, or the caller reviews on demand and was never asked.
+    NotReviewed,
     Review(String),
 }
 
@@ -238,11 +273,67 @@ pub fn review_only(
     emit_verdict(sink, &verdict);
     costs.summary();
 
-    let success = verdict.verdict == Verdict::Approved;
+    let approved = verdict.verdict == Verdict::Approved;
     Ok(OrchestratorResult {
-        success,
+        outcome: if approved { Outcome::Approved } else { Outcome::Stopped },
         rounds: 1,
-        message: if success { "approved".into() } else { "changes requested by AI".into() },
+        message: if approved { "approved".into() } else { "changes requested by AI".into() },
+        answer: None,
+    })
+}
+
+/// Reviews an answer a writer already gave, outside any loop — what a frontend
+/// runs when the user asks for a review of a task that produced no code. The
+/// diff is read fresh so the answer is judged against the tree as it stands.
+///
+/// `task` is the question the answer answered, not whatever the user typed when
+/// asking for the review; judging an answer against the wrong question is worse
+/// than not reviewing it. Anything typed rides along as an instruction instead.
+pub fn answer_review_only(
+    reviewer: &mut dyn ModelAdapter,
+    repo_dir: &Path,
+    task: &str,
+    answer: &str,
+    instruction: Option<&str>,
+    sink: &dyn Sink,
+) -> Result<OrchestratorResult> {
+    let diff = git::git_diff(repo_dir).unwrap_or_default();
+    let mut prompt = prompts::build_answer_review_prompt(
+        prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE,
+        task,
+        answer,
+        &changes_block(&diff),
+    );
+    if let Some(text) = instruction.map(str::trim).filter(|t| !t.is_empty()) {
+        prompt.push_str(&format!("\n\nUSER INSTRUCTION (authoritative):\n{}", text));
+    }
+
+    let mut costs = CostTracker::new(sink);
+    sink.event(Event::Working {
+        actor: reviewer.name().to_string(),
+        action: "reviewing the answer…".to_string(),
+    });
+    let (response, usage) = reviewer.generate(&prompt, &[])?;
+    costs.add(usage);
+
+    if !reviewer.streams_output() {
+        sink.event(Event::Response { model: reviewer.name().to_string(), text: response.clone() });
+    }
+
+    let verdict = policy::parse_verdict(&response);
+    emit_verdict(sink, &verdict);
+    costs.summary();
+
+    let approved = verdict.verdict == Verdict::Approved;
+    Ok(OrchestratorResult {
+        outcome: if approved { Outcome::Approved } else { Outcome::Stopped },
+        rounds: 1,
+        message: if approved {
+            "answer approved".into()
+        } else {
+            "changes requested on the answer".into()
+        },
+        answer: None,
     })
 }
 
@@ -279,9 +370,10 @@ fn plan_phase(
         sink.event(Event::Stopped { text: "Plan saved but not reviewed. Exiting.".into() });
         costs.summary();
         return Ok(PlanOutcome::Abort(OrchestratorResult {
-            success: false,
+            outcome: Outcome::Stopped,
             rounds: 0,
             message: "plan created, user skipped review".into(),
+            answer: None,
         }));
     }
 
@@ -307,9 +399,10 @@ fn plan_phase(
         sink.event(Event::Stopped { text: "Exiting without executing.".into() });
         costs.summary();
         return Ok(PlanOutcome::Abort(OrchestratorResult {
-            success: false,
+            outcome: Outcome::Stopped,
             rounds: 0,
             message: "plan reviewed, user chose not to execute".into(),
+            answer: None,
         }));
     }
 
@@ -368,28 +461,35 @@ fn execute_loop(
         report_stray_writes(session, opts.repo_dir, sink);
 
         match writer_diff_outcome(opts, reviewer.name(), &session.log, round, &diff_before, sink)? {
-            DiffOutcome::NoChanges if !answer_mode && round > 1 => {
+            DiffOutcome::NoChanges(_) if !answer_mode && round > 1 => {
                 sink.event(Event::Warn {
                     text: format!("{} made no changes in response to feedback", writer.name()),
                 });
                 stall.observe_no_changes();
             }
-            DiffOutcome::NoChanges => {
+            DiffOutcome::NoChanges(tree_diff) => {
                 answer_mode = true;
                 sink.event(Event::Info {
                     text: format!("{} answered without making code changes", writer.name()),
                 });
 
-                let wants_review = opts.auto
-                    || ask_yes_no(sink, &format!("review this answer with {}?", reviewer.name()));
-                if !wants_review {
+                if !wants_review(opts, reviewer.name(), "review this answer", sink) {
                     costs.summary();
-                    return Ok(ok_result(round, "completed — answer accepted without review"));
+                    return Ok(unreviewed_result(
+                        round,
+                        unreviewed_message(
+                            opts.review_on_demand, writer.name(), reviewer.name(), "answer",
+                        ),
+                        Some(writer_response.clone()),
+                    ));
                 }
 
                 let input = ReviewInput {
                     round,
-                    diff: "",
+                    // The answer wrote nothing, so the tree as it stands is the
+                    // material the answer is about — evidence the reviewer would
+                    // otherwise have to take on trust.
+                    diff: &tree_diff,
                     writer_notes: &writer_response,
                     clarification: clar.as_deref(),
                 };
@@ -444,10 +544,16 @@ fn execute_loop(
                     return Ok(ok_result(round, "user stopped after answer review"));
                 }
             }
-            DiffOutcome::UserSkipped => {
-                sink.event(Event::Success { text: "Task completed.".into() });
+            DiffOutcome::NotReviewed => {
+                sink.event(Event::Info { text: "Task completed without a review.".into() });
                 costs.summary();
-                return Ok(ok_result(round, "completed — user accepted without review"));
+                return Ok(unreviewed_result(
+                    round,
+                    unreviewed_message(
+                        opts.review_on_demand, writer.name(), reviewer.name(), "changes",
+                    ),
+                    None,
+                ));
             }
             DiffOutcome::Review(diff) => {
                 answer_mode = false;
@@ -530,9 +636,10 @@ fn execute_loop(
     costs.summary();
 
     Ok(OrchestratorResult {
-        success: false,
+        outcome: Outcome::Stopped,
         rounds: round,
         message: format!("stopped after {} rounds without full approval", round),
+        answer: None,
     })
 }
 
@@ -596,7 +703,7 @@ fn writer_diff_outcome(
     let diff_after = git::git_diff(opts.repo_dir)?;
 
     if !wrote_reviewable_code(diff_before, &diff_after) {
-        return Ok(DiffOutcome::NoChanges);
+        return Ok(DiffOutcome::NoChanges(diff_after));
     }
 
     log.write_diff(round, &diff_after)?;
@@ -606,11 +713,24 @@ fn writer_diff_outcome(
         sink.event(Event::Changes { stat });
     }
 
-    if opts.auto || ask_yes_no(sink, &format!("review changes with {}?", reviewer_name)) {
+    if wants_review(opts, reviewer_name, "review changes", sink) {
         Ok(DiffOutcome::Review(diff_after))
     } else {
-        Ok(DiffOutcome::UserSkipped)
+        Ok(DiffOutcome::NotReviewed)
     }
+}
+
+/// Whether a reviewer runs now. Auto mode always reviews; a caller that offers
+/// review as its own action never does, so the reviewer call is spent only when
+/// the user asks for it; everyone else is asked.
+fn wants_review(opts: &TaskOptions, reviewer_name: &str, action: &str, sink: &dyn Sink) -> bool {
+    if opts.auto {
+        return true;
+    }
+    if opts.review_on_demand {
+        return false;
+    }
+    ask_yes_no(sink, &format!("{} with {}?", action, reviewer_name))
 }
 
 fn run_review(
@@ -680,7 +800,10 @@ fn run_answer_review(
     sink: &dyn Sink,
 ) -> Result<ReviewOutcome> {
     let mut prompt = prompts::build_answer_review_prompt(
-        prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE, opts.task, input.writer_notes,
+        prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE,
+        opts.task,
+        input.writer_notes,
+        &changes_block(input.diff),
     );
     if let Some(text) = input.clarification {
         prompt.push_str(&format!("\n\nUSER CLARIFICATION (authoritative):\n{}", text));
@@ -847,6 +970,43 @@ fn load_prompt_template(path: &std::path::Path, default: &str, repo_dir: &Path) 
 /// The identity block plus the rules keeping the reviewer inside what the diff
 /// actually shows. Attached to every review prompt, so it reaches users whose
 /// `.duet/prompts/review.txt` predates the `{repo}` placeholder.
+/// Cap on the diff attached to an answer review. The diff is supporting
+/// evidence there, not the subject, so a large working tree is trimmed rather
+/// than billed in full — an answer review that costs more than the code review
+/// it stands in for defeats the point.
+const ANSWER_REVIEW_DIFF_BYTES: usize = 40_000;
+
+/// The working tree an answer is judged against, trimmed to the cap. Says so
+/// plainly when there is nothing, so the reviewer judges the prose alone
+/// instead of assuming evidence it was never given.
+fn changes_block(diff: &str) -> String {
+    if diff.trim().is_empty() {
+        return "(nothing uncommitted in the working tree — judge the answer on its own)".into();
+    }
+    match truncate_bytes(diff, ANSWER_REVIEW_DIFF_BYTES) {
+        (kept, false) => kept.to_string(),
+        (kept, true) => format!(
+            "{}\n\n[diff truncated at {} KB — later files are not shown. Judge only what is above, \
+             and say the diff is insufficient where it matters.]",
+            kept,
+            ANSWER_REVIEW_DIFF_BYTES / 1024,
+        ),
+    }
+}
+
+/// Cuts `text` to at most `cap` bytes on a character boundary. The flag says
+/// whether anything was dropped.
+fn truncate_bytes(text: &str, cap: usize) -> (&str, bool) {
+    if text.len() <= cap {
+        return (text, false);
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
 fn review_repo_block(dir: &Path) -> String {
     format!("{}\n{}", git::repo_identity(dir), prompts::REVIEW_GROUND_RULES)
 }
@@ -924,7 +1084,30 @@ fn report_stray_writes(session: &mut Session, primary: &Path, sink: &dyn Sink) {
 }
 
 fn ok_result(rounds: usize, message: &str) -> OrchestratorResult {
-    OrchestratorResult { success: true, rounds, message: message.into() }
+    OrchestratorResult { outcome: Outcome::Approved, rounds, message: message.into(), answer: None }
+}
+
+/// The work stands, but no reviewer ever judged it — reported as neither a pass
+/// nor a failure. `answer` carries the writer's text when the run produced one,
+/// so an on-demand review still has the thing it needs to judge.
+fn unreviewed_result(rounds: usize, message: String, answer: Option<String>) -> OrchestratorResult {
+    OrchestratorResult { outcome: Outcome::Unreviewed, rounds, message, answer }
+}
+
+/// Closing line for a run that ends with nothing reviewed. A terminal asked and
+/// was told no; a frontend with its own review action was never asked at all,
+/// so it is pointed at that action instead of being told it declined.
+fn unreviewed_message(
+    review_on_demand: bool,
+    writer: &str,
+    reviewer: &str,
+    subject: &str,
+) -> String {
+    if review_on_demand {
+        format!("{}'s {} stands unreviewed — run a review to have {} judge it", writer, subject, reviewer)
+    } else {
+        format!("review declined — {}'s {} stands unreviewed", writer, subject)
+    }
 }
 
 /// The closing line of an approved answer run. It names what was approved, and
@@ -978,6 +1161,93 @@ mod tests {
     #[test]
     fn a_trailing_separator_still_names_the_primary() {
         assert!(sibling_projects(Path::new("/w/api"), &dirs(&["/w/api/"])).is_empty());
+    }
+
+    /// An answer with no changes behind it must say so, or the reviewer reads
+    /// an empty section as evidence it was given and never looked at.
+    #[test]
+    fn an_empty_tree_is_named_rather_than_left_blank() {
+        let block = changes_block("   \n");
+        assert!(block.contains("nothing uncommitted"));
+    }
+
+    #[test]
+    fn a_diff_within_the_cap_is_attached_whole() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n+fn added() {}\n";
+        assert_eq!(changes_block(diff), diff);
+    }
+
+    /// A truncated diff must announce the truncation: a reviewer that thinks it
+    /// saw every file will report absences that are only missing from the cut.
+    #[test]
+    fn an_oversized_diff_is_cut_and_says_so() {
+        let diff = "x".repeat(ANSWER_REVIEW_DIFF_BYTES * 2);
+        let block = changes_block(&diff);
+        assert!(block.contains("diff truncated"));
+        assert!(block.len() < diff.len());
+    }
+
+    /// Records whether the loop stopped to ask, and answers yes if it did.
+    struct AskCounter {
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Sink for AskCounter {
+        fn event(&self, _event: Event) {}
+
+        fn ask(&self, _kind: AskKind, _question: &str) -> String {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            "y".into()
+        }
+    }
+
+    fn review_decision(auto: bool, review_on_demand: bool) -> (bool, usize) {
+        let config = Config::default();
+        let opts = TaskOptions {
+            config: &config,
+            task: "t",
+            images: &[],
+            repo_dir: Path::new("/w/api"),
+            workspace: &[],
+            continue_session: false,
+            auto,
+            plan_first: false,
+            review_on_demand,
+        };
+        let sink = AskCounter { asked: std::sync::atomic::AtomicUsize::new(0) };
+        let wants = wants_review(&opts, "gemini", "review changes", &sink);
+        (wants, sink.asked.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The panel offers its own review action, so the loop must not block on a
+    /// prompt — and must not spend a reviewer call the user never asked for.
+    #[test]
+    fn reviewing_on_demand_neither_asks_nor_reviews() {
+        assert_eq!(review_decision(false, true), (false, 0));
+    }
+
+    /// Auto mode is the two-brain loop: review every round, ask nothing.
+    #[test]
+    fn auto_mode_reviews_without_asking_even_on_demand() {
+        assert_eq!(review_decision(true, true), (true, 0));
+        assert_eq!(review_decision(true, false), (true, 0));
+    }
+
+    /// A terminal has no review button, so it is asked.
+    #[test]
+    fn a_terminal_run_is_asked_whether_to_review() {
+        assert_eq!(review_decision(false, false), (true, 1));
+    }
+
+    /// Cutting mid-character would panic on a slice; multi-byte diffs are
+    /// ordinary in comments and strings.
+    #[test]
+    fn truncation_lands_on_a_character_boundary() {
+        let text = "é".repeat(100);
+        let (kept, cut) = truncate_bytes(&text, 51);
+        assert!(cut);
+        assert_eq!(kept.len(), 50);
+        assert!(kept.chars().all(|c| c == 'é'));
     }
 
     const DIFF: &str = "diff --git a/src/lib.rs b/src/lib.rs\n+fn added() {}\n";

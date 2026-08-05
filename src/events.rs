@@ -5,6 +5,7 @@
 //! them as JSON lines for frontends (VS Code extension, future web UI).
 
 use crate::adapters::UsageStats;
+use crate::orchestrator::Outcome;
 use crate::ui;
 use serde::Serialize;
 use std::io::Write;
@@ -45,7 +46,7 @@ pub enum Event {
     Thinking { model: String },
     ToolAction { model: String, desc: String },
     Ask { id: u64, kind: AskKind, question: String },
-    TaskDone { success: bool, rounds: usize, message: String },
+    TaskDone { outcome: Outcome, rounds: usize, message: String },
     Error { message: String },
     Pong,
     Bye,
