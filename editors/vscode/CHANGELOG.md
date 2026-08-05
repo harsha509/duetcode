@@ -5,6 +5,20 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.0 - 2026-08-05
+
+Requires `dt` 0.2.0. From this release the extension and the CLI share a version
+number: they had drifted to 0.1.9 against 0.1.5, with nothing to say which
+pairs with which, so they are now released together.
+
+### Changed
+
+- **Blockers and suggestions appear in the panel.** They were always rendered
+  and always empty, because no prompt asked the reviewer to produce them —
+  fixed in `dt` 0.2.0, which is why this release requires it. A review now ends
+  with its findings listed as red blockers and yellow suggestions beneath the
+  verdict, instead of leaving them buried in the prose.
+
 ## 0.1.9 - 2026-08-05
 
 Requires `dt` 0.1.5 or newer for the prompt refresh described below.

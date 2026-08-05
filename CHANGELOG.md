@@ -8,6 +8,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.0 - 2026-08-05
+
+From this release the CLI and the VS Code extension share a version number.
+They were drifting apart — CLI 0.1.5 against extension 0.1.9 — which left no
+way to say which pairs with which.
+
+### Fixed
+
+- **The reviewer is finally asked for the findings the loop reads.** `BLOCKERS:`
+  and `SUGGESTIONS:` have always been parsed out of a review, and no prompt has
+  ever asked for them: across 22 real reviews, every one that was asked for a
+  `VERDICT:` line produced one, and not a single one produced a `BLOCKERS:`
+  section. So the list was always empty, and everything downstream of it was
+  dead — the stall detector could only notice a repeated *diff*, never a
+  repeated complaint, and the sidebar, panel, and `state.json` reported zero
+  blockers on every run ever recorded. Both review prompts now specify the
+  sections and say why the format matters.
+
+- **The review prompt no longer forbids what it asks for.** Step 5 asked the
+  reviewer to find "missing imports, unused variables, or incomplete refactors",
+  while the diff rules forbid claiming a symbol is missing or left over unless a
+  `-` line deletes it. The reviewer was told to look for something and then told
+  not to say it, so the most common regression of all — a caller the change
+  forgot to update — had no way to be reported. Suspicion about code outside the
+  diff is now explicitly welcome, phrased as a question with what would settle
+  it, rather than an assertion.
+
+- **An empty findings section stays empty.** The parser skipped a bullet reading
+  exactly `none`, so the ``- `none` `` and `- **None**` that reviewers actually
+  write became a blocker no one could fix — failing the run and then feeding the
+  stall detector a complaint that could never be resolved.
+
+### Added
+
+- **The reviewer checks the things a careful reviewer checks.** Correctness now
+  covers parameters, types, defaults, and units lining up across every call site
+  the diff touches — milliseconds against seconds, cents against dollars, ids
+  against uuids, local time against UTC. Two steps join the process: one for
+  design (single responsibility, honest names, no duplication, no dead code,
+  types that describe the data), held to the changed code rather than the code
+  around it; and one for whether the change can actually land, which catches work
+  that is circular by construction — a migration that only compiles once it has
+  run, a test gated on a feature gated on that test.
+
+- **The writer's notes are marked as a claim.** They are written by the author of
+  the code under review and were presented to the reviewer as context; a note
+  asserting something the diff does not show is now to be treated as unverified.
+
 ## 0.1.5 - 2026-08-05
 
 ### Fixed
