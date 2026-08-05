@@ -1,5 +1,9 @@
 # Releasing DT Duet to the VS Code Marketplace
 
+Tagging a release publishes the extension automatically — see
+[Automated publishing](#automated-publishing). The manual commands below still
+work, and are what to reach for when a publish needs to happen off-cycle.
+
 ## One-time setup
 
 1. **Azure DevOps org** — the marketplace authenticates through Azure DevOps.
@@ -19,7 +23,35 @@
    `"publisher"` field in `package.json` (`harsha509`). Display name and
    description are free-form.
 
-## Publishing a release
+## Automated publishing
+
+`.github/workflows/publish-extension.yml` publishes on the same
+`vX.Y.Z` tag that releases the CLI, since the two share a version number. It
+installs, compiles, checks the tag against `package.json`, lists what would be
+packaged, and publishes.
+
+Two things must exist for it to work:
+
+1. **Repository secret `VSCE_PAT`** — *Settings → Secrets and variables →
+   Actions → New repository secret*. Use the Azure DevOps PAT from the one-time
+   setup above, with **Marketplace → Manage** scope.
+
+2. **Environment `vscode-marketplace`** — *Settings → Environments → New
+   environment*. Add yourself under **Required reviewers**: the job then waits
+   for your approval on every run, so no tag publishes to the marketplace
+   without you saying yes. Without a reviewer the environment still works, but
+   the job runs unattended.
+
+A failed validation can be re-run from *Actions → Publish Extension → Run
+workflow*, which skips the tag check and publishes whatever version
+`package.json` names — no throwaway tag needed.
+
+The PAT is passed to `vsce` through the environment rather than `--pat`, which
+would leave it readable in the runner's process list. Rotate it when it expires
+(Azure DevOps PATs last at most a year) by updating the secret; nothing in the
+repository needs to change.
+
+## Publishing manually
 
 ```bash
 cd editors/vscode

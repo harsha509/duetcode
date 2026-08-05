@@ -1,0 +1,73 @@
+name: Publish Extension
+
+on:
+  push:
+    # The CLI and the extension share a version number, so one tag releases
+    # both: release.yml builds the binaries, this publishes the extension.
+    # Same digits-not-glob rule as release.yml — "v*.*.*" would also match the
+    # legacy vscode-vX.Y.Z tags and publish under the wrong one.
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  # Re-publish a version whose first attempt failed validation, without
+  # inventing a throwaway tag to do it.
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish to the VS Code Marketplace
+    runs-on: ubuntu-latest
+    # Gate: with required reviewers on this environment, GitHub asks for
+    # approval before the job runs. That is the safe form of "ask me every
+    # time" — a workflow_dispatch input would put the token in the run's
+    # metadata, where it is neither masked nor removable.
+    environment: vscode-marketplace
+    defaults:
+      run:
+        working-directory: editors/vscode
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile
+        run: npm run compile
+
+      # The marketplace refuses a version it has already accepted, so a
+      # mismatch here fails late and confusingly. Catch it before publishing.
+      - name: Check the tag matches package.json
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag $GITHUB_REF_NAME says $tag, package.json says $manifest" >&2
+            exit 1
+          fi
+          echo "publishing $manifest"
+
+      # The packaging check from RELEASING.md: surfaces anything .vscodeignore
+      # has stopped excluding before it ships to users.
+      - name: List what would be packaged
+        run: npx --yes @vscode/vsce ls
+
+      - name: Publish
+        # Passed by environment, never on the command line, where it would be
+        # readable in this runner's process list.
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -z "${VSCE_PAT:-}" ]; then
+            echo "VSCE_PAT is not set — add it as a repository secret" >&2
+            exit 1
+          fi
+          npx --yes @vscode/vsce publish
