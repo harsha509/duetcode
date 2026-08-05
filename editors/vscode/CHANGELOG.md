@@ -5,6 +5,41 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.1 - 2026-08-05
+
+Requires `dt` 0.2.1. The extension now tells the server which projects the
+workspace contains, and older servers reject that as an unknown command — so
+upgrading the extension without upgrading the binary shows an error on every
+task.
+
+### Fixed
+
+- **The project picker now decides where a task actually runs.** It set the
+  project a task was reported against, while the writer kept working in the
+  folder the server was started in — so choosing a second project edited the
+  first. Fixed in `dt` 0.2.1, which is why this release requires it.
+
+- **The picker keeps your choice when a folder is added or removed.** The list
+  was rebuilt from scratch on every workspace change, which quietly reset it to
+  the first project — and the picker decides where the next task writes.
+
+- **The picker is never left empty.** The project list was posted when the panel
+  was created, which can be before the webview is listening; a dropped list left
+  the composer with no project selected. The webview now asks for it once it is
+  ready.
+
+### Changed
+
+- **The whole workspace is declared to the server**, on startup and whenever
+  folders are added or removed. The update goes to the running server instead of
+  restarting it: a respawn would cost both models the context they have built up,
+  which is far too much to pay for a change of scope.
+
+- **Only settings that are baked into the server restart it.** Any `dt.*` change
+  used to force a respawn. Today every setting is a spawn-time one, so nothing
+  changes yet — but a future setting that is not can no longer cost a session
+  its context by accident.
+
 ## 0.2.0 - 2026-08-05
 
 Requires `dt` 0.2.0. From this release the extension and the CLI share a version

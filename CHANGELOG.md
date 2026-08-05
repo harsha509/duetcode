@@ -8,6 +8,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.1 - 2026-08-05
+
+A multi-root VS Code workspace used to be invisible to `dt`: the session was
+anchored to the first folder and nothing could move it. This release makes the
+session span the workspace, and fixes the two bugs that anchoring caused.
+
+### Fixed
+
+- **A task now runs in the project it says it is running in.** The composer's
+  project picker steered the diff, the checks, the session log, and the prompt's
+  "path:" line — but not the writer. The model was left standing in whichever
+  folder `dt serve` was spawned in, so picking a second project meant editing
+  the first one while `dt` diffed the second, found nothing, and reported no
+  changes to review. Both models now follow the task to its project.
+
+- **A failed call no longer costs the writer its session.** The CLI announces
+  its session id before doing any work, but a non-zero exit discarded the whole
+  response — id included — so a run that died partway through left nothing to
+  resume and the next task started cold. Worse, any failure while resuming was
+  read as "this session is broken": the id was dropped and the call immediately
+  retried, which for an account quota limit meant spending a second call to fail
+  the same way and losing the conversation permanently. The id is now recorded
+  whether or not the run succeeded, and only a resume the CLI never accepted —
+  visible as a run that never announced a session — earns a fresh start.
+
+- **Session ids are kept per project.** The CLI stores its sessions by working
+  directory, so one id shared across projects was looked up in the wrong place
+  on every switch. Each project keeps its own, and returning to an earlier
+  project resumes where it left off.
+
+### Added
+
+- **`dt serve` spans a workspace.** A new `workspace` command declares the
+  projects a session covers; frontends resend it when the set changes. It is a
+  command rather than a startup flag so adding a folder never forces a respawn,
+  which would throw away both models' accumulated context. A `review` that names
+  no directories now covers the whole workspace.
+
+- **Tasks can read their sibling projects.** The repository context names every
+  other project in the workspace with its path, branch, and changed files, and
+  the Claude CLI is granted them as additional readable roots — so research
+  across a front end and its back end sees both, instead of reasoning from the
+  one checkout it happens to write to. Siblings are explicitly marked read-only:
+  only the chosen project is diffed, checked, and reviewed.
+
+- **Edits outside the chosen project are reported.** Sibling worktrees are
+  recorded when the task begins and re-checked each round, so a change that
+  escapes the loop — reaching no reviewer and tripping no check — is announced
+  instead of passing silently. Recording the baseline first means edits that
+  were already sitting there are never blamed on the run.
+
+### Changed
+
+- **A task never silently picks the first folder.** An explicitly named project
+  still wins; otherwise the session uses the workspace's only git checkout, and
+  asks when there is more than one. Defaulting to "the first folder" is what
+  produced a task whose diff, checks, and log described a different project than
+  the one it edited.
+
 ## 0.2.0 - 2026-08-05
 
 From this release the CLI and the VS Code extension share a version number.
