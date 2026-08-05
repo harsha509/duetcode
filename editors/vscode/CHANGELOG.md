@@ -5,6 +5,22 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.1.9 - 2026-08-05
+
+Requires `dt` 0.1.5 or newer for the prompt refresh described below.
+
+### Added
+
+- **Findings are colour-coded.** A model's review arrived as one undifferentiated
+  block, so the blocking items and the nitpicks read alike and a reader had to
+  find the severity by reading everything. Lines that announce something — a
+  heading, or a list item with a bold lead-in — are now tinted red, yellow, or
+  green, and a classified heading lends its severity to the findings nested under
+  it. Body prose keeps the default colour, so the tint still means something.
+  Inheritance escalates but never clears: a green heading does not paint the
+  items beneath it green, because "nothing to do here" is the one claim this
+  must never invent.
+
 ## 0.1.8 - 2026-08-05
 
 Requires `dt` 0.1.2 or newer.
