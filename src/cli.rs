@@ -280,6 +280,10 @@ pub(crate) fn setup_task(
         anyhow::bail!("not a git repository — run `git init` first");
     }
 
+    // Before the config is read, so an upgraded binary reviews with its own
+    // prompts rather than the copy this project was initialised with.
+    crate::prompt_sync::sync(dir, sink.as_ref());
+
     let mut config = Config::load(dir).context("failed to load config")?;
     if let Some(model) = &overrides.claude {
         config.claude.model = model.clone();
@@ -341,8 +345,10 @@ fn cmd_review(dir: &Path, reviewer_name: &str, task: Option<&str>, verbose: bool
         anyhow::bail!("not a git repository");
     }
 
-    let config = Config::load(dir).context("failed to load config")?;
     let sink: Arc<dyn Sink> = Arc::new(TerminalSink::new(verbose));
+    crate::prompt_sync::sync(dir, sink.as_ref());
+
+    let config = Config::load(dir).context("failed to load config")?;
 
     let mut reviewer: Box<dyn ModelAdapter> = match reviewer_name.to_lowercase().as_str() {
         "gemini" => Box::new(GeminiAdapter::new(&config.gemini, sink.clone())?),

@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.1.5 - 2026-08-05
+
+### Fixed
+
+- **Upgrading `dt` now upgrades a project's prompts.** `dt init` copies the
+  built-in templates into `.duet/prompts/`, and the loader prefers those copies,
+  so every later improvement to a prompt stopped at the project boundary: a
+  repository initialised months ago kept reviewing with that month's prompt for
+  good, and nothing said so. Installing a new binary changed nothing, which made
+  improving a built-in prompt pointless for every existing project.
+
+  Each run now reconciles a project's copies against the templates the binary
+  shipped with, and what a file is decides what happens to it. A copy dt wrote
+  and nobody has touched is replaced with the current template. A copy that was
+  edited by hand is left alone — the edit is the point — and reported once per
+  version, not once per run. A copy predating this tracking, where authorship
+  cannot be known, is renamed aside to `<name>.bak` and brought current. A
+  manifest in `.duet/prompts/.manifest.json` records the fingerprint of what was
+  written, so "edited" means edited rather than merely "unlike today's
+  template". Projects with no `.duet/prompts/` are left untouched: adopting duet
+  is still `dt init`'s decision to make.
+
 ## 0.1.4 - 2026-08-05
 
 ### Fixed

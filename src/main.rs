@@ -7,6 +7,7 @@ mod git;
 mod logs;
 mod orchestrator;
 mod policy;
+mod prompt_sync;
 mod prompts;
 mod repl;
 mod serve;

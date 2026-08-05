@@ -138,6 +138,10 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                     path: target.dir.display().to_string(),
                 });
 
+                // Per project: a workspace folder keeps its own prompts, and a
+                // task runs against the folder the frontend named.
+                crate::prompt_sync::sync(&target.dir, sink.as_ref());
+
                 let own_config = project_config(&target, sink.as_ref());
                 let task_config = own_config.as_ref().unwrap_or(&config);
 
@@ -263,6 +267,8 @@ fn run_review(
             name: target.label.clone(),
             path: target.dir.display().to_string(),
         });
+
+        crate::prompt_sync::sync(&target.dir, sink);
 
         let own_config = project_config(target, sink);
         let config = own_config.as_ref().unwrap_or(session_config);
