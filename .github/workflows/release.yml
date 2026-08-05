@@ -3,7 +3,10 @@ name: Release
 on:
   push:
     tags:
-      - "v*.*.*"
+      # Digits, not "v*.*.*": that glob also matched the extension's own
+      # vscode-vX.Y.Z tags, so releasing the VS Code extension built and
+      # published the CLI binaries under an extension tag.
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 jobs:
   build-and-release:
