@@ -387,7 +387,19 @@ fn execute_loop(
                 last_checks_passed = true;
 
                 if review.approved() {
-                    sink.event(Event::Success { text: "Answer approved!".into() });
+                    let conclusion = policy::parse_answer_conclusion(&review.response);
+                    sink.event(Event::Success {
+                        text: format!(
+                            "{} approved {}'s answer — a verdict on the answer, not on the code it discusses",
+                            reviewer.name(),
+                            writer.name()
+                        ),
+                    });
+                    if let Some(text) = &conclusion {
+                        sink.event(Event::Info {
+                            text: format!("{}'s own conclusion stands: {}", writer.name(), text),
+                        });
+                    }
                     session.log.write_summary(&RunSummary {
                         task: opts.task,
                         writer: writer.name(),
@@ -398,7 +410,7 @@ fn execute_loop(
                         success: true,
                     })?;
                     costs.summary();
-                    return Ok(ok_result(round, "answer approved by reviewer"));
+                    return Ok(ok_result(round, &answer_approved_message(conclusion.as_deref())));
                 }
 
                 stall.observe_review(&review.verdict.blockers, "");
@@ -837,6 +849,20 @@ fn build_repo_context(dir: &Path) -> Result<String> {
 
 fn ok_result(rounds: usize, message: &str) -> OrchestratorResult {
     OrchestratorResult { success: true, rounds, message: message.into() }
+}
+
+/// The closing line of an approved answer run. It names what was approved, and
+/// carries the answer's own conclusion alongside, because that conclusion is
+/// frequently the opposite of an approval — a review answer that says "do not
+/// merge" earns an approving reviewer. Kept to one line: `dt serve` frontends
+/// render this message as a single row.
+fn answer_approved_message(conclusion: Option<&str>) -> String {
+    const BASE: &str = "answer approved by reviewer — a verdict on the answer, \
+                        not on the code it discusses";
+    match conclusion {
+        Some(text) => format!("{} · the answer's own conclusion: {}", BASE, text),
+        None => BASE.to_string(),
+    }
 }
 
 #[cfg(test)]

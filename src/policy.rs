@@ -95,6 +95,47 @@ fn is_bare_approval(line: &str) -> bool {
     words.trim().eq_ignore_ascii_case("approved")
 }
 
+/// Longest conclusion kept, in characters. It is displayed on one terminal
+/// line, and a reviewer that ignores "in one line" must not flood the screen.
+const MAX_CONCLUSION_CHARS: usize = 200;
+
+/// The reviewer's one-line restatement of what the reviewed *answer* concluded,
+/// from its `THEIR CONCLUSION:` line.
+///
+/// In answer mode the writer's output is often itself a verdict on someone
+/// else's code, so the reviewer's APPROVED and the answer's own conclusion can
+/// point opposite ways: an approved "do not merge this" is still "do not merge
+/// this". Callers show both, so the approval cannot be skimmed as an
+/// endorsement of the thing the answer is about.
+pub fn parse_answer_conclusion(raw: &str) -> Option<String> {
+    let text = raw
+        .lines()
+        .rev()
+        .find_map(|line| strip_label(line, "THEIR CONCLUSION:"))
+        .filter(|s| !s.is_empty())?;
+
+    if text.chars().count() <= MAX_CONCLUSION_CHARS {
+        return Some(text.to_string());
+    }
+    Some(format!("{}…", text.chars().take(MAX_CONCLUSION_CHARS).collect::<String>()))
+}
+
+/// Matches an `ALL CAPS:` label at the start of a line and returns the rest,
+/// tolerating the markdown a reviewer wraps it in — `**THEIR CONCLUSION:** x`,
+/// `- THEIR CONCLUSION: x`, `> Their conclusion: x`.
+fn strip_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+    debug_assert!(label.is_ascii(), "label is compared with eq_ignore_ascii_case");
+
+    let trimmed = line.trim_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '#' | '>' | '-'));
+    if !trimmed.is_char_boundary(label.len()) {
+        return None;
+    }
+
+    let (head, rest) = trimmed.split_at(label.len());
+    head.eq_ignore_ascii_case(label)
+        .then(|| rest.trim_matches(|c: char| c.is_whitespace() || c == '*'))
+}
+
 /// Strips one markdown list marker — `-`, `*`, `+`, `1.` or `1)` — returning
 /// the item text. Reviewers pick their own bullet style, and a blocker missed
 /// here is a blocker the stall detector and the escalation summary never see.
@@ -217,6 +258,38 @@ mod tests {
         for review in ["Looks good.\n\nAPPROVED", "Fine by me.\n\n**APPROVED**", "Ship it.\nApproved."] {
             assert_eq!(parse_verdict(review).verdict, Verdict::Approved, "missed: {review}");
         }
+    }
+
+    /// The approval covers the answer; this line covers what the answer said.
+    /// Losing it turns an approved "request changes" into a bare SUCCESS.
+    #[test]
+    fn answer_conclusion_is_read_through_markdown() {
+        for review in [
+            "THEIR CONCLUSION: Request changes — 3 blocking issues\nVERDICT: APPROVED",
+            "**THEIR CONCLUSION:** Request changes — 3 blocking issues\nVERDICT: APPROVED",
+            "- Their conclusion: Request changes — 3 blocking issues\nVERDICT: APPROVED",
+        ] {
+            assert_eq!(
+                parse_answer_conclusion(review).as_deref(),
+                Some("Request changes — 3 blocking issues"),
+                "missed: {review}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_empty_conclusion_is_none() {
+        assert_eq!(parse_answer_conclusion("Looks fine.\n\nVERDICT: APPROVED"), None);
+        assert_eq!(parse_answer_conclusion("THEIR CONCLUSION:\nVERDICT: APPROVED"), None);
+    }
+
+    /// A reviewer that ignores "in one line" must not flood the closing line.
+    #[test]
+    fn long_conclusion_is_truncated_on_a_char_boundary() {
+        let review = format!("THEIR CONCLUSION: {}\nVERDICT: APPROVED", "é".repeat(400));
+        let conclusion = parse_answer_conclusion(&review).expect("conclusion");
+        assert_eq!(conclusion.chars().count(), MAX_CONCLUSION_CHARS + 1);
+        assert!(conclusion.ends_with('…'));
     }
 
     /// Reviewers indent bullets under the header or use numbered lists. Dropping

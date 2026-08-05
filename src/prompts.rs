@@ -219,22 +219,40 @@ VERDICT: APPROVED
 VERDICT: CHANGES_REQUESTED
 "#;
 
-pub const DEFAULT_ANSWER_REVIEW_TEMPLATE: &str = r#"You are a senior engineer giving a second opinion. Another engineer investigated the repository and answered the question below. Verify their answer.
+pub const DEFAULT_ANSWER_REVIEW_TEMPLATE: &str = r#"You are a senior engineer giving a second opinion. Another engineer investigated the question below and wrote the answer that follows. Judge that answer.
 
 TASK / QUESTION: {task}
 
 THEIR ANSWER:
 {answer}
 
-Assess whether the reasoning is sound, internally consistent, and actually answers the question. If you are able to inspect the repository, verify the specific claims (files, line numbers, APIs) really exist and support the conclusions. Flag anything wrong, unverifiable, or missing. Do not make any code changes.
+Assess whether the reasoning is sound, internally consistent, and actually answers the question. Flag anything wrong, contradictory, or missing. Do not make any code changes.
+
+What you can and cannot check:
+- The question and the answer above are everything you have. You cannot open a repository, a file,
+  a pull request, or a URL, and you cannot run anything.
+- Never write "verified", "confirmed", "I checked", or any equivalent about a claim whose evidence
+  is not quoted in the answer itself. Restating a claim is not verifying it. Reporting verification
+  you did not perform is a failed review, however correct the claim later turns out to be.
+- You can still judge reasoning: conclusions that do not follow from the evidence given, internal
+  contradictions, parts of the question left unanswered, and claims asserted with more confidence
+  than their stated support carries.
 
 Rules:
 - NEVER run `git add`, `git commit`, or `git push`. You are a reviewer only.
-- Be direct. If the answer is accurate and complete, approve it.
+- Be direct. If the answer is sound and complete, approve it. Do not pad with generic praise.
 
-At the end, write one of these on its own line:
+Finish with exactly these three lines, in this order, each on its own line:
+
+UNVERIFIED: <the load-bearing claims you had to take on trust, comma-separated — or "none, the answer quotes its evidence">
+THEIR CONCLUSION: <the answer's own bottom line, in one line, in its words — what it decides or recommends>
 VERDICT: APPROVED
-VERDICT: CHANGES_REQUESTED
+
+Write `VERDICT: CHANGES_REQUESTED` on that last line instead when the answer is not sound.
+
+APPROVED judges this answer, and nothing else. It is not an endorsement of whatever the answer is
+about: if the answer recommends against merging a change, approving the answer means you agree that
+change should not be merged.
 "#;
 
 pub const DEFAULT_ANSWER_FIX_TEMPLATE: &str = r#"You are an expert software engineer. A reviewer checked the answer you gave and found issues. Revise your answer.

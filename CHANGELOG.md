@@ -8,7 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
-## 0.1.3 - 2026-08-01
+## 0.1.4 - 2026-08-05
+
+### Fixed
+
+- **An approved answer no longer reads as an approved change.** When the writer
+  answers instead of editing code, the reviewer judges that answer — but the run
+  ended on `Answer approved!` and a green `SUCCESS`, the same words used when a
+  diff is approved with checks passing. Asking `dt` to review a pull request and
+  getting back "request changes, three blocking issues" therefore closed with an
+  approval banner, and the tail of the log read as permission to merge. The
+  closing lines now name what was approved — `gemini approved claude's answer — a
+  verdict on the answer, not on the code it discusses` — and carry the answer's
+  own conclusion beside it, so an approved "do not merge this" still says so.
+
+### Changed
+
+- **The answer reviewer no longer claims verification it cannot perform.** The
+  review prompt invited it to "verify the specific claims … if you are able to
+  inspect the repository", while the reviewer is a plain API call with no
+  repository, file, or network access. Reviews came back asserting that files,
+  commits, and library behaviour had been confirmed when nothing had been opened,
+  which reads as corroboration and is worth less than nothing. The prompt now
+  states the reviewer's actual reach, forbids the language of verification for
+  anything not quoted in the answer itself, and requires the claims taken on
+  trust to be listed. It also spells out what an approval covers: the answer, and
+  not whatever the answer is about.
 
 ### Fixed
 
