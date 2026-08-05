@@ -5,6 +5,40 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.2 - 2026-08-05
+
+Requires `dt` 0.2.2. The panel no longer interrupts a task to ask whether to
+review — the review button decides that — and a model's code is finally set
+apart from its prose.
+
+### Added
+
+- **Code blocks are rendered as code.** Prose and code arrived as one
+  monospace wall in which neither could be read. A fenced block is now its own
+  card: labelled with its language, syntax-tinted, and scrolling sideways
+  instead of wrapping into something that reads like a sentence. Diffs carry
+  their own colouring — added, removed, hunk headers — and a symbol named
+  mid-sentence in backticks is marked so it is not read as a word.
+
+- **The review button reviews the last answer, not just the diff.** A task that
+  answers a question leaves nothing uncommitted, so the button had nothing to
+  judge and said so. The answer is now held per project until a review judges
+  it, and the button picks the review that fits what the task produced.
+
+### Changed
+
+- **No more "review this with gemini?" mid-task.** The panel has a review
+  button, so the task runs to the end and closes as `NO REVIEW` — grey, neither
+  a pass nor a failure. Press review when you want the second opinion. Auto mode
+  is unchanged: writer, reviewer, writer, every round, no clicking.
+
+### Fixed
+
+- **A `#` comment inside a shell or Python block is no longer read as a
+  heading.** The severity tinter treats `#` lines as markdown headings, so a
+  comment in a code block was tinted — and opened a section whose colour then
+  leaked onto everything after it. Code is now excluded from that pass.
+
 ## 0.2.1 - 2026-08-05
 
 Requires `dt` 0.2.1. The extension now tells the server which projects the

@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.2 - 2026-08-05
+
+A reviewer call is the expensive half of a run, and the loop used to interrupt
+every task to ask for one. Frontends with a review button of their own now skip
+the question entirely, and the review they eventually run is better armed.
+
+### Added
+
+- **A run can end unreviewed without being called a failure.** Declining a
+  review reported `SUCCESS` in green — the same word an approved run earns. The
+  outcome is now three-valued: approved, unreviewed, or stopped. `NO REVIEW` is
+  printed uncolored, and still exits 0, because declining a review is not an
+  error.
+
+- **`review_on_demand` for frontends that offer their own review action.** The
+  loop then never asks whether to review: it hands the work back unreviewed and
+  spends a reviewer call only when the user asks for one. `dt serve` sets it;
+  the terminal does not, since a prompt is the only route to a review there.
+
+- **Answers can be reviewed on their own.** `answer_review_only` judges an
+  answer a writer already gave, against the question it answered — the review a
+  frontend runs after a task that produced no diff, which the diff review has
+  nothing to work with.
+
+### Changed
+
+- **An answer review now sees the code the answer is about.** The reviewer was
+  given the question and the prose and nothing else, so every claim about the
+  repository had to be taken on trust. The working tree goes with it now, capped
+  at 40 KB and marked where it was cut, and the prompt asks the reviewer to
+  contradict the answer where the diff does not support it.
+
+### Fixed
+
+- **A reverted tree no longer shows the reviewer changes that do not exist.**
+  The answer review was handed the diff from before the round. A writer that
+  reverts its own work leaves an empty tree, and the reviewer was still shown
+  the old one.
+
 ## 0.2.1 - 2026-08-05
 
 A multi-root VS Code workspace used to be invisible to `dt`: the session was
