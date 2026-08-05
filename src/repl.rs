@@ -102,6 +102,8 @@ fn run_task(
         task: spec.task,
         images: spec.images,
         repo_dir: dir,
+        // Interactive sessions are anchored to the repo `dt` was started in.
+        workspace: &[],
         continue_session: false,
         auto,
         plan_first: spec.plan_first,

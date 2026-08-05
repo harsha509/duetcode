@@ -10,12 +10,12 @@ const INITIALIZE = 'Initialize';
 const NOT_NOW = 'Not now';
 
 /** Mirrors git::is_git_repo: a .git entry, directory or worktree file. */
-function isGitRepo(dir: string): boolean {
+export function isGitRepo(dir: string): boolean {
   return fs.existsSync(path.join(dir, '.git'));
 }
 
 /** `dt serve` bails at startup without this file, so it gates the prompt. */
-function isInitialized(dir: string): boolean {
+export function isInitialized(dir: string): boolean {
   return fs.existsSync(path.join(dir, '.duet', 'config.toml'));
 }
 

@@ -7,7 +7,7 @@ use crate::logs::{RunSummary, SessionLog};
 use crate::policy::{self, ReviewVerdict, Verdict};
 use crate::prompts;
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct OrchestratorResult {
     pub success: bool,
@@ -20,7 +20,12 @@ pub struct TaskOptions<'a> {
     pub config: &'a Config,
     pub task: &'a str,
     pub images: &'a [ImageInput],
+    /// The one checkout this task writes to: diffed, checked, and logged.
     pub repo_dir: &'a Path,
+    /// Every project in the workspace, so the task can read its siblings for
+    /// context. May include `repo_dir`; empty means a lone project, which is
+    /// how the plain CLI and a single-folder window run.
+    pub workspace: &'a [PathBuf],
     pub continue_session: bool,
     pub auto: bool,
     pub plan_first: bool,
@@ -34,6 +39,10 @@ struct Session {
     impl_template: String,
     review_template: String,
     fix_template: String,
+    /// What each sibling project's worktree looked like when the task began, so
+    /// a later change there is attributable to this run rather than to whatever
+    /// was already uncommitted.
+    stray_baseline: Vec<(PathBuf, String)>,
 }
 
 struct CostTracker<'a> {
@@ -169,7 +178,7 @@ pub fn run(
         max_rounds: opts.config.policy.max_rounds,
     });
 
-    let session = setup_session(opts, sink)?;
+    let mut session = setup_session(opts, sink)?;
     sink.event(Event::Info { text: format!("logs: {}", session.log.dir.display()) });
 
     let mut costs = CostTracker::new(sink);
@@ -183,7 +192,7 @@ pub fn run(
         None
     };
 
-    execute_loop(opts, writer, reviewer, &session, plan.as_deref(), &mut costs, sink)
+    execute_loop(opts, writer, reviewer, &mut session, plan.as_deref(), &mut costs, sink)
 }
 
 pub fn review_only(
@@ -311,7 +320,7 @@ fn execute_loop(
     opts: &TaskOptions,
     writer: &mut dyn ModelAdapter,
     reviewer: &mut dyn ModelAdapter,
-    session: &Session,
+    session: &mut Session,
     plan: Option<&str>,
     costs: &mut CostTracker,
     sink: &dyn Sink,
@@ -356,6 +365,7 @@ fn execute_loop(
         if !writer.streams_output() {
             sink.event(Event::Response { model: writer.name().to_string(), text: writer_response.clone() });
         }
+        report_stray_writes(session, opts.repo_dir, sink);
 
         match writer_diff_outcome(opts, reviewer.name(), &session.log, round, &diff_before, sink)? {
             DiffOutcome::NoChanges if !answer_mode && round > 1 => {
@@ -803,7 +813,14 @@ fn setup_session(opts: &TaskOptions, sink: &dyn Sink) -> Result<Session> {
         load_prompt_template(&config.prompts.fix, prompts::DEFAULT_FIX_TEMPLATE, repo_dir)?;
 
     let log = SessionLog::create(repo_dir, opts.task)?;
-    let mut repo_context = build_repo_context(repo_dir)?;
+    let mut repo_context = build_repo_context(repo_dir, opts.workspace)?;
+
+    // Snapshotted before the writer runs, so pre-existing edits in a sibling
+    // are never mistaken for something this task did.
+    let stray_baseline = sibling_projects(repo_dir, opts.workspace)
+        .into_iter()
+        .map(|dir| (dir.clone(), git::git_diff(dir).unwrap_or_default()))
+        .collect();
 
     if opts.continue_session {
         if let Some(last_session) = SessionLog::get_last_session(repo_dir)? {
@@ -815,7 +832,7 @@ fn setup_session(opts: &TaskOptions, sink: &dyn Sink) -> Result<Session> {
         }
     }
 
-    Ok(Session { log, repo_context, impl_template, review_template, fix_template })
+    Ok(Session { log, repo_context, impl_template, review_template, fix_template, stray_baseline })
 }
 
 fn load_prompt_template(path: &std::path::Path, default: &str, repo_dir: &Path) -> Result<String> {
@@ -834,17 +851,76 @@ fn review_repo_block(dir: &Path) -> String {
     format!("{}\n{}", git::repo_identity(dir), prompts::REVIEW_GROUND_RULES)
 }
 
-fn build_repo_context(dir: &Path) -> Result<String> {
-    let status = git::git_status(dir).unwrap_or_default();
+fn build_repo_context(primary: &Path, workspace: &[PathBuf]) -> Result<String> {
+    let status = git::git_status(primary).unwrap_or_default();
 
     // Same identity block the reviewer is given, so the writer acts on findings
     // about the checkout it is actually standing in.
-    let mut context = git::repo_identity(dir);
+    let mut context = git::repo_identity(primary);
     if !status.trim().is_empty() {
         context.push_str(&format!("working tree status:\n{}\n", status));
     }
 
+    // Siblings are named and located, so a task spanning several repos reasons
+    // from all of them instead of guessing at the ones it cannot see. They are
+    // marked read-only because only the primary is diffed, checked, reviewed,
+    // and logged — an edit anywhere else escapes the loop entirely.
+    let siblings = sibling_projects(primary, workspace);
+    if siblings.is_empty() {
+        return Ok(context);
+    }
+
+    context.push_str(
+        "\nother projects in this workspace — read them for context, but do NOT \
+         edit them. Every change you make belongs in the repository above:\n",
+    );
+    for dir in siblings {
+        context.push_str(&format!("\n{}", git::repo_identity(dir)));
+    }
+
     Ok(context)
+}
+
+/// Workspace projects other than the one being written to, in workspace order
+/// and without repeats. `workspace` may or may not list the primary itself, so
+/// both conventions collapse to the same answer here.
+fn sibling_projects<'a>(primary: &Path, workspace: &'a [PathBuf]) -> Vec<&'a PathBuf> {
+    let mut siblings: Vec<&PathBuf> = Vec::new();
+    for dir in workspace {
+        if dir.as_path() != primary && !siblings.contains(&dir) {
+            siblings.push(dir);
+        }
+    }
+    siblings
+}
+
+/// Warns when a round left changes in a project the task is not writing to.
+///
+/// The loop only ever diffs, reviews, and runs checks against the primary
+/// repository, so an edit in a sibling reaches no reviewer and trips no check.
+/// Reporting it turns a silent escape into a visible one. The baseline moves up
+/// afterwards, so each stray change is announced once rather than every round.
+fn report_stray_writes(session: &mut Session, primary: &Path, sink: &dyn Sink) {
+    for (dir, baseline) in &mut session.stray_baseline {
+        let current = git::git_diff(dir).unwrap_or_default();
+        if current == *baseline {
+            continue;
+        }
+        *baseline = current;
+
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        sink.event(Event::Warn {
+            text: format!(
+                "{} was modified, but this task writes to {} — changes there are \
+                 not reviewed, checked, or recorded in the session",
+                name,
+                primary.display(),
+            ),
+        });
+    }
 }
 
 fn ok_result(rounds: usize, message: &str) -> OrchestratorResult {
@@ -868,6 +944,41 @@ fn answer_approved_message(conclusion: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dirs(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    /// The workspace lists every project including the one being written to;
+    /// only the others are context.
+    #[test]
+    fn siblings_exclude_the_project_being_written_to() {
+        let workspace = dirs(&["/w/api", "/w/web"]);
+        let found = sibling_projects(Path::new("/w/api"), &workspace);
+        assert_eq!(found, vec![&PathBuf::from("/w/web")]);
+    }
+
+    #[test]
+    fn siblings_keep_workspace_order_without_repeats() {
+        let workspace = dirs(&["/w/web", "/w/api", "/w/web"]);
+        let found = sibling_projects(Path::new("/w/api"), &workspace);
+        assert_eq!(found, vec![&PathBuf::from("/w/web")]);
+    }
+
+    /// How the plain CLI, the REPL, and a single-folder window all run: the
+    /// same code path, with nothing beside the primary.
+    #[test]
+    fn a_lone_project_has_no_siblings() {
+        assert!(sibling_projects(Path::new("/w/api"), &[]).is_empty());
+        assert!(sibling_projects(Path::new("/w/api"), &dirs(&["/w/api"])).is_empty());
+    }
+
+    /// A trailing separator is the same directory, so it must not turn the
+    /// primary into its own sibling — which would warn about every edit.
+    #[test]
+    fn a_trailing_separator_still_names_the_primary() {
+        assert!(sibling_projects(Path::new("/w/api"), &dirs(&["/w/api/"])).is_empty());
+    }
 
     const DIFF: &str = "diff --git a/src/lib.rs b/src/lib.rs\n+fn added() {}\n";
     const STALE: &str = "diff --git a/.gitignore b/.gitignore\n+.duet/sessions/\n";

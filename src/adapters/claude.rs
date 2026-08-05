@@ -4,11 +4,31 @@ use crate::events::{Event, Sink};
 use crate::ui;
 use anyhow::{Context, Result};
 use colored::Colorize;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Whether a failed run means the stored session is unusable and the call
+/// should be retried from a fresh one.
+///
+/// Only a resume the CLI actually rejected qualifies, and that shows up as a
+/// run that never announced a session id. Every other failure — a quota limit,
+/// a dropped connection — happened *inside* a session that is still on disk and
+/// still resumable: retrying burns a second call to fail the same way, and
+/// dropping the id costs the task everything it had already done.
+fn should_restart_session(was_resuming: bool, connected: bool) -> bool {
+    was_resuming && !connected
+}
+
+/// Sibling projects to hand the CLI: everything readable except the working
+/// directory it already owns, and nothing that has since vanished — a stale
+/// workspace entry must not make every spawn fail.
+fn readable_extras<'a>(readable: &'a [PathBuf], working_dir: &Path) -> Vec<&'a PathBuf> {
+    readable.iter().filter(|dir| dir.as_path() != working_dir && dir.is_dir()).collect()
+}
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -21,9 +41,17 @@ pub struct ClaudeAdapter {
     use_api: bool,
     api_key: Option<String>,
     agent: Option<ureq::Agent>,
-    /// CLI session id captured from the first call; later calls `--resume` it
-    /// so Claude keeps its full context (files read, edits made, reasoning).
-    session_id: Option<String>,
+    /// CLI session ids keyed by the checkout they belong to; later calls in the
+    /// same project `--resume` theirs, so Claude keeps its full context (files
+    /// read, edits made, reasoning).
+    ///
+    /// Keyed rather than a single id because the CLI stores sessions per
+    /// working directory: resuming project A's id from project B looks it up in
+    /// the wrong place, and inherits a conversation about the wrong checkout.
+    /// A map also lets A → B → A pick A's own session back up.
+    sessions: HashMap<PathBuf, String>,
+    /// Sibling projects the CLI may read besides `working_dir`.
+    readable_dirs: Vec<PathBuf>,
     /// API-mode conversation history in Anthropic messages format.
     messages: Vec<serde_json::Value>,
     sink: Arc<dyn Sink>,
@@ -33,6 +61,30 @@ struct CliOutput {
     text: String,
     usage: UsageStats,
     session_id: Option<String>,
+}
+
+/// One CLI invocation, successful or not.
+///
+/// The session id is reported either way. The CLI announces it in `system/init`
+/// before doing any work, so a run that dies later — on a quota limit, say —
+/// still leaves a session on disk holding everything it did. Discarding the id
+/// with the error is what makes the writer forget a task it had already begun.
+struct CliAttempt {
+    session_id: Option<String>,
+    result: Result<CliOutput>,
+}
+
+impl CliAttempt {
+    /// A run that never got far enough to have a session.
+    fn failed(error: anyhow::Error) -> Self {
+        Self { session_id: None, result: Err(error) }
+    }
+
+    /// True when the CLI got as far as announcing its session, which means a
+    /// `--resume` was accepted.
+    fn connected(&self) -> bool {
+        self.session_id.is_some()
+    }
 }
 
 impl ClaudeAdapter {
@@ -75,10 +127,16 @@ impl ClaudeAdapter {
             use_api,
             api_key,
             agent,
-            session_id: None,
+            sessions: HashMap::new(),
+            readable_dirs: Vec::new(),
             messages: Vec::new(),
             sink,
         }
+    }
+
+    /// The stored session for the checkout the adapter currently points at.
+    fn current_session(&self) -> Option<&String> {
+        self.sessions.get(&self.working_dir)
     }
 
     fn emit_chunk(&self, started: &mut bool, text: &str) {
@@ -277,29 +335,44 @@ impl ClaudeAdapter {
     // ── CLI mode (spawn claude command, resume the session across calls) ──
 
     fn run_cli(&mut self, prompt: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
-        let resuming = self.session_id.is_some();
-        match self.run_cli_once(prompt, images) {
-            Err(e) if resuming => {
-                eprintln!("  {} could not resume session ({:#}) — starting fresh", "↻".yellow(), e);
-                self.session_id = None;
-                self.run_cli_once(prompt, images)
-            }
-            other => other,
+        let was_resuming = self.current_session().is_some();
+
+        let attempt = self.spawn_cli(prompt, images);
+        let connected = attempt.connected();
+        self.record_session(&attempt);
+
+        let error = match attempt.result {
+            Ok(CliOutput { text, usage, .. }) => return Ok((text, usage)),
+            Err(error) => error,
+        };
+
+        if !should_restart_session(was_resuming, connected) {
+            return Err(error);
         }
+
+        eprintln!("  {} could not resume session ({:#}) — starting fresh", "↻".yellow(), error);
+        self.sessions.remove(&self.working_dir);
+
+        let retry = self.spawn_cli(prompt, images);
+        self.record_session(&retry);
+        let CliOutput { text, usage, .. } = retry.result?;
+        Ok((text, usage))
     }
 
-    fn run_cli_once(&mut self, prompt: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
-        let output = if images.is_empty() {
+    fn spawn_cli(&self, prompt: &str, images: &[ImageInput]) -> CliAttempt {
+        if images.is_empty() {
             self.spawn_cli_text(prompt)
         } else {
             self.spawn_cli_images(prompt, images)
-        }?;
-
-        let CliOutput { text, usage, session_id } = output;
-        if session_id.is_some() {
-            self.session_id = session_id;
         }
-        Ok((text, usage))
+    }
+
+    /// Remembers the session this run belongs to, so the next task in the same
+    /// project resumes it — whether or not this run succeeded.
+    fn record_session(&mut self, attempt: &CliAttempt) {
+        if let Some(id) = &attempt.session_id {
+            self.sessions.insert(self.working_dir.clone(), id.clone());
+        }
     }
 
     fn base_cli_command(&self) -> Command {
@@ -314,13 +387,22 @@ impl ClaudeAdapter {
         if self.config.skip_permissions {
             cmd.arg("--dangerously-skip-permissions");
         }
-        if let Some(id) = &self.session_id {
+        // Variadic in the CLI, so every sibling project goes on one flag. Placed
+        // before the caller's `-p`, which ends the list.
+        let extra = readable_extras(&self.readable_dirs, &self.working_dir);
+        if !extra.is_empty() {
+            cmd.arg("--add-dir");
+            for dir in extra {
+                cmd.arg(dir);
+            }
+        }
+        if let Some(id) = self.current_session() {
             cmd.arg("--resume").arg(id);
         }
         cmd
     }
 
-    fn spawn_cli_text(&self, prompt: &str) -> Result<CliOutput> {
+    fn spawn_cli_text(&self, prompt: &str) -> CliAttempt {
         let mut cmd = self.base_cli_command();
         cmd.arg("-p")
             .arg(prompt)
@@ -333,18 +415,22 @@ impl ClaudeAdapter {
                 "  {} {} -p <prompt> --output-format stream-json{}",
                 "[verbose]".dimmed(),
                 self.config.command,
-                if self.session_id.is_some() { " --resume <session>" } else { "" },
+                if self.current_session().is_some() { " --resume <session>" } else { "" },
             );
         }
 
-        let mut child = cmd
+        let mut child = match cmd
             .spawn()
-            .with_context(|| format!("failed to execute '{}'", self.config.command))?;
+            .with_context(|| format!("failed to execute '{}'", self.config.command))
+        {
+            Ok(child) => child,
+            Err(e) => return CliAttempt::failed(e),
+        };
 
         self.finish_cli(&mut child)
     }
 
-    fn spawn_cli_images(&self, prompt: &str, images: &[ImageInput]) -> Result<CliOutput> {
+    fn spawn_cli_images(&self, prompt: &str, images: &[ImageInput]) -> CliAttempt {
         let mut content_parts = vec![serde_json::json!({
             "type": "text",
             "text": prompt
@@ -366,8 +452,11 @@ impl ClaudeAdapter {
             "content": content_parts
         });
 
-        let json_str = serde_json::to_string(&message)
-            .context("failed to serialize image payload")?;
+        let json_str = match serde_json::to_string(&message).context("failed to serialize image payload")
+        {
+            Ok(json) => json,
+            Err(e) => return CliAttempt::failed(e),
+        };
 
         let mut cmd = self.base_cli_command();
         cmd.arg("-p")
@@ -377,21 +466,37 @@ impl ClaudeAdapter {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = cmd
+        let mut child = match cmd
             .spawn()
-            .with_context(|| format!("failed to spawn '{}'", self.config.command))?;
+            .with_context(|| format!("failed to spawn '{}'", self.config.command))
+        {
+            Ok(child) => child,
+            Err(e) => return CliAttempt::failed(e),
+        };
 
         if let Some(ref mut stdin) = child.stdin {
-            stdin.write_all(json_str.as_bytes()).context("failed to write to claude stdin")?;
+            if let Err(e) = stdin.write_all(json_str.as_bytes()).context("failed to write to claude stdin")
+            {
+                return CliAttempt::failed(e);
+            }
         }
         drop(child.stdin.take());
 
         self.finish_cli(&mut child)
     }
 
-    fn finish_cli(&self, child: &mut Child) -> Result<CliOutput> {
-        let output = self.stream_cli_json(child)?;
-        let status = child.wait().context("failed to wait for claude")?;
+    fn finish_cli(&self, child: &mut Child) -> CliAttempt {
+        let output = match self.stream_cli_json(child) {
+            Ok(output) => output,
+            Err(e) => return CliAttempt::failed(e),
+        };
+        // Read off the parsed output, so a failure below still reports it.
+        let session_id = output.session_id.clone();
+
+        let status = match child.wait().context("failed to wait for claude") {
+            Ok(status) => status,
+            Err(e) => return CliAttempt { session_id, result: Err(e) },
+        };
         let stderr = collect_stderr(child);
 
         if self.verbose && !stderr.is_empty() {
@@ -406,10 +511,13 @@ impl ClaudeAdapter {
             } else {
                 "no output (claude may need authentication — run `claude` interactively first)".to_string()
             };
-            anyhow::bail!("claude CLI exited with {}: {}", status, details);
+            return CliAttempt {
+                session_id,
+                result: Err(anyhow::anyhow!("claude CLI exited with {}: {}", status, details)),
+            };
         }
 
-        Ok(output)
+        CliAttempt { session_id, result: Ok(output) }
     }
 
     fn describe_tool_action(tool: &str, input: Option<&serde_json::Value>) -> String {
@@ -745,11 +853,61 @@ impl ModelAdapter for ClaudeAdapter {
     fn streams_output(&self) -> bool {
         true
     }
+
+    /// Sessions are keyed by checkout, so moving here simply looks up this
+    /// project's own session — project A's is neither resumed nor lost, and
+    /// coming back to A resumes exactly where A left off.
+    fn set_working_dir(&mut self, dir: &Path) {
+        self.working_dir = dir.to_path_buf();
+    }
+
+    fn set_readable_dirs(&mut self, dirs: &[PathBuf]) {
+        self.readable_dirs = dirs.to_vec();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The case that made the writer forget a half-finished research task: the
+    /// CLI connected, worked, then died on an account quota limit. The session
+    /// holds everything it did, so it must survive to be resumed.
+    #[test]
+    fn a_failure_after_connecting_keeps_the_session() {
+        assert!(!should_restart_session(true, true));
+    }
+
+    /// The only failure a fresh start actually fixes.
+    #[test]
+    fn a_resume_the_cli_never_accepted_starts_fresh() {
+        assert!(should_restart_session(true, false));
+    }
+
+    /// Nothing to fall back to, so a first-call failure is just a failure —
+    /// retrying it would only spend a second call.
+    #[test]
+    fn a_first_call_is_never_retried() {
+        assert!(!should_restart_session(false, false));
+        assert!(!should_restart_session(false, true));
+    }
+
+    /// The CLI already owns its working directory; granting it again would be
+    /// noise, and on some paths an outright error.
+    #[test]
+    fn the_working_directory_is_not_granted_twice() {
+        let working = std::env::temp_dir();
+        assert!(readable_extras(std::slice::from_ref(&working), &working).is_empty());
+    }
+
+    /// A folder removed from disk since the workspace was declared must not
+    /// make every later spawn fail.
+    #[test]
+    fn a_project_that_no_longer_exists_is_dropped() {
+        let present = std::env::temp_dir();
+        let readable = vec![PathBuf::from("/dt-no-such-workspace-project"), present.clone()];
+        assert_eq!(readable_extras(&readable, Path::new("/elsewhere")), vec![&present]);
+    }
 
     #[test]
     fn short_ascii_is_returned_unchanged() {

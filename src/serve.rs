@@ -1,11 +1,17 @@
 //! `dt serve` — JSON-lines protocol for GUI frontends (VS Code extension).
 //!
 //! Commands arrive on stdin, one JSON object per line:
-//!   {"cmd":"task","task":"...","auto":true,"images":["/path.png"]}
+//!   {"cmd":"workspace","projects":["/proj-a","/proj-b"]}
+//!   {"cmd":"task","task":"...","auto":true,"dir":"/proj-a","images":["/p.png"]}
 //!   {"cmd":"plan","task":"..."}
 //!   {"cmd":"review","task":"optional context","dirs":["/proj-a","/proj-b"]}
 //!   {"cmd":"answer","id":3,"value":"y"}        // reply to an "ask" event
 //!   {"cmd":"ping"} / {"cmd":"quit"}
+//!
+//! `workspace` declares the projects the session spans; frontends resend it
+//! whenever the set changes. It is a command rather than a startup flag so a
+//! folder being added never costs a respawn, which would throw away both
+//! models' accumulated context.
 //!
 //! Events stream to stdout as JSON lines (see `events::Event`); stderr is
 //! free-form logging. Adapters are constructed once per serve process, so
@@ -38,16 +44,19 @@ struct Command {
     id: Option<u64>,
     #[serde(default)]
     value: Option<String>,
-    /// Projects a review covers. A multi-root workspace sends every folder so
-    /// one clean project never hides the changes sitting in another; omitted
-    /// or empty means the serve directory alone.
+    /// Projects a review covers, when it should differ from the session's
+    /// workspace. Omitted or empty means the whole workspace, so one clean
+    /// project never hides the changes sitting in another.
     #[serde(default)]
     dirs: Option<Vec<String>>,
-    /// Project a task or plan runs in. Lets a fix land in the project the
-    /// review was about rather than always the serve directory; omitted means
-    /// the serve directory.
+    /// Project a task or plan writes to. Lets a fix land in the project the
+    /// review was about; omitted means the session picks one (see
+    /// `task_target`).
     #[serde(default)]
     dir: Option<String>,
+    /// Projects the session spans, sent by the `workspace` command.
+    #[serde(default)]
+    projects: Option<Vec<String>>,
 }
 
 /// Serializes events as JSON lines on stdout; asks block until the frontend
@@ -105,10 +114,20 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
         version: env!("CARGO_PKG_VERSION").to_string(),
     });
 
+    // Until a frontend declares otherwise, the session spans the one project it
+    // was started in — which is exactly how the plain CLI behaves.
+    let mut workspace: Vec<PathBuf> = vec![dir.to_path_buf()];
+
     for cmd in cmd_rx {
         match cmd.cmd.as_str() {
             "ping" => sink.event(Event::Pong),
             "quit" => break,
+            "workspace" => {
+                workspace = workspace_projects(&cmd, dir);
+                sink.event(Event::Info {
+                    text: format!("workspace: {}", describe_projects(&workspace)),
+                });
+            }
             "task" | "plan" => {
                 let Some(task) = cmd.task.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
                     sink.event(Event::Error { message: "missing 'task' field".into() });
@@ -123,7 +142,7 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                     }
                 };
 
-                let target = match task_target(&cmd, dir) {
+                let target = match task_target(&cmd, &workspace, sink.as_ref()) {
                     Ok(target) => target,
                     Err(message) => {
                         sink.event(Event::Error { message });
@@ -145,11 +164,18 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                 let own_config = project_config(&target, sink.as_ref());
                 let task_config = own_config.as_ref().unwrap_or(&config);
 
+                // Both models follow the task to its project: the writer edits
+                // there, and a CLI-backed reviewer reads the same checkout.
+                // Without this the picker would only steer the diff, leaving
+                // the models standing in whichever project serve started in.
+                aim_adapters(&target.dir, &workspace, writer.as_mut(), reviewer.as_mut());
+
                 let opts = TaskOptions {
                     config: task_config,
                     task,
                     images: &images,
                     repo_dir: &target.dir,
+                    workspace: &workspace,
                     continue_session: false,
                     auto: cmd.auto.unwrap_or(false),
                     plan_first: cmd.cmd == "plan",
@@ -164,7 +190,9 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                     Err(e) => sink.event(Event::Error { message: format!("{:#}", e) }),
                 }
             }
-            "review" => run_review(&config, reviewer.as_mut(), dir, &cmd, sink.as_ref()),
+            "review" => {
+                run_review(&config, reviewer.as_mut(), &workspace, &cmd, sink.as_ref());
+            }
             other => {
                 sink.event(Event::Error { message: format!("unknown command '{}'", other) });
             }
@@ -176,6 +204,7 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
 }
 
 /// One project a review covers: where it lives and how the UI labels it.
+#[derive(Debug)]
 struct ReviewTarget {
     dir: PathBuf,
     label: String,
@@ -183,38 +212,123 @@ struct ReviewTarget {
 
 impl ReviewTarget {
     fn new(dir: PathBuf) -> Self {
-        let label = dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| dir.display().to_string());
+        let label = project_label(&dir);
         Self { dir, label }
     }
 }
 
-/// Every project the frontend asked for, falling back to the serve directory
-/// when it sent none (plain `dt serve` clients and single-folder workspaces).
-fn review_targets(cmd: &Command, default_dir: &Path) -> Vec<ReviewTarget> {
+/// How a project is named in prompts to the user: its folder name, falling back
+/// to the full path when there is no final component.
+fn project_label(dir: &Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
+}
+
+/// The workspace a `workspace` command declares. Blank entries are dropped and
+/// repeats collapsed; an empty list falls back to the serve directory, so a
+/// frontend can never leave the session with nowhere to run.
+fn workspace_projects(cmd: &Command, default_dir: &Path) -> Vec<PathBuf> {
+    let mut projects: Vec<PathBuf> = Vec::new();
+    for path in cmd.projects.as_deref().unwrap_or_default() {
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let dir = PathBuf::from(path);
+        if !projects.contains(&dir) {
+            projects.push(dir);
+        }
+    }
+    if projects.is_empty() {
+        projects.push(default_dir.to_path_buf());
+    }
+    projects
+}
+
+fn describe_projects(projects: &[PathBuf]) -> String {
+    projects.iter().map(|dir| project_label(dir)).collect::<Vec<_>>().join(", ")
+}
+
+/// Every project the frontend asked for, falling back to the session's
+/// workspace when a `review` command names none.
+fn review_targets(cmd: &Command, workspace: &[PathBuf]) -> Vec<ReviewTarget> {
     match cmd.dirs.as_deref() {
         Some(dirs) if !dirs.is_empty() => {
             dirs.iter().map(|dir| ReviewTarget::new(PathBuf::from(dir))).collect()
         }
-        _ => vec![ReviewTarget::new(default_dir.to_path_buf())],
+        _ => workspace.iter().cloned().map(ReviewTarget::new).collect(),
     }
 }
 
-/// The project a task runs in: the requested one when the frontend named it,
-/// otherwise the serve directory. Rejects anything that is not a git checkout
-/// rather than writing into an unrelated folder.
-fn task_target(cmd: &Command, default_dir: &Path) -> Result<ReviewTarget, String> {
-    let Some(requested) = cmd.dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) else {
-        return Ok(ReviewTarget::new(default_dir.to_path_buf()));
-    };
-
-    let target = ReviewTarget::new(PathBuf::from(requested));
-    if !git::is_git_repo(&target.dir) {
-        return Err(format!("'{}' is not a git repository — cannot run a task there", requested));
+/// The project a task writes to.
+///
+/// An explicit `dir` always wins. Otherwise the session picks the workspace's
+/// only git checkout, and asks when there is more than one — deliberately never
+/// defaulting to "the first folder", which is how a task ends up editing one
+/// project while its diff, checks, and session log describe another.
+fn task_target(
+    cmd: &Command,
+    workspace: &[PathBuf],
+    sink: &dyn Sink,
+) -> Result<ReviewTarget, String> {
+    if let Some(requested) = cmd.dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        let target = ReviewTarget::new(PathBuf::from(requested));
+        if !git::is_git_repo(&target.dir) {
+            return Err(format!("'{}' is not a git repository — cannot run a task there", requested));
+        }
+        return Ok(target);
     }
-    Ok(target)
+
+    let candidates: Vec<ReviewTarget> = workspace
+        .iter()
+        .filter(|dir| git::is_git_repo(dir))
+        .cloned()
+        .map(ReviewTarget::new)
+        .collect();
+
+    match candidates.len() {
+        0 => Err("no git repository in this workspace — cannot run a task".to_string()),
+        1 => Ok(candidates.into_iter().next().expect("one candidate")),
+        _ => choose_target(candidates, sink),
+    }
+}
+
+/// Asks which project to write to, matching the reply against project names
+/// first and full paths second.
+fn choose_target(candidates: Vec<ReviewTarget>, sink: &dyn Sink) -> Result<ReviewTarget, String> {
+    let names = candidates.iter().map(|t| t.label.as_str()).collect::<Vec<_>>().join(", ");
+    let answer =
+        sink.ask(AskKind::Text, &format!("which project should this task write to? ({})", names));
+    let answer = answer.trim().to_string();
+
+    if answer.is_empty() {
+        return Err(format!(
+            "no project chosen — name one of: {}, or pick one in the composer",
+            names
+        ));
+    }
+
+    // Paths compare as paths, not as text: `/w/api/` and `/w/api` are the same
+    // project, and a pasted path very often carries the trailing separator.
+    candidates
+        .into_iter()
+        .find(|t| t.label.eq_ignore_ascii_case(&answer) || t.dir.as_path() == Path::new(&answer))
+        .ok_or_else(|| format!("'{}' is not a project in this workspace ({})", answer, names))
+}
+
+/// Points both models at the project a task or review is about, and offers the
+/// rest of the workspace as readable context.
+fn aim_adapters<'a>(
+    target: &Path,
+    workspace: &[PathBuf],
+    writer: &'a mut dyn ModelAdapter,
+    reviewer: &'a mut dyn ModelAdapter,
+) {
+    for adapter in [writer, reviewer] {
+        adapter.set_working_dir(target);
+        adapter.set_readable_dirs(workspace);
+    }
 }
 
 /// A project's own `.duet/config.toml` when it has one, so each project keeps
@@ -248,11 +362,11 @@ struct ReviewTally {
 fn run_review(
     session_config: &Config,
     reviewer: &mut dyn ModelAdapter,
-    default_dir: &Path,
+    workspace: &[PathBuf],
     cmd: &Command,
     sink: &dyn Sink,
 ) {
-    let targets = review_targets(cmd, default_dir);
+    let targets = review_targets(cmd, workspace);
     let multi = targets.len() > 1;
     let mut tally = ReviewTally::default();
 
@@ -269,6 +383,11 @@ fn run_review(
         });
 
         crate::prompt_sync::sync(&target.dir, sink);
+
+        // A CLI-backed reviewer reads the checkout it is judging, so it moves
+        // with the loop instead of staying where serve started.
+        reviewer.set_working_dir(&target.dir);
+        reviewer.set_readable_dirs(workspace);
 
         let own_config = project_config(target, sink);
         let config = own_config.as_ref().unwrap_or(session_config);
@@ -398,4 +517,102 @@ fn load_images(paths: &[String]) -> Result<Vec<ImageInput>> {
         .iter()
         .map(|p| ImageInput::load(std::path::PathBuf::from(p)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(projects: Option<Vec<&str>>, dirs: Option<Vec<&str>>) -> Command {
+        let owned = |v: Vec<&str>| v.into_iter().map(str::to_string).collect();
+        Command {
+            cmd: "workspace".into(),
+            projects: projects.map(owned),
+            dirs: dirs.map(owned),
+            ..Default::default()
+        }
+    }
+
+    fn targets(dirs: &[&str]) -> Vec<ReviewTarget> {
+        dirs.iter().map(|d| ReviewTarget::new(PathBuf::from(d))).collect()
+    }
+
+    /// Answers whatever it was built with, so the choice logic can be exercised
+    /// without a frontend on the other end.
+    struct StubSink(&'static str);
+
+    impl Sink for StubSink {
+        fn event(&self, _event: Event) {}
+        fn ask(&self, _kind: AskKind, _question: &str) -> String {
+            self.0.to_string()
+        }
+    }
+
+    #[test]
+    fn a_workspace_drops_blanks_and_repeats() {
+        let cmd = command(Some(vec!["/a", "", "  ", "/b", "/a"]), None);
+        assert_eq!(
+            workspace_projects(&cmd, Path::new("/fallback")),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+    }
+
+    /// A frontend must not be able to leave the session with nowhere to run.
+    #[test]
+    fn an_empty_workspace_falls_back_to_the_serve_directory() {
+        let cmd = command(Some(vec![" "]), None);
+        assert_eq!(workspace_projects(&cmd, Path::new("/fallback")), vec![PathBuf::from("/fallback")]);
+    }
+
+    #[test]
+    fn a_review_without_dirs_covers_the_whole_workspace() {
+        let workspace = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let found = review_targets(&command(None, None), &workspace);
+        assert_eq!(found.iter().map(|t| t.dir.clone()).collect::<Vec<_>>(), workspace);
+    }
+
+    #[test]
+    fn a_review_with_dirs_covers_exactly_those() {
+        let workspace = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let found = review_targets(&command(None, Some(vec!["/b"])), &workspace);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].dir, PathBuf::from("/b"));
+    }
+
+    #[test]
+    fn a_project_can_be_chosen_by_name() {
+        let chosen = choose_target(targets(&["/w/api", "/w/web"]), &StubSink("web")).expect("chosen");
+        assert_eq!(chosen.dir, PathBuf::from("/w/web"));
+    }
+
+    #[test]
+    fn a_project_can_be_chosen_by_path() {
+        let chosen =
+            choose_target(targets(&["/w/api", "/w/web"]), &StubSink("/w/api")).expect("chosen");
+        assert_eq!(chosen.dir, PathBuf::from("/w/api"));
+    }
+
+    /// A pasted path usually carries the trailing separator, and it names the
+    /// same project either way.
+    #[test]
+    fn a_pasted_path_matches_despite_a_trailing_separator() {
+        let chosen =
+            choose_target(targets(&["/w/api", "/w/web"]), &StubSink("/w/web/")).expect("chosen");
+        assert_eq!(chosen.dir, PathBuf::from("/w/web"));
+    }
+
+    /// Guessing on an unrecognised answer is how a task ends up writing to the
+    /// wrong repo, so the run stops instead.
+    #[test]
+    fn an_unrecognised_answer_names_the_real_projects() {
+        let err = choose_target(targets(&["/w/api", "/w/web"]), &StubSink("mobile")).unwrap_err();
+        assert!(err.contains("mobile"), "{}", err);
+        assert!(err.contains("api") && err.contains("web"), "{}", err);
+    }
+
+    #[test]
+    fn no_answer_is_not_a_choice() {
+        let err = choose_target(targets(&["/w/api", "/w/web"]), &StubSink("  ")).unwrap_err();
+        assert!(err.contains("no project chosen"), "{}", err);
+    }
 }

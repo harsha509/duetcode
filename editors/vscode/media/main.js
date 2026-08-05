@@ -367,6 +367,7 @@
 
   /** Fill the project picker from the workspace folders the extension sent. */
   function setProjects(projects) {
+    const chosen = projectSel.value;
     projectSel.innerHTML = '';
     for (const p of projects) {
       const opt = el('option', null, p.name);
@@ -374,6 +375,10 @@
       projectSel.appendChild(opt);
     }
     projectSel.classList.toggle('hidden', projects.length < 2);
+    // Rebuilding the options resets the picker to the first project. Restoring
+    // the choice matters because the picker decides where a task writes: a
+    // folder added mid-session must not silently redirect the next task.
+    selectProject(chosen);
   }
 
   /** Select `path` if the picker knows it; ignored when it does not. */
@@ -454,4 +459,9 @@
         break;
     }
   });
+
+  // The panel posts the project list as soon as it is constructed, which can be
+  // before this script is listening. Asking once we are means the picker is
+  // never left empty — and an empty picker means a task with no chosen project.
+  vscode.postMessage({ type: 'ready' });
 })();

@@ -74,6 +74,10 @@ export class DuetPanel {
 
   private onMessage(msg: any): void {
     switch (msg.type) {
+      case 'ready':
+        // The webview finished loading; replay the list it may have missed.
+        this.postProjects();
+        break;
       case 'task': {
         const cmd: Record<string, unknown> = {
           cmd: msg.plan ? 'plan' : 'task',

@@ -65,11 +65,17 @@ export class ServeClient implements vscode.Disposable {
   constructor(
     /** Settings snapshot taken at spawn time, so restart() picks up changes. */
     private readonly optionsProvider: () => ServeOptions,
-    private readonly cwd: string,
+    /** Read per spawn: the folder set can change between one server and the next. */
+    private readonly cwdProvider: () => string,
     /** Extra env (API keys from SecretStorage) injected at spawn time. */
     private readonly envProvider: () => Promise<Record<string, string>> = async () => ({}),
     /** Runs before each spawn, to set up projects the server would bail on. */
     private readonly prepare: (binPath: string) => Promise<void> = async () => {},
+    /**
+     * Commands written ahead of anything queued, re-sent on every spawn so a
+     * restarted server is told about the workspace before it runs a task.
+     */
+    private readonly handshakeProvider: () => unknown[] = () => [],
   ) {}
 
   /** Kill the server; the next send() respawns it with fresh secrets. */
@@ -107,7 +113,7 @@ export class ServeClient implements vscode.Disposable {
       args.push('--gemini-model', opts.geminiModel);
     }
     const proc = spawn(opts.binPath, args, {
-      cwd: this.cwd,
+      cwd: this.cwdProvider(),
       env: { ...process.env, ...extraEnv },
     });
     this.proc = proc;
@@ -148,12 +154,32 @@ export class ServeClient implements vscode.Disposable {
       this.proc = undefined;
       this._onExit.fire(code);
     });
+
+    // Written here rather than via send(), which would await ensureStarted()
+    // and deadlock inside start(). Going out first also guarantees the server
+    // knows the workspace before the command that made us spawn arrives.
+    for (const cmd of this.handshakeProvider()) {
+      this.write(cmd);
+    }
   }
 
   send(obj: unknown): void {
-    void this.ensureStarted().then(() => {
-      this.proc?.stdin.write(JSON.stringify(obj) + '\n');
-    });
+    void this.ensureStarted().then(() => this.write(obj));
+  }
+
+  /**
+   * Update a running server, starting nothing. Adding a workspace folder must
+   * not launch `dt serve` on its own — if none is running, the handshake will
+   * carry the change into the next spawn anyway.
+   */
+  notify(obj: unknown): void {
+    if (this.proc) {
+      this.write(obj);
+    }
+  }
+
+  private write(obj: unknown): void {
+    this.proc?.stdin.write(JSON.stringify(obj) + '\n');
   }
 
   dispose(): void {

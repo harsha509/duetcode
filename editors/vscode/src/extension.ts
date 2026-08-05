@@ -1,14 +1,37 @@
 import * as vscode from 'vscode';
-import { ensureInitialized } from './init';
+import { ensureInitialized, isGitRepo, isInitialized } from './init';
 import { DuetPanel } from './panel';
 import { ServeClient } from './serveClient';
 import { SessionsProvider } from './sessions';
 import { secretEnv } from './settings';
 import { SettingsPanel } from './settingsPanel';
 
-export function activate(ctx: vscode.ExtensionContext): void {
-  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+/** Settings baked into the `dt serve` process, so changing one needs a respawn. */
+const SPAWN_SETTINGS = ['dt.binaryPath', 'dt.writer', 'dt.claudeModel', 'dt.geminiModel'];
 
+/** Absolute path of every folder in the workspace, in workspace order. */
+function workspaceProjects(): string[] {
+  return (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
+}
+
+/**
+ * Where `dt serve` is spawned. The server loads a config and checks for a git
+ * repo at startup, so an uninitialized first folder would make it exit 1 before
+ * it could be told about the workspace — pick a folder that satisfies it. The
+ * first folder remains the fallback so an unsatisfiable workspace still fails
+ * with the server's own message rather than a silently different one.
+ */
+function serveCwd(): string {
+  const projects = workspaceProjects();
+  return (
+    projects.find((dir) => isGitRepo(dir) && isInitialized(dir)) ??
+    projects.find(isGitRepo) ??
+    projects[0] ??
+    process.cwd()
+  );
+}
+
+export function activate(ctx: vscode.ExtensionContext): void {
   const provider = new SessionsProvider();
   ctx.subscriptions.push(vscode.window.registerTreeDataProvider('dtSessions', provider));
 
@@ -22,17 +45,28 @@ export function activate(ctx: vscode.ExtensionContext): void {
         geminiModel: cfg.get('geminiModel', ''),
       };
     },
-    root ?? process.cwd(),
+    serveCwd,
     () => secretEnv(ctx),
     (binPath) => ensureInitialized(ctx, binPath),
+    () => [{ cmd: 'workspace', projects: workspaceProjects() }],
   );
   ctx.subscriptions.push(client);
 
-  // Settings only take effect on a fresh `dt serve` spawn; restart so the
-  // next task picks up a changed writer, model, or binary path.
+  // A folder added or removed changes which projects a task may read and write.
+  // Sent to the running server rather than restarting it: a respawn would drop
+  // both models' accumulated context for what is only a change of scope.
+  ctx.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      client.notify({ cmd: 'workspace', projects: workspaceProjects() });
+    }),
+  );
+
+  // Spawn-time settings only take effect on a fresh `dt serve`; restart so the
+  // next task picks up a changed writer, model, or binary path. Other dt
+  // settings must not restart — that would cost the session its context.
   ctx.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('dt')) {
+      if (SPAWN_SETTINGS.some((setting) => e.affectsConfiguration(setting))) {
         client.restart();
       }
     }),

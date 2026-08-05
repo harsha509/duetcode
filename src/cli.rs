@@ -328,6 +328,8 @@ fn cmd_task(dir: &Path, args: TaskArgs) -> Result<()> {
         task: &args.task,
         images: &images,
         repo_dir: dir,
+        // The plain CLI runs in one checkout; there is no workspace around it.
+        workspace: &[],
         continue_session: args.continue_session,
         auto: args.auto || config.policy.auto,
         plan_first: args.plan_first,

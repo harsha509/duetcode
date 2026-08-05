@@ -3,7 +3,7 @@ pub mod gemini;
 pub mod pricing;
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Cap on remembered conversation turns (user + model messages).
 pub(crate) const MAX_HISTORY_TURNS: usize = 12;
@@ -96,6 +96,16 @@ pub trait ModelAdapter {
     fn streams_output(&self) -> bool {
         false
     }
+
+    /// Point the adapter at the project the next task writes to. Adapters that
+    /// drive a tool inside the checkout run it there; API-only adapters, which
+    /// never touch the filesystem, ignore it.
+    fn set_working_dir(&mut self, _dir: &Path) {}
+
+    /// Projects the adapter may also read, beyond the working directory. Lets a
+    /// task in a multi-root workspace consult its sibling repos instead of
+    /// reasoning from the one checkout it happens to write to.
+    fn set_readable_dirs(&mut self, _dirs: &[PathBuf]) {}
 }
 
 #[cfg(test)]
