@@ -5,6 +5,33 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.6 - 2026-08-06
+
+Requires `dt` 0.2.6. A pull request review now says go or no-go before it says
+anything else, and a running task can be stopped rather than trampled.
+
+### Added
+
+- **A go/no-go card above a pull request review.** When a task names a GitHub
+  pull request, `dt` 0.2.6 asks the writer to open with a verdict, and the panel
+  lifts it into a card at the top of the answer: `✓ GO` or `✕ NO-GO`, the
+  blocker and warning counts, then each finding as one plain sentence. The full
+  analysis follows underneath, unchanged. Only a block at the very start of an
+  answer is lifted — the words appear in ordinary review prose too, and a card
+  assembled from sentences scattered through the analysis would be a different,
+  worse review than the one the model wrote.
+- **A stop button for a running task.** It appears in the Sessions toolbar only
+  while something is running, and ends the task by taking `dt serve` down with
+  it — the protocol has no cancel, so a task owns the server until it finishes.
+  The timeline closes with `STOPPED` rather than falling silent.
+
+### Changed
+
+- **+ (New Task) will not discard a running task.** It now refuses while one is
+  in flight and says so, offering **Stop It** for when that is what you meant.
+  Previously it restarted the models underneath a live task without asking,
+  ending it mid-round.
+
 ## 0.2.5 - 2026-08-06
 
 Requires `dt` 0.2.5. The CLI is unchanged — it shares a version number with the

@@ -33,7 +33,11 @@ You give a task
   against the change itself rather than against whatever is checked out. If the
   change cannot be fetched, the review is refused instead of run against the
   wrong revision — install and authenticate [`gh`](https://cli.github.com), or
-  check the branch out locally, and run it again.
+  check the branch out locally, and run it again. The answer opens with a
+  verdict — `GO` or `NO-GO`, then a `BLOCKER:`/`WARNING:` line per finding in
+  one plain sentence each — so the merge decision is readable without working
+  through the analysis first. Give the full URL: `owner/repo#123` is a label dt
+  prints, not one it reads.
 - Both models keep context: the Claude CLI session is resumed across rounds
   (`--resume`), and API-mode Claude and Gemini carry capped message history.
 - Flip roles anytime with `--writer gemini`.

@@ -51,6 +51,18 @@ dt "add input validation" --auto
 
 **Questions about a pull request:** name the pull requests in the task ("review https://github.com/acme/api/pull/529") and dt fetches their diffs with `gh pr diff`, so the reviewer judges the answer against the change rather than against your current branch. Without a fetchable change the review is refused rather than run against the wrong revision — `gh pr checkout <number>`, or authenticate `gh`, and try again.
 
+The answer to a pull request task opens with a verdict block, before any analysis:
+
+```
+VERDICT: NO-GO
+BLOCKER: Saved credentials break when the key and the agent id are in different scopes.
+WARNING: Redaction can corrupt a tool schema that has a parameter named "token".
+```
+
+`NO-GO` whenever there is at least one `BLOCKER`. Each line is one plainly worded sentence, so the merge decision is readable on its own; the full analysis follows underneath, unchanged. Anything the writer only suspects is kept out of the block and raised in the analysis. The VS Code panel renders the block as a summary card.
+
+Use the full URL. The trigger is the same detector that fetches the diff, and it reads `github.com/owner/repo/pull/123` only — `owner/repo#123` is a label dt prints, never one it parses, so a task written that way gets neither the verdict block nor a fetched diff.
+
 **Role flip / images / continuity:**
 ```bash
 dt "fix bug" --writer gemini          # Gemini writes, Claude reviews

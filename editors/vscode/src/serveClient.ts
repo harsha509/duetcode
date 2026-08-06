@@ -60,7 +60,60 @@ export class ServeClient implements vscode.Disposable {
   private readonly _onExit = new vscode.EventEmitter<number | null>();
   readonly onExit = this._onExit.event;
 
+  /** Whether a task is holding the server. See `trackRunning`. */
+  private running = false;
+  private readonly _onRunningChanged = new vscode.EventEmitter<boolean>();
+  readonly onRunningChanged = this._onRunningChanged.event;
+
   private starting?: Promise<void>;
+
+  get isRunning(): boolean {
+    return this.running;
+  }
+
+  private setRunning(running: boolean): void {
+    if (this.running === running) {
+      return;
+    }
+    this.running = running;
+    this._onRunningChanged.fire(running);
+  }
+
+  /**
+   * Follows a task's life through the event stream, which is the only place it
+   * is visible: the serve loop is busy from `task_started` until it reports an
+   * outcome, and an `error` ends the task that raised it — the server emits one
+   * and moves to the next command rather than carrying on with the same task.
+   */
+  private trackRunning(event: { event?: string }): void {
+    if (event.event === 'task_started') {
+      this.setRunning(true);
+    } else if (event.event === 'task_done' || event.event === 'error') {
+      this.setRunning(false);
+    }
+  }
+
+  /**
+   * Ends the running task by taking the server down with it.
+   *
+   * The protocol has no cancel — a task owns the serve loop until it finishes —
+   * so stopping means killing the process. The panel is told the task is over
+   * here, because the exit that would otherwise say so is deliberately silenced
+   * by `restart()`.
+   */
+  stop(): void {
+    if (!this.proc) {
+      return;
+    }
+    this.restart();
+    this._onEvent.fire({
+      event: 'task_done',
+      outcome: 'stopped',
+      rounds: 0,
+      // The panel prefixes this with the outcome, so it must not repeat it.
+      message: "ended at your request — both models' context went with the server",
+    });
+  }
 
   constructor(
     /** Settings snapshot taken at spawn time, so restart() picks up changes. */
@@ -82,6 +135,9 @@ export class ServeClient implements vscode.Disposable {
   restart(): void {
     const proc = this.proc;
     this.proc = undefined;
+    // Whatever was running died with the process. Cleared before the early
+    // return so a client that never spawned cannot be left claiming otherwise.
+    this.setRunning(false);
     // A partial line from the dead server would otherwise prefix — and
     // invalidate — the first event the next one writes.
     this.buffer = '';
@@ -141,11 +197,14 @@ export class ServeClient implements vscode.Disposable {
         if (!line) {
           continue;
         }
+        let event: { event?: string };
         try {
-          this._onEvent.fire(JSON.parse(line));
+          event = JSON.parse(line);
         } catch {
-          // non-JSON noise on stdout; ignore
+          continue; // non-JSON noise on stdout
         }
+        this.trackRunning(event);
+        this._onEvent.fire(event);
       }
     });
 
@@ -155,6 +214,7 @@ export class ServeClient implements vscode.Disposable {
 
     proc.on('error', (err: NodeJS.ErrnoException) => {
       this.proc = undefined;
+      this.setRunning(false);
       this._onEvent.fire({
         event: 'error',
         message: startupErrorMessage(err, opts.binPath),
@@ -165,6 +225,9 @@ export class ServeClient implements vscode.Disposable {
     });
     proc.on('exit', (code) => {
       this.proc = undefined;
+      // A crash mid-task ends the task, and leaving `running` set would lock
+      // out the new-session button with nothing left to be running.
+      this.setRunning(false);
       this._onExit.fire(code);
     });
 

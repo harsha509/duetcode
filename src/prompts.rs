@@ -43,6 +43,39 @@ Then, while reviewing:
   is insufficient to judge and ask for the file — do not guess.
 - Cite the file path with any line number you give, and only for lines present in the diff."#;
 
+/// Asked for only when the task names pull requests, where the question really
+/// being put is "does this merge?" — and several screens of correct, careful
+/// analysis do not answer it. The detail is what makes the review worth having;
+/// the block is what makes it usable without reading all of it first.
+///
+/// Prefixed lines rather than a fenced block or an HTML comment: the panel can
+/// lift them into a summary card, and they still read as plain text in the
+/// terminal, where there is nothing to lift them into.
+pub const PR_VERDICT_BLOCK: &str = r#"REQUIRED — because this task is about pull requests, your reply must OPEN with a
+verdict block, before any heading, preamble, or analysis:
+
+VERDICT: GO
+or
+VERDICT: NO-GO
+
+then one line per finding, most serious first, using exactly these prefixes:
+
+BLOCKER: <what breaks, in one plain sentence>
+WARNING: <what is risky but not merge-blocking, in one plain sentence>
+
+Rules for the block:
+- NO-GO if there is at least one BLOCKER. GO if there are none.
+- One sentence per line, plainly worded — a reader who has not opened the diff
+  must understand what is wrong and why it matters. Name the file or PR if it
+  helps them find it; do not paste code, stack traces, or line ranges.
+- No BLOCKER or WARNING line for something you only suspect. If it is
+  unverified, leave it out of the block and raise it in the analysis below.
+- Nothing else in the block: no bullets, no bold, no sub-headings.
+
+Then a blank line, and your full analysis exactly as you would have written it —
+same depth, same evidence, same structure. The block summarises that analysis;
+it does not replace it."#;
+
 /// Appends a `{key}` section to a template that lacks the placeholder, so
 /// prompt files written before the placeholder existed still receive the
 /// content. Appended rather than prefixed: instructions closest to the end of

@@ -242,6 +242,76 @@ pre.prose .pl.ok { color: var(--vscode-charts-green); }
   margin-bottom: 4px;
 }
 
+/* PR verdict card. Pinned above the analysis it summarises, and deliberately
+   the loudest thing in the column: the whole point is answering "does this
+   merge?" without reading the several screens underneath it. */
+.pr-verdict {
+  margin: 10px 0;
+  border: 1px solid var(--vscode-panel-border);
+  border-left: 4px solid var(--vscode-charts-red);
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background);
+  padding: 10px 12px;
+}
+
+.pr-verdict.go {
+  border-left-color: var(--vscode-charts-green);
+}
+
+.pr-verdict-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pr-verdict-badge {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  color: var(--vscode-charts-red);
+}
+
+.pr-verdict.go .pr-verdict-badge {
+  color: var(--vscode-charts-green);
+}
+
+.pr-verdict-counts {
+  opacity: 0.75;
+  font-size: 12px;
+}
+
+.pr-verdict-group {
+  margin: 10px 0 4px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.6;
+}
+
+/* Hanging indent, so a finding that wraps stays visually one item. */
+.pr-verdict-item {
+  padding: 2px 0 2px 16px;
+  text-indent: -16px;
+  line-height: 1.5;
+}
+
+.pr-verdict-item::before {
+  display: inline-block;
+  width: 16px;
+  text-indent: 0;
+}
+
+.pr-verdict-item.bad::before {
+  content: '✕';
+  color: var(--vscode-charts-red);
+}
+
+.pr-verdict-item.warn::before {
+  content: '~';
+  color: var(--vscode-charts-yellow);
+}
+
 #input {
   width: 100%;
   box-sizing: border-box;

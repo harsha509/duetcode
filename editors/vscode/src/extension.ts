@@ -31,6 +31,27 @@ function serveCwd(): string {
   );
 }
 
+const STOP_IT = 'Stop It';
+
+/**
+ * Turns the new-session button away while a task is running, and offers the one
+ * thing that would make it possible.
+ *
+ * The task cannot survive a new session — there is no second server to move it
+ * to — and interrupting one to start another is how a round's work is lost
+ * halfway through it.
+ */
+async function warnTaskStillRunning(): Promise<void> {
+  const choice = await vscode.window.showWarningMessage(
+    'A task is still running. Let it finish before starting a new session — a new ' +
+      'session restarts the models, which would end this task mid-round.',
+    STOP_IT,
+  );
+  if (choice === STOP_IT) {
+    await vscode.commands.executeCommand('dt.stopTask');
+  }
+}
+
 export function activate(ctx: vscode.ExtensionContext): void {
   const provider = new SessionsProvider();
   ctx.subscriptions.push(vscode.window.registerTreeDataProvider('dtSessions', provider));
@@ -74,6 +95,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   ctx.subscriptions.push(
     vscode.commands.registerCommand('dt.newTask', () => {
+      // Refused rather than confirmed while a task runs: a new session kills
+      // the server the task is running in, and waiting is nearly always what
+      // was meant. Stopping is offered inside the warning for when it is not.
+      if (client.isRunning) {
+        void warnTaskStillRunning();
+        return;
+      }
       // A new session starts clean on both counts the user can see: the old
       // panel closes with its timeline, and `dt serve` is killed so neither
       // model resumes the conversation the previous session left it in.
@@ -83,11 +111,26 @@ export function activate(ctx: vscode.ExtensionContext): void {
       client.restart();
       DuetPanel.createOrShow(ctx, client);
     }),
+    vscode.commands.registerCommand('dt.stopTask', () => {
+      if (!client.isRunning) {
+        void vscode.window.showInformationMessage('DT Duet: no task is running.');
+        return;
+      }
+      client.stop();
+    }),
     vscode.commands.registerCommand('dt.refreshSessions', () => provider.refresh()),
     vscode.commands.registerCommand('dt.openSession', (dir: string) => {
       DuetPanel.createOrShow(ctx, client).showHistory(dir);
     }),
     vscode.commands.registerCommand('dt.settings', () => SettingsPanel.createOrShow(ctx, client)),
+  );
+
+  // Gates the stop button on there being something to stop, so the toolbar
+  // carries it only while a task is actually running.
+  ctx.subscriptions.push(
+    client.onRunningChanged((running) => {
+      void vscode.commands.executeCommand('setContext', 'dt.running', running);
+    }),
   );
 
   ctx.subscriptions.push(watchSessions(provider));

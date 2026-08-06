@@ -11,8 +11,13 @@ tests and linters, and you watch both sides of the conversation live.
 - **Duet panel** — per round, the writer's stream (tool actions, code,
   explanation) stacks above the reviewer's block (check results, review,
   verdict with blockers), each full-width.
+- **Go/no-go card on pull request reviews** — name a GitHub pull request URL in
+  the task and the answer opens with `✓ GO` or `✕ NO-GO`, blocker and warning
+  counts, and one plain sentence per finding, above the full analysis.
 - **Sessions sidebar** — every past run from `.duet/sessions`, with outcome
   icons; click to replay any session round by round, patches included.
+- **Stop, without losing the room** — a running task can be stopped from the
+  sidebar toolbar, and **+** refuses to discard one that is still going.
 - **Task composer** — type a task, toggle `auto` (models loop unattended
   until mutual approval) or `plan` (plan → review → approve → execute).
 - **Screenshots** — attach with the picker or **paste directly with Cmd+V**;
@@ -47,9 +52,10 @@ tests and linters, and you watch both sides of the conversation live.
 
 1. Open a git project (accept the `dt init` prompt if it appears).
 2. Click the DT Duet icon in the activity bar.
-3. Hit **+** (New Task), type what you want, press Enter. **+** always starts a
-   fresh session: it closes the open panel and clears both models' context, so
-   nothing from the previous task carries over.
+3. Hit **+** (New Task), type what you want, press Enter. **+** starts a fresh
+   session: it closes the open panel and clears both models' context, so nothing
+   from the previous task carries over. With a task still running it declines
+   and offers to stop that task first.
 4. Watch Claude write and Gemini review; answer prompts with the buttons.
 
 Settings live behind the **⚙ gear** (sidebar title or panel): API keys,

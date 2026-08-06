@@ -706,6 +706,15 @@ fn build_writer_prompt(
         prompts::build_fix_prompt(&session.fix_template, task, feedback.unwrap_or_default())
     };
 
+    // Every round, not just the first: a fix round rewrites the answer, and one
+    // that dropped the block would leave the panel with nothing to summarise.
+    // Appended for the reason `ensure_placeholder` documents — the end of a
+    // prompt is the part models actually follow.
+    if wants_pr_verdict(task) {
+        prompt.push_str("\n\n");
+        prompt.push_str(prompts::PR_VERDICT_BLOCK);
+    }
+
     if let Some(text) = clarification {
         prompt.push_str(&format!(
             "\n\nUSER CLARIFICATION (authoritative — follow this over any conflicting review feedback):\n{}",
@@ -713,6 +722,17 @@ fn build_writer_prompt(
         ));
     }
     prompt
+}
+
+/// Whether the task is asking about pull requests, and so has a go/no-go answer
+/// worth stating plainly.
+///
+/// Keyed on a pull request being *named*, which is a cheap scan of the task
+/// text — no `gh`, no network. A task that merely edits code is left alone: a
+/// verdict header on "add a retry to the upload path" answers nothing, and
+/// asking for one invites the writer to frame ordinary work as a judgement.
+fn wants_pr_verdict(task: &str) -> bool {
+    !review_subject::pull_requests(task).is_empty()
 }
 
 /// Whether this round produced code worth sending to the reviewer.
@@ -1412,6 +1432,37 @@ mod tests {
 
     fn dirs(paths: &[&str]) -> Vec<PathBuf> {
         paths.iter().map(PathBuf::from).collect()
+    }
+
+    /// The verdict block answers "does this merge?", which is only a question
+    /// when a pull request is on the table.
+    #[test]
+    fn only_a_task_naming_a_pull_request_asks_for_a_verdict() {
+        assert!(wants_pr_verdict(
+            "review https://github.com/acme/api/pull/542 and tell me if it is safe"
+        ));
+        assert!(wants_pr_verdict(
+            "compare github.com/acme/api/pull/542 with github.com/acme/web/pull/462"
+        ));
+    }
+
+    /// Ordinary work must not be pushed into a pass/fail frame: "GO" answers
+    /// nothing about a task that was never a judgement.
+    #[test]
+    fn ordinary_work_is_left_alone() {
+        assert!(!wants_pr_verdict("add a retry to the upload path"));
+        assert!(!wants_pr_verdict("why is the checkout test flaky?"));
+        assert!(!wants_pr_verdict("fix the bug from ticket 542"));
+    }
+
+    /// The gate is the same detector that fetches the diff, so it inherits the
+    /// requirement for a real github.com URL. `owner/repo#n` is a label this
+    /// code *prints*, never one it reads — a task written that way gets no
+    /// verdict block, and would get no fetched diff either.
+    #[test]
+    fn the_shorthand_label_is_not_a_pull_request_reference() {
+        assert!(!wants_pr_verdict("look at acme/api#542"));
+        assert!(!wants_pr_verdict("review PR #542"));
     }
 
     /// A reviewer that fails the test if it is ever called. The gate's whole

@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.6 - 2026-08-06
+
+A review of a pull request could be several screens of correct, careful analysis
+and still not answer the question that was asked: does this merge? The findings
+were all there, spread through prose, each one needing the diff open to parse.
+
+### Added
+
+- **A task about a pull request opens with a verdict.** When the task names a
+  GitHub pull request, the writer is now required to lead with a short block
+  before any analysis — `VERDICT: GO` or `VERDICT: NO-GO`, then one
+  `BLOCKER:` or `WARNING:` line per finding, each a single plainly worded
+  sentence a reader who has not opened the diff can act on. Anything merely
+  suspected is kept out of the block and raised in the analysis instead, so the
+  summary never carries a finding the reviewer did not stand behind.
+
+  The analysis itself is unchanged — same depth, same evidence. The block
+  summarises it; it does not replace it. Plain prefixed lines rather than a
+  fenced block, so it reads as text in the terminal and the VS Code panel can
+  lift it into a summary card.
+
+  The trigger is the same detector that fetches the diff, so it needs a real
+  `github.com/owner/repo/pull/123` URL. `owner/repo#123` is a label dt prints,
+  never one it reads — a task written that way gets neither the verdict block
+  nor a fetched diff. Ordinary tasks are untouched: a `GO` header answers
+  nothing about "add a retry to the upload path", and asking for one would only
+  push routine work into a pass/fail frame.
+
 ## 0.2.5 - 2026-08-06
 
 No changes to the CLI. The version is shared with the VS Code extension and both

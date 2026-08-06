@@ -2,7 +2,7 @@
   "name": "dt-duet",
   "displayName": "DT Duet — AI Pair Programming",
   "description": "Claude writes, Gemini reviews — run and watch the duet from VS Code.",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "publisher": "harsha509",
   "license": "MIT",
   "icon": "media/logo.png",
@@ -50,6 +50,11 @@
         "icon": "$(add)"
       },
       {
+        "command": "dt.stopTask",
+        "title": "DT: Stop Running Task",
+        "icon": "$(debug-stop)"
+      },
+      {
         "command": "dt.refreshSessions",
         "title": "DT: Refresh Sessions",
         "icon": "$(refresh)"
@@ -67,19 +72,24 @@
     "menus": {
       "view/title": [
         {
+          "command": "dt.stopTask",
+          "when": "view == dtSessions && dt.running",
+          "group": "navigation@0"
+        },
+        {
           "command": "dt.newTask",
           "when": "view == dtSessions",
-          "group": "navigation"
+          "group": "navigation@1"
         },
         {
           "command": "dt.refreshSessions",
           "when": "view == dtSessions",
-          "group": "navigation"
+          "group": "navigation@2"
         },
         {
           "command": "dt.settings",
           "when": "view == dtSessions",
-          "group": "navigation"
+          "group": "navigation@3"
         }
       ]
     },

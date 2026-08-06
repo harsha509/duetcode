@@ -412,10 +412,102 @@
     }
   }
 
-  function renderProse(target, text) {
+  // ── PR verdict block ───────────────────────────────────────
+
+  // Asked for by the prompt when a task names pull requests. Prefixed lines
+  // rather than a fence, so the same text reads plainly in the terminal.
+  const VERDICT_HEAD = /^VERDICT:\s*(GO|NO-GO)\b/i;
+  const VERDICT_FINDING = /^(BLOCKER|WARNING):\s*(.+)$/i;
+
+  /**
+   * Lifts the verdict block off the front of an answer.
+   *
+   * Only a *leading* run counts: the words appear in ordinary review prose too,
+   * and a summary assembled from sentences scattered through the analysis would
+   * be a different, worse review than the one the model actually wrote.
+   * Returns null when the answer does not open with one, which is every task
+   * that is not about a pull request.
+   */
+  function takeVerdict(text) {
+    const lines = text.split('\n');
+    let i = 0;
+    while (i < lines.length && !lines[i].trim()) i++;
+    const head = VERDICT_HEAD.exec((lines[i] || '').trim());
+    if (!head) {
+      return null;
+    }
+    const findings = [];
+    for (i++; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      const found = VERDICT_FINDING.exec(line);
+      if (!found) break;
+      findings.push({ blocking: found[1].toUpperCase() === 'BLOCKER', text: found[2] });
+    }
+    return {
+      go: head[1].toUpperCase() === 'GO',
+      findings,
+      rest: lines.slice(i).join('\n'),
+    };
+  }
+
+  function countLabel(n, word) {
+    return `${n} ${word}${n === 1 ? '' : 's'}`;
+  }
+
+  function verdictGroup(card, title, findings, cls) {
+    if (!findings.length) {
+      return;
+    }
+    card.appendChild(el('div', 'pr-verdict-group', title));
+    for (const f of findings) {
+      card.appendChild(el('div', 'pr-verdict-item ' + cls, f.text));
+    }
+  }
+
+  function verdictCard(v) {
+    const blockers = v.findings.filter((f) => f.blocking);
+    const warnings = v.findings.filter((f) => !f.blocking);
+    const card = el('div', 'pr-verdict ' + (v.go ? 'go' : 'nogo'));
+
+    const head = el('div', 'pr-verdict-head');
+    head.appendChild(el('span', 'pr-verdict-badge', v.go ? '✓ GO' : '✕ NO-GO'));
+    head.appendChild(
+      el(
+        'span',
+        'pr-verdict-counts',
+        `${countLabel(blockers.length, 'blocker')} · ${countLabel(warnings.length, 'warning')}`,
+      ),
+    );
+    card.appendChild(head);
+
+    verdictGroup(card, 'Blockers', blockers, 'bad');
+    verdictGroup(card, 'Warnings', warnings, 'warn');
+    return card;
+  }
+
+  /**
+   * An answer as nodes: its verdict card, when it opens with one, then the
+   * prose. Shared so a streamed answer, a whole one, and a replayed session all
+   * render the same.
+   */
+  function answerNodes(text) {
+    const nodes = [];
+    const v = takeVerdict(text);
+    if (v) {
+      nodes.push(verdictCard(v));
+      text = v.rest;
+    }
     const block = el('div', 'block');
     fillProse(block, text);
-    target.appendChild(block);
+    nodes.push(block);
+    return nodes;
+  }
+
+  function renderProse(target, text) {
+    for (const node of answerNodes(text)) {
+      target.appendChild(node);
+    }
     scrollDown();
   }
 
@@ -445,9 +537,7 @@
       pre.remove();
       return;
     }
-    const block = el('div', 'block');
-    fillProse(block, pre.textContent);
-    pre.replaceWith(block);
+    pre.replaceWith(...answerNodes(pre.textContent));
   }
 
   // ── live events ────────────────────────────────────────────
