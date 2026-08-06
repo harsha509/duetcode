@@ -5,6 +5,38 @@ import * as path from 'path';
 import { ServeClient } from './serveClient';
 
 /**
+ * Composer icons, drawn rather than typed.
+ *
+ * `📎` and `⚙` disagree about themselves: the paperclip defaults to emoji
+ * presentation and arrives from a colour font at roughly 1.3em, while the gear
+ * defaults to text presentation and falls back to whatever monochrome symbol
+ * font the platform has — smaller, differently baselined, and a different
+ * weight. Matching them is not possible in CSS because the discrepancy is in
+ * the fonts. Geometry that scales with the button removes the question.
+ *
+ * Stroke and fill are attributes, not inline styles: the webview's CSP allows
+ * no inline `style`, and `currentColor` lets the button's own colour through.
+ */
+const ICON_SVG_ATTRS =
+  'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+
+const ICON_ATTACH =
+  `<svg ${ICON_SVG_ATTRS}><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 ` +
+  `5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>`;
+
+const ICON_SETTINGS =
+  `<svg ${ICON_SVG_ATTRS}><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82` +
+  `l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 ` +
+  `1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06` +
+  `a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 ` +
+  `2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 ` +
+  `0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 ` +
+  `2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 ` +
+  `0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 ` +
+  `1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
+
+/**
  * The duet webview: sessions history viewer + live task runner with
  * round-aligned writer/reviewer columns.
  */
@@ -33,6 +65,11 @@ export class DuetPanel {
     );
     DuetPanel.current = new DuetPanel(panel, ctx, client);
     return DuetPanel.current;
+  }
+
+  /** Closes the open panel, if there is one. A no-op otherwise. */
+  static close(): void {
+    DuetPanel.current?.panel.dispose();
   }
 
   private constructor(
@@ -180,8 +217,8 @@ export class DuetPanel {
       <select id="project" class="hidden" title="Project a task runs in"></select>
       <label><input type="checkbox" id="auto" checked> auto</label>
       <label><input type="checkbox" id="plan"> plan</label>
-      <button id="attach" title="Attach image">📎</button>
-      <button id="settings" title="Settings — API keys, Claude login">⚙</button>
+      <button id="attach" class="icon" title="Attach image" aria-label="Attach image">${ICON_ATTACH}</button>
+      <button id="settings" class="icon" title="Settings — API keys, Claude login" aria-label="Settings">${ICON_SETTINGS}</button>
       <button id="review" title="Second opinion on the last answer, or on the uncommitted changes, in every workspace project">review</button>
       <button id="send">Send</button>
     </div>
@@ -193,6 +230,9 @@ export class DuetPanel {
 
   private dispose(): void {
     DuetPanel.current = undefined;
+    // A panel closed mid-task never sees task_done, so the screenshots it
+    // wrote to tmp are swept here instead of leaking one file per paste.
+    this.cleanupTmpImages();
     for (const d of this.disposables) {
       d.dispose();
     }

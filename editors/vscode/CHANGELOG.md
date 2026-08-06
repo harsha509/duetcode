@@ -5,6 +5,47 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.5 - 2026-08-06
+
+Requires `dt` 0.2.5. The CLI is unchanged — it shares a version number with the
+extension — and this release is all panel: **+** starts a session that is
+actually new, and the writer's tool calls appear where they happened instead of
+in a heap underneath the answer.
+
+### Changed
+
+- **+ (New Task) starts a genuinely new session.** It used to reveal the panel
+  you already had: same timeline, same conversation, so a "new" task began with
+  everything the previous one had told the models still in scope. It now closes
+  the open panel and restarts `dt serve`, which drops both models' accumulated
+  context along with their CLI resume ids. The Sessions sidebar is deliberately
+  untouched — it is the on-disk archive of past runs, and opening one only
+  renders stored text, so browsing history can never turn into context for a
+  live task.
+
+### Fixed
+
+- **Tool actions appear in the order they happened.** A turn that interleaved
+  text and tool calls — answer, grep, more answer — put every `⚡` line below
+  the entire reply, because streamed text kept flowing into a block pinned
+  above them. Both models were affected; the reviewer only looked correct when
+  it happened to run all its tools before writing anything. `◌ thinking…` had
+  the same problem.
+- **The composer's ⚙ and 📎 are the same size.** They were two different kinds
+  of character — one defaulting to emoji presentation, one to text — so they
+  arrived from different fonts at different sizes, weights, and baselines, which
+  no amount of CSS could reconcile. Both are drawn now, in matching square
+  toolbar buttons. The row's buttons and checkboxes also pick up VS Code's font,
+  which form controls do not inherit on their own.
+- **A deliberate restart no longer reports itself as a crash.** Changing the
+  writer or a model restarts `dt serve`, which announced itself as
+  `dt serve exited (code null)` in red. The dying process is detached from its
+  events before it is killed, so neither the exit nor whatever its output was
+  still flushing can land in the next session's timeline.
+- **Screenshots pasted into an abandoned task are cleaned up.** Closing the
+  panel mid-task leaked one temp file per pasted image — they were swept only
+  when a task ran to completion.
+
 ## 0.2.4 - 2026-08-06
 
 Requires `dt` 0.2.4. The review button stops agreeing with answers it could not

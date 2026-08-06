@@ -47,7 +47,9 @@ tests and linters, and you watch both sides of the conversation live.
 
 1. Open a git project (accept the `dt init` prompt if it appears).
 2. Click the DT Duet icon in the activity bar.
-3. Hit **+** (New Task), type what you want, press Enter.
+3. Hit **+** (New Task), type what you want, press Enter. **+** always starts a
+   fresh session: it closes the open panel and clears both models' context, so
+   nothing from the previous task carries over.
 4. Watch Claude write and Gemini review; answer prompts with the buttons.
 
 Settings live behind the **⚙ gear** (sidebar title or panel): API keys,

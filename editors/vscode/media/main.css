@@ -261,7 +261,32 @@ pre.prose .pl.ok { color: var(--vscode-charts-green); }
   margin-top: 6px;
 }
 
-#controls label { opacity: 0.8; font-size: 12px; }
+/* Form controls do not inherit the document font in any browser — left alone,
+   every button and select here renders in the UA default (Arial ~13.3px) while
+   the text beside it uses VS Code's, which is most of why the row looks
+   mismatched. One family and one size across the row settles it. */
+#controls button,
+#controls select,
+#controls label {
+  font-family: inherit;
+  font-size: 12px;
+}
+
+#controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0.8;
+}
+
+/* Default checkbox metrics are set for 13px+ text and sit a pixel or two proud
+   of a 12px label. */
+#controls label input[type='checkbox'] {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--vscode-button-background);
+}
 #controls #project {
   background: var(--vscode-dropdown-background);
   color: var(--vscode-dropdown-foreground);
@@ -279,6 +304,31 @@ pre.prose .pl.ok { color: var(--vscode-charts-green); }
   border-radius: 4px;
   padding: 4px 10px;
   cursor: pointer;
+}
+
+/* Square, so the two icons occupy identical boxes however wide their glyphs
+   would have been, and centred rather than sitting on a text baseline. */
+#controls button.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  background: none;
+  color: var(--vscode-foreground);
+  opacity: 0.75;
+}
+
+#controls button.icon:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+  opacity: 1;
+}
+
+#controls button.icon svg {
+  width: 15px;
+  height: 15px;
+  display: block;
 }
 
 #controls #send, #askbar .primary {

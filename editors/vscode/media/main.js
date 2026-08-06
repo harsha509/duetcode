@@ -419,6 +419,37 @@
     scrollDown();
   }
 
+  /**
+   * Closes the open stream for `model`, laying out the text that arrived.
+   *
+   * Chunks accumulate in one <pre> pinned where it was created, while a tool or
+   * thinking line appends to the end of the column. A turn that interleaves the
+   * two — answer, grep, more answer — therefore renders every tool below text
+   * that came after it, which is how the whole run's tools end up in a clump at
+   * the bottom. Sealing at the boundary lets the next chunk open a fresh <pre>
+   * after the tool line, so the column reads in the order things happened.
+   *
+   * The layout waits for the seal because a chunk can split a line — or a fence
+   * — anywhere, and classifying mid-stream would colour half a heading and card
+   * half a code block.
+   */
+  function sealStream(model) {
+    const pre = streams[model];
+    if (!pre) {
+      return;
+    }
+    delete streams[model];
+    // A stream sealed before its first chunk has nothing to lay out, and an
+    // empty block would still take a paragraph's worth of space.
+    if (!pre.textContent) {
+      pre.remove();
+      return;
+    }
+    const block = el('div', 'block');
+    fillProse(block, pre.textContent);
+    pre.replaceWith(block);
+  }
+
   // ── live events ────────────────────────────────────────────
 
   function onEvent(ev) {
@@ -457,12 +488,17 @@
         line(colFor(ev.actor), 'working', '● ' + ev.actor + ' — ' + ev.action);
         break;
       case 'thinking':
+        sealStream(ev.model);
         line(colFor(ev.model), 'dim', '◌ thinking…');
         break;
       case 'tool_action':
+        sealStream(ev.model);
         line(colFor(ev.model), 'tool', '⚡ ' + ev.desc);
         break;
       case 'stream_start': {
+        // A previous stream left open — by an error, or a round that ended
+        // without its end event — would otherwise be stranded as raw <pre>.
+        sealStream(ev.model);
         const pre = el('pre', 'stream');
         colFor(ev.model).appendChild(pre);
         streams[ev.model] = pre;
@@ -479,20 +515,9 @@
         scrollDown();
         break;
       }
-      case 'stream_end': {
-        // Laid out once the text is whole: a chunk can split a line — or a
-        // fence — anywhere, so classifying mid-stream would colour half a
-        // heading and card half a code block. The raw <pre> the chunks landed
-        // in is replaced by the formatted block it turned out to be.
-        const pre = streams[ev.model];
-        if (pre) {
-          const block = el('div', 'block');
-          fillProse(block, pre.textContent);
-          pre.replaceWith(block);
-        }
-        delete streams[ev.model];
+      case 'stream_end':
+        sealStream(ev.model);
         break;
-      }
       case 'response':
         renderProse(colFor(ev.model), ev.text);
         break;

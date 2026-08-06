@@ -74,6 +74,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   ctx.subscriptions.push(
     vscode.commands.registerCommand('dt.newTask', () => {
+      // A new session starts clean on both counts the user can see: the old
+      // panel closes with its timeline, and `dt serve` is killed so neither
+      // model resumes the conversation the previous session left it in.
+      // Context belongs to the session window, so carrying it into a new one
+      // would make two sessions that only look independent.
+      DuetPanel.close();
+      client.restart();
       DuetPanel.createOrShow(ctx, client);
     }),
     vscode.commands.registerCommand('dt.refreshSessions', () => provider.refresh()),

@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.5 - 2026-08-06
+
+No changes to the CLI. The version is shared with the VS Code extension and both
+are released from one tag, so `dt` moves with it — the panel is where this
+release happened, and
+[editors/vscode/CHANGELOG.md](editors/vscode/CHANGELOG.md) says what changed
+there. `dt serve` and its protocol are untouched.
+
 ## 0.2.4 - 2026-08-06
 
 The reviewer could read code, and read the wrong code. Asked to review an

@@ -80,12 +80,25 @@ export class ServeClient implements vscode.Disposable {
 
   /** Kill the server; the next send() respawns it with fresh secrets. */
   restart(): void {
+    const proc = this.proc;
+    this.proc = undefined;
+    // A partial line from the dead server would otherwise prefix — and
+    // invalidate — the first event the next one writes.
+    this.buffer = '';
+    if (!proc) {
+      return;
+    }
+    // Detached before the kill, not after: every one of these fires a tick or
+    // more later, by which time a new task has a fresh panel listening. The
+    // exit would read there as the new server having died, and whatever stdout
+    // still flushes would replay the old session's events into it.
+    proc.stdout.removeAllListeners('data');
+    proc.removeAllListeners('exit');
     try {
-      this.proc?.kill();
+      proc.kill();
     } catch {
       // already gone
     }
-    this.proc = undefined;
   }
 
   private ensureStarted(): Promise<void> {
