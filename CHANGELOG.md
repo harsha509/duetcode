@@ -8,6 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.4 - 2026-08-06
+
+The reviewer could read code, and read the wrong code. Asked to review an
+answer about two pull requests, it opened eleven files in the checkout it
+happened to be standing in — all on `main`, none of them the change — and
+reported back agreeing. Every path resolved and every line number read cleanly,
+which is what made it look like corroboration.
+
+### Added
+
+- **The change under review is fetched, not assumed.** When a task names GitHub
+  pull requests, dt now fetches their diffs with `gh pr diff` and reviews the
+  answer against those, saying so on screen: `reviewing the answer against
+  acme/api#529 — not against the working tree`. Up to four per task, sharing a
+  120 KB budget so one large change cannot crowd out the rest. Anything that
+  did not come back is named in the prompt as missing, rather than left for the
+  reviewer to fill in from the checkout.
+- **A reviewer whose tools point elsewhere is told so.** Holding a fetched
+  diff, it is now instructed that the checkout around it is a *different
+  revision* — to settle every claim about the change in the diff, to use its
+  tools only for what the diff cannot show, and never to quote a line number
+  from a file it opened as though it were a line of the change.
+- **A review that cannot reach the code is refused.** If the answer is about a
+  change outside the checkout that could not be fetched — no `gh`, not
+  authenticated, an enterprise host, a link with no fetchable URL — the run
+  ends `NO REVIEW` and names the way out (`gh pr checkout <number>`), instead
+  of returning a confident review of an unrelated revision. This holds however
+  capable the reviewer is: file access is what makes this failure convincing,
+  so it is not an excuse for it.
+
+### Changed
+
+- **An answer is judged `SOUND` or `UNSOUND`, never `APPROVED`.** The two
+  verdicts shared one word, and an approved answer arguing *against* a merge
+  read as an approval of the merge. They no longer collide — in the terminal,
+  in the panel, and in the closing summary, which said "approved" for a single
+  answer review and now says "the answer was found sound". Both vocabularies
+  still parse, so a custom prompt template written before the split keeps
+  working.
+
 ## 0.2.3 - 2026-08-05
 
 The reviewer could not read code. Reviewing an answer, it was handed the prose

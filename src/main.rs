@@ -10,6 +10,7 @@ mod policy;
 mod prompt_sync;
 mod prompts;
 mod repl;
+mod review_subject;
 mod serve;
 mod ui;
 

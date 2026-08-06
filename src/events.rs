@@ -6,6 +6,7 @@
 
 use crate::adapters::UsageStats;
 use crate::orchestrator::Outcome;
+use crate::policy::VerdictKind;
 use crate::ui;
 use serde::Serialize;
 use std::io::Write;
@@ -36,7 +37,11 @@ pub enum Event {
     Stopped { text: String },
     Changes { stat: String },
     Check { name: String, passed: bool },
-    Verdict { approved: bool, blockers: Vec<String>, suggestions: Vec<String> },
+    /// `kind` says which pair of words this verdict is in: a code review
+    /// approves or requests changes, an answer review calls the answer sound or
+    /// unsound. A frontend that renders one wording for both tells the user an
+    /// answer's approval was an approval of the code it discusses.
+    Verdict { kind: VerdictKind, approved: bool, blockers: Vec<String>, suggestions: Vec<String> },
     Usage { model: String, input_tokens: u64, output_tokens: u64, cost_usd: Option<f64> },
     CostSummary { calls: usize, input_tokens: u64, output_tokens: u64, cost_usd: Option<f64> },
     Response { model: String, text: String },
@@ -103,8 +108,8 @@ impl Sink for TerminalSink {
             Event::Stopped { text } => ui::stopped(&text),
             Event::Changes { stat } => ui::changes(&stat),
             Event::Check { name, passed } => ui::check_result(&name, passed),
-            Event::Verdict { approved, blockers, suggestions } => {
-                ui::verdict(approved, &blockers, &suggestions);
+            Event::Verdict { kind, approved, blockers, suggestions } => {
+                ui::verdict(kind, approved, &blockers, &suggestions);
             }
             Event::Usage { model, input_tokens, output_tokens, cost_usd } => {
                 ui::usage(&UsageStats { model, input_tokens, output_tokens, cost_usd });

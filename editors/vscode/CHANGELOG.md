@@ -5,6 +5,25 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.4 - 2026-08-06
+
+Requires `dt` 0.2.4. The review button stops agreeing with answers it could not
+check: asked about a pull request, the reviewer was reading whatever branch your
+window happened to be on.
+
+### Changed
+
+- **An answer's verdict chip reads `SOUND` / `UNSOUND`.** It used to read
+  `APPROVED`, the same chip a code review shows — so an approved answer that
+  argued *against* merging a change looked like an approval of that change. The
+  code review chip is unchanged.
+- **Reviewing an answer about a pull request fetches the pull request.** Name
+  the pull requests in the task and the reviewer is given their diffs, not the
+  files sitting in your editor. If they cannot be fetched, the review is refused
+  and tells you what to do about it, rather than reporting a confident review of
+  a different revision. Needs [`gh`](https://cli.github.com) installed and
+  authenticated.
+
 ## 0.2.3 - 2026-08-05
 
 Requires `dt` 0.2.3. The extension itself is unchanged — it shares a version

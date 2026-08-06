@@ -120,9 +120,18 @@
     vscode.postMessage({ type: 'answer', id, value });
   }
 
-  function renderVerdict(target, approved, blockers, suggestions) {
+  // An answer review judges an answer, not the code that answer is about — and
+  // those are regularly opposite, since an answer can soundly argue against a
+  // change. Rendering both as APPROVED said the reviewer endorsed the change.
+  // `kind` is absent on verdicts from an older CLI, which only ever sent code.
+  function verdictLabel(kind, approved) {
+    if (kind === 'answer') { return approved ? 'SOUND' : 'UNSOUND'; }
+    return approved ? 'APPROVED' : 'CHANGES REQUESTED';
+  }
+
+  function renderVerdict(target, kind, approved, blockers, suggestions) {
     const chip = el('div', 'verdict ' + (approved ? 'ok' : 'bad'),
-      approved ? 'APPROVED' : 'CHANGES REQUESTED');
+      verdictLabel(kind, approved));
     target.appendChild(chip);
     for (const b of blockers || []) line(target, 'blocker', '✗ ' + b);
     for (const s of suggestions || []) line(target, 'suggestion', '~ ' + s);
@@ -492,7 +501,7 @@
           (ev.passed ? '✓ ' : '✗ ') + ev.name);
         break;
       case 'verdict':
-        renderVerdict(colFor(reviewerName), ev.approved, ev.blockers, ev.suggestions);
+        renderVerdict(colFor(reviewerName), ev.kind, ev.approved, ev.blockers, ev.suggestions);
         break;
       case 'changes':
         fullWidth('changes', ev.stat.trim());

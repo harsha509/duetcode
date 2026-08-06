@@ -47,7 +47,9 @@ dt "add input validation to the signup form"
 dt "add input validation" --auto
 ```
 
-**Question tasks:** if the task is a question ("do we have performance issues?"), the writer answers without touching code — and the reviewer then gives a second opinion on the answer itself (auto: always; interactive: you're asked). Wrong or incomplete answers loop back for revision like code does.
+**Question tasks:** if the task is a question ("do we have performance issues?"), the writer answers without touching code — and the reviewer then gives a second opinion on the answer itself (auto: always; interactive: you're asked). Wrong or incomplete answers loop back for revision like code does. An answer verdict reads `SOUND` / `UNSOUND`, not `APPROVED`: it judges the answer, not the code the answer is about.
+
+**Questions about a pull request:** name the pull requests in the task ("review https://github.com/acme/api/pull/529") and dt fetches their diffs with `gh pr diff`, so the reviewer judges the answer against the change rather than against your current branch. Without a fetchable change the review is refused rather than run against the wrong revision — `gh pr checkout <number>`, or authenticate `gh`, and try again.
 
 **Role flip / images / continuity:**
 ```bash

@@ -3,6 +3,7 @@
 
 use crate::adapters::UsageStats;
 use crate::orchestrator::Outcome;
+use crate::policy::VerdictKind;
 use colored::Colorize;
 use std::io::Write;
 
@@ -69,12 +70,9 @@ pub fn changes(stat: &str) {
     println!("  {} Changes:\n{}", "~~".blue(), indent(stat, "     "));
 }
 
-pub fn verdict(approved: bool, blockers: &[String], suggestions: &[String]) {
-    let label = if approved {
-        "APPROVED".green().bold()
-    } else {
-        "CHANGES REQUESTED".red().bold()
-    };
+pub fn verdict(kind: VerdictKind, approved: bool, blockers: &[String], suggestions: &[String]) {
+    let word = kind.label(approved);
+    let label = if approved { word.green().bold() } else { word.red().bold() };
     println!("  {} AI Verdict: {}", "⚖".cyan(), label);
 
     if !blockers.is_empty() {

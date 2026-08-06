@@ -398,6 +398,11 @@ fn project_key(dir: &Path) -> PathBuf {
 struct ReviewTally {
     reviewed: usize,
     approved: usize,
+    /// How many of `reviewed` judged an *answer* rather than a diff. An answer
+    /// review reports in different words — sound, not approved — and saying
+    /// "approved" for one claims the reviewer endorsed whatever code the answer
+    /// was about, which is regularly the opposite of what it decided.
+    answers: usize,
     failures: Vec<String>,
     /// Projects where the review was refused because the reviewer had nothing
     /// it could check. Kept apart from `reviewed`, which would otherwise report
@@ -471,6 +476,9 @@ fn run_review(
             }
             Ok(result) => {
                 tally.reviewed += 1;
+                if pending.is_some() {
+                    tally.answers += 1;
+                }
                 if result.outcome == Outcome::Approved {
                     tally.approved += 1;
                 }
@@ -560,9 +568,17 @@ fn nothing_to_review_message(targets: &[ReviewTarget]) -> String {
 
 fn review_summary(tally: &ReviewTally) -> String {
     if tally.reviewed == 1 && tally.failures.is_empty() && tally.unreviewable.is_empty() {
-        return if tally.approved == 1 { "approved".into() } else { "changes requested by AI".into() };
+        return match (tally.answers == 1, tally.approved == 1) {
+            (true, true) => "the answer was found sound".into(),
+            (true, false) => "the answer was found unsound".into(),
+            (false, true) => "approved".into(),
+            (false, false) => "changes requested by AI".into(),
+        };
     }
-    let mut summary = format!("{}/{} projects approved", tally.approved, tally.reviewed);
+    // "approved" would be the wrong word for any answer review in the tally, so
+    // a mixed or all-answer run is summarised in one that fits both.
+    let verb = if tally.answers == 0 { "approved" } else { "passed" };
+    let mut summary = format!("{}/{} projects {}", tally.approved, tally.reviewed, verb);
     if !tally.failures.is_empty() {
         summary.push_str(&format!(", {} failed", tally.failures.len()));
     }
@@ -625,6 +641,34 @@ mod tests {
 
     fn targets(dirs: &[&str]) -> Vec<ReviewTarget> {
         dirs.iter().map(|d| ReviewTarget::new(PathBuf::from(d))).collect()
+    }
+
+    /// A single answer review reported as "approved" claims the reviewer
+    /// endorsed the code the answer was about. It regularly decided the
+    /// opposite — an answer arguing against a merge is a sound answer.
+    #[test]
+    fn one_answer_review_is_summarised_in_the_answer_vocabulary() {
+        let sound = ReviewTally { reviewed: 1, approved: 1, answers: 1, ..Default::default() };
+        assert_eq!(review_summary(&sound), "the answer was found sound");
+
+        let unsound = ReviewTally { reviewed: 1, approved: 0, answers: 1, ..Default::default() };
+        assert_eq!(review_summary(&unsound), "the answer was found unsound");
+    }
+
+    #[test]
+    fn one_code_review_still_reads_as_approval() {
+        let approved = ReviewTally { reviewed: 1, approved: 1, answers: 0, ..Default::default() };
+        assert_eq!(review_summary(&approved), "approved");
+    }
+
+    /// A run holding even one answer review cannot call the total "approved".
+    #[test]
+    fn a_tally_containing_an_answer_avoids_the_code_word() {
+        let mixed = ReviewTally { reviewed: 2, approved: 2, answers: 1, ..Default::default() };
+        assert_eq!(review_summary(&mixed), "2/2 projects passed");
+
+        let code = ReviewTally { reviewed: 2, approved: 2, answers: 0, ..Default::default() };
+        assert_eq!(review_summary(&code), "2/2 projects approved");
     }
 
     /// Answers whatever it was built with, so the choice logic can be exercised

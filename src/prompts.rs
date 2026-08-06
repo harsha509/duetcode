@@ -138,6 +138,30 @@ pub const ANSWER_REVIEW_ACCESS_TOOLS: &str = r#"What you can and cannot check:
   file to check. Restating a claim is not verifying it, and reporting verification you did not
   perform is a failed review however correct the claim later turns out to be."#;
 
+/// Access rules for a reviewer whose tools work, but not on the code under
+/// review: the change was fetched from elsewhere, and the checkout the reviewer
+/// stands in is a different revision of it — or a different project entirely.
+///
+/// Telling *this* reviewer to "open the files the answer cites" is precisely
+/// what produced the failure these rules exist to stop. Every path resolves,
+/// every line number reads back cleanly, and none of it is the change under
+/// review; the review comes back corroborating claims it never checked.
+pub const ANSWER_REVIEW_ACCESS_ELSEWHERE: &str = r#"What you can and cannot check:
+- The changes above are the code under review, and you are NOT standing in it. The checkout around
+  you is a different revision of the same project, or a different project altogether. Any file you
+  open here may be older than the change, newer than it, or unrelated to it.
+- Settle every claim about what the change does, adds, or removes against the diff above. That is
+  the only place those claims can be settled.
+- Your read-only tools are still worth using, for what the diff cannot show: a definition the change
+  calls but does not touch, a caller it never mentions, a convention it departs from. Whenever you
+  use them, say so, and say the file came from the surrounding checkout rather than from the change.
+- Never quote a line number from a file you opened as though it were a line of the change. Never
+  report a claim as confirmed because the checkout agrees with it — the checkout can agree with an
+  answer that is wrong about the change, and contradict one that is right.
+- You cannot edit anything, and must not try. Never run `git add`, `git commit`, or `git push`.
+- Never write "verified", "confirmed", or "I checked" about a claim you settled anywhere other than
+  the diff above, or a file you actually opened and quoted as being outside the change."#;
+
 /// Access rules for an API-only reviewer, which has no tools and can see
 /// nothing but this prompt.
 pub const ANSWER_REVIEW_ACCESS_NONE: &str = r#"What you can and cannot check:
@@ -335,13 +359,13 @@ BLOCKERS:
 - one line per thing that has to change before this answer is sound
 - write a single bullet reading `none` when there are none
 
-VERDICT: APPROVED
+VERDICT: SOUND
 
-Write `VERDICT: CHANGES_REQUESTED` on that last line instead when the answer is not sound.
+Write `VERDICT: UNSOUND` on that last line instead when the answer is not sound.
 
-APPROVED judges this answer, and nothing else. It is not an endorsement of whatever the answer is
-about: if the answer recommends against merging a change, approving the answer means you agree that
-change should not be merged.
+SOUND judges this answer, and nothing else — which is why it is not the word a code review uses.
+It is not an endorsement of whatever the answer is about: if the answer recommends against merging
+a change, calling the answer sound means you agree that change should not be merged.
 "#;
 
 pub const DEFAULT_ANSWER_FIX_TEMPLATE: &str = r#"You are an expert software engineer. A reviewer checked the answer you gave and found issues. Revise your answer.
@@ -436,6 +460,31 @@ mod tests {
         );
         assert!(without.contains("You cannot open a"));
         assert!(!without.contains("read-only tools. Use them."));
+    }
+
+    /// The three access blocks say genuinely different things, and each has one
+    /// job. Their whole purpose is that a reviewer is never told it can do
+    /// something it cannot, nor told to do something that would mislead it.
+    #[test]
+    fn each_access_block_says_something_the_others_do_not() {
+        let elsewhere = build_answer_review_prompt(
+            DEFAULT_ANSWER_REVIEW_TEMPLATE, "t", "a", "d", ANSWER_REVIEW_ACCESS_ELSEWHERE, "r",
+        );
+        assert!(elsewhere.contains("you are NOT standing in it"));
+        // The instruction that produced the failure: it must not reach a
+        // reviewer whose tools point at a different revision.
+        assert!(!elsewhere.contains("Open the files the answer cites"));
+        assert!(!elsewhere.contains("You cannot open a"));
+    }
+
+    /// An answer is judged sound or unsound, never approved — a word that would
+    /// read as a verdict on the code the answer is about.
+    #[test]
+    fn the_answer_verdict_has_its_own_vocabulary() {
+        assert!(DEFAULT_ANSWER_REVIEW_TEMPLATE.contains("VERDICT: SOUND"));
+        assert!(DEFAULT_ANSWER_REVIEW_TEMPLATE.contains("VERDICT: UNSOUND"));
+        assert!(!DEFAULT_ANSWER_REVIEW_TEMPLATE.contains("VERDICT: APPROVED"));
+        assert!(DEFAULT_REVIEW_TEMPLATE.contains("VERDICT: APPROVED"));
     }
 
     /// A review that opened nothing has to say so on the record.

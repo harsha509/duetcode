@@ -4,8 +4,9 @@ use crate::config::Config;
 use crate::events::{ask_yes_no, AskKind, Event, Sink};
 use crate::git;
 use crate::logs::{RunSummary, SessionLog};
-use crate::policy::{self, ReviewVerdict, Verdict};
+use crate::policy::{self, ReviewVerdict, Verdict, VerdictKind};
 use crate::prompts;
+use crate::review_subject;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -130,18 +131,20 @@ impl ReviewOutcome {
     }
 }
 
+/// What both kinds of review need. What they are judging differs — a diff for
+/// code, a [`Subject`] for an answer — so that arrives as its own argument
+/// rather than as a field one of them always ignores.
 struct ReviewInput<'a> {
     round: usize,
-    diff: &'a str,
     writer_notes: &'a str,
     clarification: Option<&'a str>,
 }
 
 enum DiffOutcome {
-    /// The writer wrote no reviewable code this round, carrying the working
-    /// tree as it stands — which is what an answer is about, and is not
-    /// necessarily what was there before the round.
-    NoChanges(String),
+    /// The writer wrote no reviewable code this round, so the task is being
+    /// answered rather than implemented. What that answer is about is worked
+    /// out separately, by [`resolve_subject`] — it is not always the tree.
+    NoChanges,
     /// The writer changed code and no review was run on it — either the user
     /// said no, or the caller reviews on demand and was never asked.
     NotReviewed,
@@ -270,7 +273,7 @@ pub fn review_only(
     }
 
     let verdict = policy::parse_verdict(&response);
-    emit_verdict(sink, &verdict);
+    emit_verdict(sink, VerdictKind::Code, &verdict);
     costs.summary();
 
     let approved = verdict.verdict == Verdict::Approved;
@@ -284,11 +287,13 @@ pub fn review_only(
 
 /// Reviews an answer a writer already gave, outside any loop — what a frontend
 /// runs when the user asks for a review of a task that produced no code. The
-/// diff is read fresh so the answer is judged against the tree as it stands.
+/// subject is resolved fresh, so the answer is judged against the change it is
+/// about as it stands right now.
 ///
 /// `task` is the question the answer answered, not whatever the user typed when
 /// asking for the review; judging an answer against the wrong question is worse
-/// than not reviewing it. Anything typed rides along as an instruction instead.
+/// than not reviewing it, and the question is also what names the change under
+/// discussion. Anything typed rides along as an instruction instead.
 pub fn answer_review_only(
     reviewer: &mut dyn ModelAdapter,
     repo_dir: &Path,
@@ -297,18 +302,18 @@ pub fn answer_review_only(
     instruction: Option<&str>,
     sink: &dyn Sink,
 ) -> Result<OrchestratorResult> {
-    let diff = git::git_diff(repo_dir).unwrap_or_default();
-    if is_unreviewable(reviewer, &diff) {
-        sink.event(Event::Warn { text: unreviewable_warning(reviewer.name()) });
-        return Ok(unreviewed_result(0, UNREVIEWABLE_MESSAGE.into(), None));
+    let subject = resolve_subject(task, repo_dir, sink);
+    if let Some(refused) = refusal(&subject, reviewer) {
+        sink.event(Event::Warn { text: refused.warning });
+        return Ok(unreviewed_result(0, refused.message.into(), None));
     }
 
     let mut prompt = prompts::build_answer_review_prompt(
         prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE,
         task,
         answer,
-        &changes_block(&diff),
-        access_block(reviewer),
+        &changes_block(&subject),
+        access_block(reviewer, &subject),
         &git::repo_identity(repo_dir),
     );
     if let Some(text) = instruction.map(str::trim).filter(|t| !t.is_empty()) {
@@ -328,7 +333,7 @@ pub fn answer_review_only(
     }
 
     let verdict = policy::parse_verdict(&response);
-    emit_verdict(sink, &verdict);
+    emit_verdict(sink, VerdictKind::Answer, &verdict);
     costs.summary();
 
     let approved = verdict.verdict == Verdict::Approved;
@@ -336,9 +341,9 @@ pub fn answer_review_only(
         outcome: if approved { Outcome::Approved } else { Outcome::Stopped },
         rounds: 1,
         message: if approved {
-            "answer approved".into()
+            answer_sound_message(policy::parse_answer_conclusion(&response).as_deref())
         } else {
-            "changes requested on the answer".into()
+            "the answer was found unsound".into()
         },
         answer: None,
     })
@@ -400,7 +405,7 @@ fn plan_phase(
         sink.event(Event::Response { model: reviewer.name().to_string(), text: plan_review.clone() });
     }
     session.log.write_reviewer_response(0, &plan_review)?;
-    emit_verdict(sink, &policy::parse_verdict(&plan_review));
+    emit_verdict(sink, VerdictKind::Code, &policy::parse_verdict(&plan_review));
 
     if !ask_yes_no(sink, "execute this task?") {
         sink.event(Event::Stopped { text: "Exiting without executing.".into() });
@@ -439,6 +444,9 @@ fn execute_loop(
     // yet): review targets the answer itself, and later no-change rounds are
     // revisions, not stalls.
     let mut answer_mode = false;
+    // The code an answer is judged against, resolved on the first answer round
+    // and kept for the rest of the run.
+    let mut subject: Option<Subject> = None;
     let mut round = 0;
 
     while round < budget {
@@ -468,31 +476,24 @@ fn execute_loop(
         report_stray_writes(session, opts.repo_dir, sink);
 
         match writer_diff_outcome(opts, reviewer.name(), &session.log, round, &diff_before, sink)? {
-            DiffOutcome::NoChanges(_) if !answer_mode && round > 1 => {
+            DiffOutcome::NoChanges if !answer_mode && round > 1 => {
                 sink.event(Event::Warn {
                     text: format!("{} made no changes in response to feedback", writer.name()),
                 });
                 stall.observe_no_changes();
             }
-            DiffOutcome::NoChanges(tree_diff) => {
+            DiffOutcome::NoChanges => {
                 answer_mode = true;
                 sink.event(Event::Info {
                     text: format!("{} answered without making code changes", writer.name()),
                 });
 
-                // Checked before the prompt: asking the user to spend a
-                // reviewer call that cannot check anything wastes the call
-                // whichever way they answer.
-                if is_unreviewable(reviewer, &tree_diff) {
-                    sink.event(Event::Warn { text: unreviewable_warning(reviewer.name()) });
-                    costs.summary();
-                    return Ok(unreviewed_result(
-                        round,
-                        UNREVIEWABLE_MESSAGE.into(),
-                        Some(writer_response.clone()),
-                    ));
-                }
-
+                // Asked before the subject is resolved, because resolving can
+                // mean fetching pull requests over the network. A caller that
+                // reviews on demand — the panel — always declines here and
+                // spends its reviewer call later, through `answer_review_only`;
+                // fetching first would do that work twice and throw the first
+                // copy away.
                 if !wants_review(opts, reviewer.name(), "review this answer", sink) {
                     costs.summary();
                     return Ok(unreviewed_result(
@@ -504,23 +505,38 @@ fn execute_loop(
                     ));
                 }
 
+                // Resolved once and kept: a later round is the same answer
+                // revised, about the same code, and re-resolving would fetch
+                // every pull request again for nothing.
+                let subject = subject
+                    .get_or_insert_with(|| resolve_subject(opts.task, opts.repo_dir, sink));
+
+                // Checked before the prompt, so a reviewer call is never spent
+                // on a review that could not check anything.
+                if let Some(refused) = refusal(subject, reviewer) {
+                    sink.event(Event::Warn { text: refused.warning });
+                    costs.summary();
+                    return Ok(unreviewed_result(
+                        round,
+                        refused.message.into(),
+                        Some(writer_response.clone()),
+                    ));
+                }
+
                 let input = ReviewInput {
                     round,
-                    // The answer wrote nothing, so the tree as it stands is the
-                    // material the answer is about — evidence the reviewer would
-                    // otherwise have to take on trust.
-                    diff: &tree_diff,
                     writer_notes: &writer_response,
                     clarification: clar.as_deref(),
                 };
-                let review = run_answer_review(opts, reviewer, session, costs, &input, sink)?;
+                let review =
+                    run_answer_review(opts, reviewer, session, costs, &input, subject, sink)?;
                 last_checks_passed = true;
 
                 if review.approved() {
                     let conclusion = policy::parse_answer_conclusion(&review.response);
                     sink.event(Event::Success {
                         text: format!(
-                            "{} approved {}'s answer — a verdict on the answer, not on the code it discusses",
+                            "{} found {}'s answer SOUND — a verdict on the answer, not on the code it discusses",
                             reviewer.name(),
                             writer.name()
                         ),
@@ -540,7 +556,7 @@ fn execute_loop(
                         success: true,
                     })?;
                     costs.summary();
-                    return Ok(ok_result(round, &answer_approved_message(conclusion.as_deref())));
+                    return Ok(ok_result(round, &answer_sound_message(conclusion.as_deref())));
                 }
 
                 stall.observe_review(&review.verdict.blockers, "");
@@ -579,11 +595,10 @@ fn execute_loop(
                 answer_mode = false;
                 let input = ReviewInput {
                     round,
-                    diff: &diff,
                     writer_notes: &writer_response,
                     clarification: clar.as_deref(),
                 };
-                let review = run_review(opts, reviewer, session, costs, &input, sink)?;
+                let review = run_review(opts, reviewer, session, costs, &input, &diff, sink)?;
                 last_checks_passed = review.checks_passed;
 
                 if review.approved() {
@@ -723,7 +738,7 @@ fn writer_diff_outcome(
     let diff_after = git::git_diff(opts.repo_dir)?;
 
     if !wrote_reviewable_code(diff_before, &diff_after) {
-        return Ok(DiffOutcome::NoChanges(diff_after));
+        return Ok(DiffOutcome::NoChanges);
     }
 
     log.write_diff(round, &diff_after)?;
@@ -759,6 +774,7 @@ fn run_review(
     session: &Session,
     costs: &mut CostTracker,
     input: &ReviewInput,
+    diff: &str,
     sink: &dyn Sink,
 ) -> Result<ReviewOutcome> {
     sink.event(Event::Working { actor: "checks".into(), action: "running configured checks…".into() });
@@ -777,7 +793,7 @@ fn run_review(
         &session.review_template,
         opts.task,
         &review_repo_block(opts.repo_dir),
-        input.diff,
+        diff,
         &checks_summary,
         input.writer_notes,
     );
@@ -800,7 +816,7 @@ fn run_review(
     }
 
     let verdict = policy::parse_verdict(&response);
-    emit_verdict(sink, &verdict);
+    emit_verdict(sink, VerdictKind::Code, &verdict);
 
     Ok(ReviewOutcome {
         checks_passed: checks::all_passed(&check_results),
@@ -810,21 +826,25 @@ fn run_review(
     })
 }
 
-/// Second opinion on a text answer (no diff involved, so no checks either).
+/// Second opinion on a text answer. The answer produced no diff of its own, so
+/// there is nothing for the checks to run against either; `subject` is the code
+/// the answer is about, and decides both what the reviewer is shown and what it
+/// is told about its own reach.
 fn run_answer_review(
     opts: &TaskOptions,
     reviewer: &mut dyn ModelAdapter,
     session: &Session,
     costs: &mut CostTracker,
     input: &ReviewInput,
+    subject: &Subject,
     sink: &dyn Sink,
 ) -> Result<ReviewOutcome> {
     let mut prompt = prompts::build_answer_review_prompt(
         prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE,
         opts.task,
         input.writer_notes,
-        &changes_block(input.diff),
-        access_block(reviewer),
+        &changes_block(subject),
+        access_block(reviewer, subject),
         &git::repo_identity(opts.repo_dir),
     );
     if let Some(text) = input.clarification {
@@ -846,7 +866,7 @@ fn run_answer_review(
     }
 
     let verdict = policy::parse_verdict(&response);
-    emit_verdict(sink, &verdict);
+    emit_verdict(sink, VerdictKind::Answer, &verdict);
 
     Ok(ReviewOutcome {
         checks_passed: true,
@@ -935,8 +955,9 @@ fn notify_approval(
     }
 }
 
-fn emit_verdict(sink: &dyn Sink, verdict: &ReviewVerdict) {
+fn emit_verdict(sink: &dyn Sink, kind: VerdictKind, verdict: &ReviewVerdict) {
     sink.event(Event::Verdict {
+        kind,
         approved: verdict.verdict == Verdict::Approved,
         blockers: verdict.blockers.clone(),
         suggestions: verdict.suggestions.clone(),
@@ -989,40 +1010,178 @@ fn load_prompt_template(path: &std::path::Path, default: &str, repo_dir: &Path) 
     }
 }
 
-/// The identity block plus the rules keeping the reviewer inside what the diff
-/// actually shows. Attached to every review prompt, so it reaches users whose
-/// `.duet/prompts/review.txt` predates the `{repo}` placeholder.
-/// Cap on the diff attached to an answer review. The diff is supporting
+/// Cap on the working tree attached to an answer review. The diff is supporting
 /// evidence there, not the subject, so a large working tree is trimmed rather
 /// than billed in full — an answer review that costs more than the code review
 /// it stands in for defeats the point.
 const ANSWER_REVIEW_DIFF_BYTES: usize = 40_000;
 
-/// The working tree an answer is judged against, trimmed to the cap. Says so
-/// plainly when there is nothing, so the reviewer judges the prose alone
-/// instead of assuming evidence it was never given.
+/// Total budget for the changes fetched for one answer review, shared evenly
+/// between them. Larger than the working-tree cap because here the diff *is*
+/// the subject rather than context for it, but still bounded: a change nobody
+/// can fit in one reading is not reviewed better by pasting more of it.
+const FETCHED_DIFF_BYTES: usize = 120_000;
+
 /// Told to the user, and returned as the run's message, when a review was
 /// refused for want of anything to check.
 const UNREVIEWABLE_MESSAGE: &str =
     "unreviewable — the reviewer cannot read files and there are no changes to judge the answer against";
 
-/// The access rules that match what this reviewer can actually do.
-fn access_block(reviewer: &dyn ModelAdapter) -> &'static str {
-    if reviewer.can_read_files() {
-        prompts::ANSWER_REVIEW_ACCESS_TOOLS
-    } else {
-        prompts::ANSWER_REVIEW_ACCESS_NONE
-    }
+/// Told to the user when the answer is about code this checkout does not
+/// contain and none of it could be retrieved.
+const UNGROUNDED_MESSAGE: &str =
+    "unreviewable — the answer is about code that is not in this checkout, and it could not be fetched";
+
+/// What an answer review is judged against — and, the part that decides whether
+/// the review means anything, whether the reviewer's own tools are looking at
+/// that same code.
+enum Subject {
+    /// Uncommitted work in the checkout. A reviewer with tools opens the very
+    /// files this diff describes, so what it reads corroborates.
+    WorkingTree(String),
+    /// A change fetched from outside the checkout. The reviewer has the diff,
+    /// but its tools are standing somewhere else entirely.
+    ///
+    /// `missing` names anything the task pointed at that did not come back. A
+    /// task naming two pull requests where only one fetches is still worth
+    /// reviewing — but the reviewer has to be told which half it cannot see,
+    /// or it judges those claims from the checkout, which is the failure this
+    /// whole path exists to prevent.
+    Fetched { diff: String, labels: Vec<String>, missing: Vec<String> },
+    /// The answer is about a change outside the checkout that could not be
+    /// retrieved. There is nothing here to review: no diff, and a reviewer whose
+    /// tools would read a different revision while reporting it as the change.
+    Absent { labels: Vec<String>, reason: String },
+    /// A clean tree, and no change named anywhere else — so the question is
+    /// about the checkout as it stands.
+    Nothing,
 }
 
-/// True when a review could only ever be a rubber stamp: the reviewer has no
-/// tools to open the code with, and there is no diff to judge the answer
-/// against either. It would have nothing but the answer's own prose, and an
-/// approval drawn from that says only that the answer reads well.
+/// Works out what the reviewer will be judging, fetching the change when the
+/// task names one that is not in the checkout.
 ///
-/// Callers refuse the review outright rather than spending a model call on it.
-fn is_unreviewable(reviewer: &dyn ModelAdapter, diff: &str) -> bool {
-    !reviewer.can_read_files() && diff.trim().is_empty()
+/// Only the task is scanned, never the answer. The task is the question being
+/// reviewed, so it is what decides the subject; an answer that happens to
+/// mention a pull request in passing must not redirect the review at it.
+fn resolve_subject(task: &str, repo_dir: &Path, sink: &dyn Sink) -> Subject {
+    if !review_subject::names_absent_code(task) {
+        let diff = git::git_diff(repo_dir).unwrap_or_default();
+        return if diff.trim().is_empty() {
+            Subject::Nothing
+        } else {
+            Subject::WorkingTree(diff)
+        };
+    }
+
+    let named = review_subject::pull_requests(task);
+    if named.is_empty() {
+        return Subject::Absent {
+            labels: Vec::new(),
+            reason: "it names no GitHub pull request URL that could be fetched".into(),
+        };
+    }
+    if named.len() > review_subject::MAX_PULL_REQUESTS {
+        sink.event(Event::Warn {
+            text: format!(
+                "{} pull requests named; fetching the first {}",
+                named.len(),
+                review_subject::MAX_PULL_REQUESTS
+            ),
+        });
+    }
+
+    let mut fetched: Vec<(String, String)> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut failure: Option<String> = None;
+
+    for pr in named.iter().take(review_subject::MAX_PULL_REQUESTS) {
+        sink.event(Event::Working {
+            actor: "gh".into(),
+            action: format!("fetching {}…", pr.label),
+        });
+        match review_subject::fetch_diff(pr, repo_dir) {
+            Ok(diff) => fetched.push((pr.label.clone(), diff)),
+            Err(e) => {
+                let text = format!("{:#}", e);
+                sink.event(Event::Warn { text: text.clone() });
+                failure.get_or_insert(text);
+                missing.push(pr.label.clone());
+            }
+        }
+    }
+    // Anything past the cap was never attempted. The answer very likely covers
+    // it, so it is missing evidence in exactly the same way a failed fetch is.
+    missing.extend(
+        named.iter().skip(review_subject::MAX_PULL_REQUESTS).map(|pr| pr.label.clone()),
+    );
+
+    if fetched.is_empty() {
+        return Subject::Absent {
+            labels: named.iter().map(|pr| pr.label.clone()).collect(),
+            reason: failure.unwrap_or_else(|| "no diff could be fetched".into()),
+        };
+    }
+
+    let labels: Vec<String> = fetched.iter().map(|(label, _)| label.clone()).collect();
+    sink.event(Event::Info {
+        text: format!(
+            "reviewing the answer against {} — not against the working tree",
+            labels.join(", ")
+        ),
+    });
+    Subject::Fetched { diff: join_fetched_diffs(&fetched), labels, missing }
+}
+
+/// One labelled block per pull request, sharing the budget evenly so a single
+/// huge change cannot squeeze the others out of the prompt entirely.
+fn join_fetched_diffs(parts: &[(String, String)]) -> String {
+    let share = FETCHED_DIFF_BYTES / parts.len().max(1);
+    parts
+        .iter()
+        .map(|(label, diff)| {
+            let body = match truncate_bytes(diff, share) {
+                (kept, false) => kept.to_string(),
+                (kept, true) => format!(
+                    "{}\n\n[{} truncated at {} KB — later files are not shown. Say the diff is \
+                     insufficient where that matters.]",
+                    kept,
+                    label,
+                    share / 1024,
+                ),
+            };
+            format!("───── {} ─────\n{}", label, body)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Why this review must not be run, or `None` when it can be.
+///
+/// Refusing costs the user the review they asked for, so each refusal says what
+/// is missing and how to supply it.
+struct Refusal {
+    warning: String,
+    /// One line, carried as the run's message and shown in a multi-project tally.
+    message: &'static str,
+}
+
+fn refusal(subject: &Subject, reviewer: &dyn ModelAdapter) -> Option<Refusal> {
+    match subject {
+        // The reviewer's tools resolve every path the answer cites — in the
+        // wrong revision. That reads as verification and is not, so no reviewer
+        // is grounded enough for this, tools or no tools.
+        Subject::Absent { labels, reason } => Some(Refusal {
+            warning: ungrounded_warning(labels, reason, reviewer.name()),
+            message: UNGROUNDED_MESSAGE,
+        }),
+        // No tools and no diff: nothing but the answer's own prose, and an
+        // approval drawn from that says only that the answer reads well.
+        Subject::Nothing if !reviewer.can_read_files() => Some(Refusal {
+            warning: unreviewable_warning(reviewer.name()),
+            message: UNREVIEWABLE_MESSAGE,
+        }),
+        _ => None,
+    }
 }
 
 fn unreviewable_warning(reviewer_name: &str) -> String {
@@ -1032,6 +1191,21 @@ fn unreviewable_warning(reviewer_name: &str) -> String {
          cannot support. {}",
         reviewer_name,
         install_hint(reviewer_name),
+    )
+}
+
+fn ungrounded_warning(labels: &[String], reason: &str, reviewer_name: &str) -> String {
+    let subject = if labels.is_empty() {
+        "a change that is not in this checkout".to_string()
+    } else {
+        labels.join(", ")
+    };
+    format!(
+        "this question is about {}, and {}. {} would read the checkout instead, where every path \
+         the answer cites resolves against a different revision — which reads as verification and \
+         is not. Skipping the review. Check the change out locally (`gh pr checkout <number>`), or \
+         make `gh` available and authenticated, then run the review again.",
+        subject, reason, reviewer_name,
     )
 }
 
@@ -1046,18 +1220,59 @@ fn install_hint(reviewer_name: &str) -> &'static str {
     }
 }
 
-fn changes_block(diff: &str) -> String {
-    if diff.trim().is_empty() {
-        return "(nothing uncommitted in the working tree — judge the answer on its own)".into();
+/// The access rules that match both what the reviewer can do and where the code
+/// under review actually is. A reviewer holding a fetched diff is told its tools
+/// point somewhere else; getting that wrong is the whole bug.
+fn access_block(reviewer: &dyn ModelAdapter, subject: &Subject) -> &'static str {
+    if !reviewer.can_read_files() {
+        return prompts::ANSWER_REVIEW_ACCESS_NONE;
     }
-    match truncate_bytes(diff, ANSWER_REVIEW_DIFF_BYTES) {
-        (kept, false) => kept.to_string(),
-        (kept, true) => format!(
-            "{}\n\n[diff truncated at {} KB — later files are not shown. Judge only what is above, \
-             and say the diff is insufficient where it matters.]",
-            kept,
-            ANSWER_REVIEW_DIFF_BYTES / 1024,
-        ),
+    match subject {
+        Subject::Fetched { .. } => prompts::ANSWER_REVIEW_ACCESS_ELSEWHERE,
+        _ => prompts::ANSWER_REVIEW_ACCESS_TOOLS,
+    }
+}
+
+/// The code the answer is judged against, as it appears in the prompt. Says
+/// plainly when there is nothing, so the reviewer judges the prose alone
+/// instead of assuming evidence it was never given.
+fn changes_block(subject: &Subject) -> String {
+    match subject {
+        Subject::Nothing => {
+            "(nothing uncommitted in the working tree — judge the answer on its own)".into()
+        }
+        Subject::WorkingTree(diff) => match truncate_bytes(diff, ANSWER_REVIEW_DIFF_BYTES) {
+            (kept, false) => kept.to_string(),
+            (kept, true) => format!(
+                "{}\n\n[diff truncated at {} KB — later files are not shown. Judge only what is \
+                 above, and say the diff is insufficient where it matters.]",
+                kept,
+                ANSWER_REVIEW_DIFF_BYTES / 1024,
+            ),
+        },
+        Subject::Fetched { diff, labels, missing } => {
+            let mut block = format!(
+                "{}, fetched with `gh pr diff`. This — not the working tree of the checkout you \
+                 are standing in — is the change under discussion.\n\n{}",
+                labels.join(" and "),
+                diff,
+            );
+            if !missing.is_empty() {
+                block.push_str(&format!(
+                    "\n\n[{} could not be fetched and is not shown here. The answer probably \
+                     discusses it: say the evidence is missing rather than judging those claims \
+                     from the checkout, which is a different revision.]",
+                    missing.join(", "),
+                ));
+            }
+            block
+        }
+        // Refused before a prompt is ever built; stated rather than asserted
+        // away, so a future caller that skips the refusal gets an honest block
+        // instead of a confident one.
+        Subject::Absent { .. } => {
+            "(the change under discussion is not in this checkout and could not be fetched)".into()
+        }
     }
 }
 
@@ -1177,13 +1392,13 @@ fn unreviewed_message(
     }
 }
 
-/// The closing line of an approved answer run. It names what was approved, and
-/// carries the answer's own conclusion alongside, because that conclusion is
-/// frequently the opposite of an approval — a review answer that says "do not
-/// merge" earns an approving reviewer. Kept to one line: `dt serve` frontends
-/// render this message as a single row.
-fn answer_approved_message(conclusion: Option<&str>) -> String {
-    const BASE: &str = "answer approved by reviewer — a verdict on the answer, \
+/// The closing line of an answer run the reviewer found sound. It names what
+/// was judged, and carries the answer's own conclusion alongside, because that
+/// conclusion is frequently the opposite — a review answer saying "do not merge"
+/// is a sound answer. Kept to one line: `dt serve` frontends render this message
+/// as a single row.
+fn answer_sound_message(conclusion: Option<&str>) -> String {
+    const BASE: &str = "the reviewer found the answer SOUND — a verdict on the answer, \
                         not on the code it discusses";
     match conclusion {
         Some(text) => format!("{} · the answer's own conclusion: {}", BASE, text),
@@ -1219,20 +1434,52 @@ mod tests {
         }
     }
 
-    /// The reported bug: a reviewer with no file access, judging an answer with
-    /// no diff behind it, has nothing but the prose — and approved it anyway.
+    fn fetched() -> Subject {
+        Subject::Fetched {
+            diff: "+ fn added() {}".into(),
+            labels: vec!["acme/api#529".into()],
+            missing: Vec::new(),
+        }
+    }
+
+    fn absent() -> Subject {
+        Subject::Absent {
+            labels: vec!["acme/api#529".into()],
+            reason: "gh is not installed".into(),
+        }
+    }
+
+    /// A reviewer with no file access, judging an answer with no diff behind
+    /// it, has nothing but the prose — and approved it anyway.
     #[test]
     fn a_blind_reviewer_with_no_diff_cannot_review() {
-        assert!(is_unreviewable(&Reviewer { reads_files: false }, ""));
-        assert!(is_unreviewable(&Reviewer { reads_files: false }, "  \n "));
+        assert!(refusal(&Subject::Nothing, &Reviewer { reads_files: false }).is_some());
     }
 
     /// Either kind of evidence is enough to go ahead: tools to read the code,
     /// or a diff to read instead.
     #[test]
     fn evidence_of_either_kind_allows_the_review() {
-        assert!(!is_unreviewable(&Reviewer { reads_files: true }, ""));
-        assert!(!is_unreviewable(&Reviewer { reads_files: false }, "+ fn added() {}"));
+        assert!(refusal(&Subject::Nothing, &Reviewer { reads_files: true }).is_none());
+        let tree = Subject::WorkingTree("+ fn added() {}".into());
+        assert!(refusal(&tree, &Reviewer { reads_files: false }).is_none());
+    }
+
+    /// The reported bug. The reviewer's tools work perfectly and point at the
+    /// wrong revision: every path the answer cites resolves, every line number
+    /// reads back, and none of it is the change. Having tools is what makes
+    /// this worse than having none, so tools must not excuse it.
+    #[test]
+    fn a_change_that_is_not_here_is_refused_however_capable_the_reviewer() {
+        assert!(refusal(&absent(), &Reviewer { reads_files: true }).is_some());
+        assert!(refusal(&absent(), &Reviewer { reads_files: false }).is_some());
+    }
+
+    /// Fetching the change is what turns that refusal back into a review.
+    #[test]
+    fn a_fetched_change_is_reviewable() {
+        assert!(refusal(&fetched(), &Reviewer { reads_files: true }).is_none());
+        assert!(refusal(&fetched(), &Reviewer { reads_files: false }).is_none());
     }
 
     /// Telling a tool-capable reviewer it cannot open files is what produced
@@ -1240,13 +1487,64 @@ mod tests {
     #[test]
     fn the_access_block_follows_the_reviewers_actual_capability() {
         assert_eq!(
-            access_block(&Reviewer { reads_files: true }),
+            access_block(&Reviewer { reads_files: true }, &Subject::Nothing),
             prompts::ANSWER_REVIEW_ACCESS_TOOLS
         );
         assert_eq!(
-            access_block(&Reviewer { reads_files: false }),
+            access_block(&Reviewer { reads_files: false }, &Subject::Nothing),
             prompts::ANSWER_REVIEW_ACCESS_NONE
         );
+    }
+
+    /// A reviewer holding a fetched diff has working tools aimed somewhere
+    /// else. Handing it the ordinary "open the files the answer cites" rules is
+    /// exactly how a review of the wrong revision reads as verification.
+    #[test]
+    fn a_reviewer_reading_a_fetched_change_is_told_its_tools_point_elsewhere() {
+        assert_eq!(
+            access_block(&Reviewer { reads_files: true }, &fetched()),
+            prompts::ANSWER_REVIEW_ACCESS_ELSEWHERE
+        );
+    }
+
+    /// With no tools there is nothing to misaim, so the rules stay the ones for
+    /// a reviewer that can see only the prompt.
+    #[test]
+    fn a_blind_reviewer_is_never_told_about_tools_it_does_not_have() {
+        assert_eq!(
+            access_block(&Reviewer { reads_files: false }, &fetched()),
+            prompts::ANSWER_REVIEW_ACCESS_NONE
+        );
+    }
+
+    /// A pull request on a host `gh` cannot reach is still a change that is not
+    /// in this checkout. The directory here does not exist, which proves the
+    /// path never falls back to reading the working tree.
+    #[test]
+    fn an_unfetchable_host_resolves_to_absent_without_reading_the_tree() {
+        let sink = AskCounter { asked: std::sync::atomic::AtomicUsize::new(0) };
+        let subject = resolve_subject(
+            "review https://git.acme.corp/acme/api/pull/529",
+            Path::new("/nonexistent-checkout"),
+            &sink,
+        );
+        match subject {
+            Subject::Absent { labels, reason } => {
+                assert!(labels.is_empty());
+                assert!(reason.contains("no GitHub pull request URL"), "reason: {reason}");
+            }
+            _ => panic!("a pull request that cannot be fetched must not be reviewable"),
+        }
+    }
+
+    /// The refusal is only useful if it says what was missing and what to do.
+    #[test]
+    fn the_ungrounded_refusal_names_the_change_and_the_way_out() {
+        let warning = ungrounded_warning(&["acme/api#529".into()], "gh is not installed", "gemini");
+        assert!(warning.contains("acme/api#529"));
+        assert!(warning.contains("gh is not installed"));
+        assert!(warning.contains("gh pr checkout"));
+        assert!(warning.contains("gemini"));
     }
 
     /// The refusal has to tell the user how to get a real review.
@@ -1301,14 +1599,13 @@ mod tests {
     /// an empty section as evidence it was given and never looked at.
     #[test]
     fn an_empty_tree_is_named_rather_than_left_blank() {
-        let block = changes_block("   \n");
-        assert!(block.contains("nothing uncommitted"));
+        assert!(changes_block(&Subject::Nothing).contains("nothing uncommitted"));
     }
 
     #[test]
     fn a_diff_within_the_cap_is_attached_whole() {
         let diff = "diff --git a/src/lib.rs b/src/lib.rs\n+fn added() {}\n";
-        assert_eq!(changes_block(diff), diff);
+        assert_eq!(changes_block(&Subject::WorkingTree(diff.into())), diff);
     }
 
     /// A truncated diff must announce the truncation: a reviewer that thinks it
@@ -1316,9 +1613,64 @@ mod tests {
     #[test]
     fn an_oversized_diff_is_cut_and_says_so() {
         let diff = "x".repeat(ANSWER_REVIEW_DIFF_BYTES * 2);
-        let block = changes_block(&diff);
+        let block = changes_block(&Subject::WorkingTree(diff.clone()));
         assert!(block.contains("diff truncated"));
         assert!(block.len() < diff.len());
+    }
+
+    /// A fetched diff has to be labelled as the subject. A reviewer that reads
+    /// it as "some diff" falls back on the checkout for anything it does not
+    /// cover — which is the wrong revision.
+    #[test]
+    fn a_fetched_change_is_named_and_set_against_the_checkout() {
+        let block = changes_block(&fetched());
+        assert!(block.contains("acme/api#529"));
+        assert!(block.contains("not the working tree"));
+        assert!(block.contains("+ fn added() {}"));
+    }
+
+    /// The pull requests share the budget, so one enormous change cannot push
+    /// the others out of the prompt entirely.
+    #[test]
+    fn fetched_pull_requests_are_labelled_and_share_the_budget() {
+        let parts = vec![
+            ("acme/api#1".to_string(), "x".repeat(FETCHED_DIFF_BYTES * 2)),
+            ("acme/ui#2".to_string(), "+ small\n".to_string()),
+        ];
+        let joined = join_fetched_diffs(&parts);
+        assert!(joined.contains("acme/api#1"));
+        assert!(joined.contains("acme/ui#2"));
+        assert!(joined.contains("truncated at"));
+        // The small one survives whole even though the first blew its share.
+        assert!(joined.contains("+ small"));
+        assert!(joined.len() < FETCHED_DIFF_BYTES + 1_000);
+    }
+
+    /// Two pull requests where only one fetches. Reviewing the half that
+    /// arrived is right; letting the reviewer settle claims about the other
+    /// half from the checkout is the exact failure being fixed, so the gap is
+    /// named in the prompt rather than left silent.
+    #[test]
+    fn a_change_that_did_not_arrive_is_named_as_missing() {
+        let partial = Subject::Fetched {
+            diff: "+ fn added() {}".into(),
+            labels: vec!["acme/api#529".into()],
+            missing: vec!["acme/ui#451".into()],
+        };
+        let block = changes_block(&partial);
+        assert!(block.contains("acme/api#529"));
+        assert!(block.contains("acme/ui#451"));
+        assert!(block.contains("could not be fetched"));
+        assert!(block.contains("say the evidence is missing"));
+    }
+
+    /// Refused before any prompt is built — but if a future caller ever skips
+    /// the refusal, the reviewer must be told the change is missing rather than
+    /// handed a blank it will read as "no changes".
+    #[test]
+    fn an_unfetchable_change_is_never_described_as_nothing() {
+        let block = changes_block(&absent());
+        assert!(block.contains("could not be fetched"));
     }
 
     /// Records whether the loop stopped to ask, and answers yes if it did.

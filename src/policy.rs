@@ -1,9 +1,35 @@
+use serde::Serialize;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Approved,
     ChangesRequested,
+}
+
+/// Which pair of words a verdict is reported in.
+///
+/// A code review approves a change or requests changes to it. An answer review
+/// judges an *answer*, and that answer is frequently itself a verdict on
+/// somebody else's code — so the two were reported in the same two words, and
+/// an approved "do not merge this" read as an approval of the merge. They no
+/// longer share a vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictKind {
+    Code,
+    Answer,
+}
+
+impl VerdictKind {
+    pub fn label(self, approved: bool) -> &'static str {
+        match (self, approved) {
+            (VerdictKind::Code, true) => "APPROVED",
+            (VerdictKind::Code, false) => "CHANGES REQUESTED",
+            (VerdictKind::Answer, true) => "SOUND",
+            (VerdictKind::Answer, false) => "UNSOUND",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -63,14 +89,20 @@ fn parse_verdict_line(lines: &[&str]) -> Verdict {
     for line in lines.iter().rev() {
         let upper = line.to_uppercase();
         if upper.contains("VERDICT:") || upper.contains("VERDICT :") {
-            // Rejections are tested first: "NOT APPROVED" also contains "APPROVED".
+            // Rejections are tested first: "NOT APPROVED" also contains
+            // "APPROVED", and "UNSOUND" contains "SOUND".
             if upper.contains("CHANGES_REQUESTED")
                 || upper.contains("CHANGES REQUESTED")
                 || upper.contains("NOT APPROVED")
+                || upper.contains("UNSOUND")
+                || upper.contains("NOT SOUND")
             {
                 return Verdict::ChangesRequested;
             }
-            if upper.contains("APPROVED") {
+            // Both vocabularies are read: answer reviews say SOUND, code reviews
+            // say APPROVED, and a custom prompt template predating the split
+            // still says APPROVED for either.
+            if upper.contains("APPROVED") || upper.contains("SOUND") {
                 return Verdict::Approved;
             }
         }
@@ -85,14 +117,17 @@ fn parse_verdict_line(lines: &[&str]) -> Verdict {
     Verdict::ChangesRequested
 }
 
-/// True for a line whose entire content is the word "approved", ignoring
-/// markdown emphasis and punctuation — `APPROVED`, `**Approved**`, `Approved.`
+/// True for a line whose entire content is the verdict word, ignoring markdown
+/// emphasis and punctuation — `APPROVED`, `**Approved**`, `Sound.`
+///
+/// `unsound` deliberately fails this and falls through to the rejection, the
+/// same way `not approved` does.
 fn is_bare_approval(line: &str) -> bool {
     let words: String = line
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
-    words.trim().eq_ignore_ascii_case("approved")
+    matches!(words.trim().to_lowercase().as_str(), "approved" | "sound")
 }
 
 /// Longest conclusion kept, in characters. It is displayed on one terminal
@@ -263,6 +298,43 @@ mod tests {
     fn explicit_not_approved_verdict_is_changes_requested() {
         let v = parse_verdict("VERDICT: NOT APPROVED");
         assert_eq!(v.verdict, Verdict::ChangesRequested);
+    }
+
+    /// Answer reviews report in their own words, so both vocabularies have to
+    /// parse. `UNSOUND` contains `SOUND`, exactly as `NOT APPROVED` contains
+    /// `APPROVED` — reading it as an approval would end the run reporting an
+    /// answer the reviewer had just rejected.
+    #[test]
+    fn the_answer_vocabulary_parses_and_unsound_is_not_sound() {
+        assert_eq!(parse_verdict("VERDICT: SOUND").verdict, Verdict::Approved);
+        assert_eq!(parse_verdict("VERDICT: UNSOUND").verdict, Verdict::ChangesRequested);
+        assert_eq!(parse_verdict("VERDICT: NOT SOUND").verdict, Verdict::ChangesRequested);
+    }
+
+    /// A prompt template written before the split still says APPROVED for an
+    /// answer, and must keep working.
+    #[test]
+    fn the_code_vocabulary_still_parses_after_the_split() {
+        assert_eq!(parse_verdict("VERDICT: APPROVED").verdict, Verdict::Approved);
+        assert_eq!(parse_verdict("VERDICT: CHANGES_REQUESTED").verdict, Verdict::ChangesRequested);
+    }
+
+    /// The two verdicts must never read as each other; that collision is the
+    /// whole reason for the split.
+    #[test]
+    fn each_kind_reports_in_its_own_words() {
+        assert_eq!(VerdictKind::Code.label(true), "APPROVED");
+        assert_eq!(VerdictKind::Code.label(false), "CHANGES REQUESTED");
+        assert_eq!(VerdictKind::Answer.label(true), "SOUND");
+        assert_eq!(VerdictKind::Answer.label(false), "UNSOUND");
+    }
+
+    /// A bare `SOUND` with no `VERDICT:` prefix is still an approval, and a bare
+    /// `UNSOUND` still is not.
+    #[test]
+    fn a_bare_soundness_line_is_read_the_same_way() {
+        assert_eq!(parse_verdict("Reads well.\n\n**SOUND**").verdict, Verdict::Approved);
+        assert_eq!(parse_verdict("Reads badly.\n\nUNSOUND").verdict, Verdict::ChangesRequested);
     }
 
     /// A bare approval with no `VERDICT:` line is still an approval.

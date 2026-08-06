@@ -24,7 +24,16 @@ You give a task
   models' prompts) before continuing.
 - **Question tasks**: if the writer answers without changing code (e.g. "do we
   have performance issues?"), the reviewer gives a second opinion on the
-  answer itself, and the writer revises until it's approved.
+  answer itself, and the writer revises until the answer is found sound. An
+  answer verdict reads `SOUND` / `UNSOUND` rather than `APPROVED`, because it
+  judges the answer and not the code the answer is about — those are regularly
+  opposite, since an answer can soundly argue against a change.
+- **Questions about a pull request**: name the pull requests in the task and dt
+  fetches their diffs with `gh pr diff`, so the reviewer judges the answer
+  against the change itself rather than against whatever is checked out. If the
+  change cannot be fetched, the review is refused instead of run against the
+  wrong revision — install and authenticate [`gh`](https://cli.github.com), or
+  check the branch out locally, and run it again.
 - Both models keep context: the Claude CLI session is resumed across rounds
   (`--resume`), and API-mode Claude and Gemini carry capped message history.
 - Flip roles anytime with `--writer gemini`.
@@ -38,6 +47,8 @@ You give a task
 - [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`npm i -g @google/gemini-cli`),
   or a [Gemini API key](https://aistudio.google.com/apikey) exported as `GEMINI_API_KEY`
 - Git
+- Optional: [`gh`](https://cli.github.com), authenticated — needed only to
+  review answers about a pull request that is not checked out locally
 
 Install the Gemini CLI if you can. Only the CLI can open the files it is
 reviewing — over the API the reviewer is a bare HTTPS call with no tools, and
@@ -258,6 +269,10 @@ BLOCKERS:
 SUGGESTIONS:
 - <improvement>
 ```
+
+A review of an *answer* ends `VERDICT: SOUND | UNSOUND` instead, and adds a
+`FILES READ:` line naming everything the reviewer actually opened — so a review
+that inspected nothing says so.
 
 ## Session logs
 
