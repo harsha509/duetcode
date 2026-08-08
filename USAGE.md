@@ -63,6 +63,19 @@ WARNING: Redaction can corrupt a tool schema that has a parameter named "token".
 
 Use the full URL. The trigger is the same detector that fetches the diff, and it reads `github.com/owner/repo/pull/123` only — `owner/repo#123` is a label dt prints, never one it parses, so a task written that way gets neither the verdict block nor a fetched diff.
 
+**What a review will and will not block on:** a blocker has to be a defect the reviewer can say how to reach — the input, state, or call order that makes it fail. A principle cited without a failure behind it, anything the diff left unverifiable, and anything the reviewer would merely have written differently all come back as suggestions. Optional findings are prefixed `Nit:` and raised freely; they never block.
+
+**Reviews declare what they read, and dt checks it.** Every review ends with a `FILES READ:` line. dt records the files the reviewer actually opened from its own tool calls and warns when the two disagree:
+
+```
+⚠ gemini listed services/billing.py as read, but opened only utils/vapi.py this turn
+  — treat that part of the review as unverified
+```
+
+The warning does not fail the review — the finding underneath may still be sound — but it is the one part of a review that is a record rather than a claim. `FILES READ: none` is a legitimate answer; a review of the diff alone is still a review.
+
+**Standalone reviews start clean.** `dt review` and the panel's review button reset the reviewer's model session first, so the verdict is a fresh judgement on the code as it stands rather than a continuation of whatever that model last concluded about an earlier diff. Rounds inside one task keep resuming, which is where the continuity is worth having — the reviewer is watching its own findings get addressed.
+
 **Role flip / images / continuity:**
 ```bash
 dt "fix bug" --writer gemini          # Gemini writes, Claude reviews

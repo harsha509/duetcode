@@ -258,6 +258,34 @@ interface RoundData {
 }
 
 /**
+ * Which model held which role in a stored session, from the session's own
+ * record — never from the current configuration, which would relabel finished
+ * work every time the writer is switched.
+ *
+ * roles.json is written when a session is created. state.json is the fallback
+ * for sessions recorded before it existed, and only runs that reached a summary
+ * have one. Sessions with neither are left undefined: nothing on disk says who
+ * ran them, and a guess would read exactly like a fact.
+ */
+function readRoles(dir: string, state: unknown): { writer?: string; reviewer?: string } {
+  const names = (source: unknown) => {
+    const record = source as { writer?: unknown; reviewer?: unknown } | null;
+    const writer = typeof record?.writer === 'string' ? record.writer : undefined;
+    const reviewer = typeof record?.reviewer === 'string' ? record.reviewer : undefined;
+    return writer && reviewer ? { writer, reviewer } : undefined;
+  };
+
+  let recorded: unknown;
+  try {
+    recorded = JSON.parse(fs.readFileSync(path.join(dir, 'roles.json'), 'utf8'));
+  } catch {
+    recorded = null;
+  }
+
+  return names(recorded) ?? names(state) ?? {};
+}
+
+/**
  * Load a stored session for the history view. Log filenames are fixed:
  * claude_out.md is always the writer's output and gemini_out.md the
  * reviewer's, regardless of which model held which role.
@@ -305,6 +333,7 @@ function readSession(dir: string) {
     name: path.basename(dir),
     task: read(path.join(dir, 'prompt.md')) ?? '',
     state,
+    roles: readRoles(dir, state),
     rounds,
   };
 }

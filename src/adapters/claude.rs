@@ -47,6 +47,9 @@ pub struct ClaudeAdapter {
     readable_dirs: Vec<PathBuf>,
     /// API-mode conversation history in Anthropic messages format.
     messages: Vec<serde_json::Value>,
+    /// Files opened during the most recent `generate`, so a review's account of
+    /// what it read can be checked rather than believed.
+    files_opened: Vec<String>,
     sink: Arc<dyn Sink>,
 }
 
@@ -54,6 +57,31 @@ struct CliOutput {
     text: String,
     usage: UsageStats,
     session_id: Option<String>,
+    /// Files the CLI actually opened this turn, from its own tool events.
+    files_opened: Vec<String>,
+}
+
+/// The files a tool call actually opened, or nothing for a call that opened
+/// none. Only `Read` names a file it read; Grep and Glob search the tree
+/// without reading any one file, and Write and Edit are not reading at all.
+///
+/// `file_path` is the key the CLI uses, and the only one seen in practice. The
+/// alternatives are read too, because of how this fails if the key ever moves:
+/// no path is captured, the turn looks like it opened nothing, and a review
+/// that honestly read six files has all six reported as unsupported. Accusing
+/// truthful reviews is a worse failure than reading a key that is never set.
+fn opened_paths(tool: &str, input: Option<&serde_json::Value>) -> Vec<String> {
+    if tool != "Read" {
+        return Vec::new();
+    }
+    let Some(input) = input else {
+        return Vec::new();
+    };
+    ["file_path", "path", "absolute_path"]
+        .iter()
+        .filter_map(|key| input.get(*key).and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect()
 }
 
 /// One CLI invocation, successful or not.
@@ -123,6 +151,7 @@ impl ClaudeAdapter {
             sessions: HashMap::new(),
             readable_dirs: Vec::new(),
             messages: Vec::new(),
+            files_opened: Vec::new(),
             sink,
         }
     }
@@ -328,6 +357,10 @@ impl ClaudeAdapter {
     // ── CLI mode (spawn claude command, resume the session across calls) ──
 
     fn run_cli(&mut self, prompt: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
+        // Cleared per turn: what matters is what this answer went and read, not
+        // what some earlier answer did.
+        self.files_opened.clear();
+
         let was_resuming = self.current_session().is_some();
 
         let attempt = self.spawn_cli(prompt, images);
@@ -335,7 +368,10 @@ impl ClaudeAdapter {
         self.record_session(&attempt);
 
         let error = match attempt.result {
-            Ok(CliOutput { text, usage, .. }) => return Ok((text, usage)),
+            Ok(CliOutput { text, usage, files_opened, .. }) => {
+                self.files_opened = files_opened;
+                return Ok((text, usage));
+            }
             Err(error) => error,
         };
 
@@ -348,7 +384,8 @@ impl ClaudeAdapter {
 
         let retry = self.spawn_cli(prompt, images);
         self.record_session(&retry);
-        let CliOutput { text, usage, .. } = retry.result?;
+        let CliOutput { text, usage, files_opened, .. } = retry.result?;
+        self.files_opened = files_opened;
         Ok((text, usage))
     }
 
@@ -587,6 +624,7 @@ impl ClaudeAdapter {
         let reader = BufReader::new(stdout_pipe);
         let mut full_result = String::new();
         let mut delta_text = String::new();
+        let mut files_opened: Vec<String> = Vec::new();
         let mut started = false;
         let start = std::time::Instant::now();
         let mut cost_usd: Option<f64> = None;
@@ -648,6 +686,7 @@ impl ClaudeAdapter {
                     let input = event.get("input")
                         .or_else(|| event.pointer("/content_block/input"));
                     let desc = Self::describe_tool_action(tool, input);
+                    files_opened.extend(opened_paths(tool, input));
 
                     if tool != "Bash" || !desc.starts_with("running `cat >") && !desc.starts_with("running `python -c") {
                         self.sink.event(Event::ToolAction { model: "claude".into(), desc });
@@ -720,6 +759,7 @@ impl ClaudeAdapter {
                                     let tool = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                                     let input = block.get("input");
                                     let desc = Self::describe_tool_action(tool, input);
+                                    files_opened.extend(opened_paths(tool, input));
                                     self.sink.event(Event::ToolAction { model: "claude".into(), desc });
                                 }
                                 _ => {}
@@ -757,7 +797,7 @@ impl ClaudeAdapter {
             delta_text
         };
 
-        Ok(CliOutput { text, usage, session_id })
+        Ok(CliOutput { text, usage, session_id, files_opened })
     }
 }
 
@@ -862,11 +902,54 @@ impl ModelAdapter for ClaudeAdapter {
     fn can_read_files(&self) -> bool {
         !self.use_api
     }
+
+    fn files_opened_last_turn(&self) -> Vec<String> {
+        self.files_opened.clone()
+    }
+
+    /// Drops this checkout's session and the API history behind it, so the next
+    /// call starts from the prompt alone.
+    fn reset_session(&mut self) {
+        self.sessions.remove(&self.working_dir);
+        self.messages.clear();
+        self.files_opened.clear();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the audit is allowed to treat as "this review opened that file".
+    /// Only a read counts: a Grep or Glob searches the tree without reading any
+    /// one file, and an Edit is not reading at all. Counting either would let a
+    /// claim be validated by a call that never opened what it names.
+    #[test]
+    fn only_a_read_records_the_file_it_opened() {
+        let input = serde_json::json!({ "file_path": "src/policy.rs" });
+        assert_eq!(opened_paths("Read", Some(&input)), vec!["src/policy.rs".to_string()]);
+
+        assert!(opened_paths("Edit", Some(&input)).is_empty());
+        assert!(opened_paths("Write", Some(&input)).is_empty());
+        assert!(opened_paths("Grep", Some(&serde_json::json!({ "path": "src" }))).is_empty());
+        assert!(opened_paths("Read", None).is_empty());
+    }
+
+    /// If the CLI ever moves the key, the failure is silent and inverted: no
+    /// path is captured, so an honest review's every read is reported as
+    /// unsupported. Reading the alternatives costs nothing and stops that.
+    #[test]
+    fn a_read_is_recorded_whichever_key_names_the_path() {
+        for key in ["file_path", "path", "absolute_path"] {
+            let input = serde_json::json!({ key: "/repo/src/policy.rs" });
+            assert_eq!(
+                opened_paths("Read", Some(&input)),
+                vec!["/repo/src/policy.rs".to_string()],
+                "key {} was not read",
+                key
+            );
+        }
+    }
 
     /// The case that made the writer forget a half-finished research task: the
     /// CLI connected, worked, then died on an account quota limit. The session

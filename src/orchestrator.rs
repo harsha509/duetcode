@@ -3,7 +3,7 @@ use crate::checks;
 use crate::config::Config;
 use crate::events::{ask_yes_no, AskKind, Event, Sink};
 use crate::git;
-use crate::logs::{RunSummary, SessionLog};
+use crate::logs::{RunSummary, SessionLog, SessionRoles};
 use crate::policy::{self, ReviewVerdict, Verdict, VerdictKind};
 use crate::prompts;
 use crate::review_subject;
@@ -216,7 +216,8 @@ pub fn run(
         max_rounds: opts.config.policy.max_rounds,
     });
 
-    let mut session = setup_session(opts, sink)?;
+    let roles = SessionRoles { writer: writer.name(), reviewer: reviewer.name() };
+    let mut session = setup_session(opts, &roles, sink)?;
     sink.event(Event::Info { text: format!("logs: {}", session.log.dir.display()) });
 
     let mut costs = CostTracker::new(sink);
@@ -265,6 +266,9 @@ pub fn review_only(
         actor: reviewer.name().to_string(),
         action: "reviewing uncommitted changes…".to_string(),
     });
+    // A standalone review is a fresh judgement on the code as it stands, so it
+    // starts from a clean session. See `ModelAdapter::reset_session`.
+    reviewer.reset_session();
     let (response, usage) = reviewer.generate(&review_prompt, &[])?;
     costs.add(usage);
 
@@ -272,6 +276,7 @@ pub fn review_only(
         sink.event(Event::Response { model: reviewer.name().to_string(), text: response.clone() });
     }
 
+    report_unsupported_reads(reviewer, &response, sink);
     let verdict = policy::parse_verdict(&response);
     emit_verdict(sink, VerdictKind::Code, &verdict);
     costs.summary();
@@ -325,6 +330,9 @@ pub fn answer_review_only(
         actor: reviewer.name().to_string(),
         action: "reviewing the answer…".to_string(),
     });
+    // A standalone review is a fresh judgement on the answer as it stands, so it
+    // starts from a clean session. See `ModelAdapter::reset_session`.
+    reviewer.reset_session();
     let (response, usage) = reviewer.generate(&prompt, &[])?;
     costs.add(usage);
 
@@ -332,6 +340,7 @@ pub fn answer_review_only(
         sink.event(Event::Response { model: reviewer.name().to_string(), text: response.clone() });
     }
 
+    report_unsupported_reads(reviewer, &response, sink);
     let verdict = policy::parse_verdict(&response);
     emit_verdict(sink, VerdictKind::Answer, &verdict);
     costs.summary();
@@ -835,6 +844,7 @@ fn run_review(
         sink.event(Event::Response { model: reviewer.name().to_string(), text: response.clone() });
     }
 
+    report_unsupported_reads(reviewer, &response, sink);
     let verdict = policy::parse_verdict(&response);
     emit_verdict(sink, VerdictKind::Code, &verdict);
 
@@ -986,7 +996,7 @@ fn emit_verdict(sink: &dyn Sink, kind: VerdictKind, verdict: &ReviewVerdict) {
 
 // ── Setup helpers ──
 
-fn setup_session(opts: &TaskOptions, sink: &dyn Sink) -> Result<Session> {
+fn setup_session(opts: &TaskOptions, roles: &SessionRoles, sink: &dyn Sink) -> Result<Session> {
     let config = opts.config;
     let repo_dir = opts.repo_dir;
 
@@ -998,7 +1008,7 @@ fn setup_session(opts: &TaskOptions, sink: &dyn Sink) -> Result<Session> {
     let fix_template =
         load_prompt_template(&config.prompts.fix, prompts::DEFAULT_FIX_TEMPLATE, repo_dir)?;
 
-    let log = SessionLog::create(repo_dir, opts.task)?;
+    let log = SessionLog::create(repo_dir, opts.task, roles)?;
     let mut repo_context = build_repo_context(repo_dir, opts.workspace)?;
 
     // Snapshotted before the writer runs, so pre-existing edits in a sibling
@@ -1307,6 +1317,34 @@ fn truncate_bytes(text: &str, cap: usize) -> (&str, bool) {
         end -= 1;
     }
     (&text[..end], true)
+}
+
+/// Warns when a review names files it never opened.
+///
+/// Everything else a review says has to be taken on its word; this does not.
+/// The warning is deliberately not a failure: the finding underneath may still
+/// be sound, and the reader is the one who should decide what a review that
+/// overstated its own work is worth.
+fn report_unsupported_reads(reviewer: &dyn ModelAdapter, response: &str, sink: &dyn Sink) {
+    let opened = reviewer.files_opened_last_turn();
+    let unsupported = policy::unsupported_read_claims(response, &opened);
+    if unsupported.is_empty() {
+        return;
+    }
+
+    sink.event(Event::Warn {
+        text: format!(
+            "{} listed {} as read, but opened {} this turn — treat that part of the review \
+             as unverified",
+            reviewer.name(),
+            unsupported.join(", "),
+            if opened.is_empty() {
+                "no files".to_string()
+            } else {
+                format!("only {}", opened.join(", "))
+            },
+        ),
+    });
 }
 
 fn review_repo_block(dir: &Path) -> String {

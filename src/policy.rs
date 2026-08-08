@@ -49,6 +49,55 @@ pub fn parse_verdict(raw: &str) -> ReviewVerdict {
     }
 }
 
+/// The files a review says it opened, from its `FILES READ:` line.
+///
+/// One line, comma-separated, which is the shape the review prompts ask for.
+/// `none` and its variants come back as no claim at all rather than as a file
+/// called "none".
+pub fn claimed_files_read(review: &str) -> Vec<String> {
+    review
+        .lines()
+        .filter_map(|line| strip_label(line.trim(), "FILES READ:"))
+        .flat_map(|list| list.split(','))
+        .map(|path| path.trim().trim_matches(['`', '"', '\'', '.']).trim().to_string())
+        .filter(|path| !path.is_empty() && !is_nothing_to_report(path))
+        .collect()
+}
+
+/// Claimed reads with no tool call behind them.
+///
+/// This is the one part of a review that does not have to be taken on trust.
+/// The model's account of what it opened is a claim; the tool calls are a
+/// record. Where they disagree, the record is right.
+///
+/// Paths are compared in both directions, because the two sides spell them
+/// differently: a tool is handed an absolute path, while a review writes the
+/// repo-relative one a reader would recognise.
+pub fn unsupported_read_claims(review: &str, opened: &[String]) -> Vec<String> {
+    let normalise = |path: &str| path.replace('\\', "/");
+    let opened: Vec<String> = opened.iter().map(|p| normalise(p)).collect();
+
+    claimed_files_read(review)
+        .into_iter()
+        .filter(|claim| {
+            let claim = normalise(claim);
+            !opened.iter().any(|read| same_file(read, &claim))
+        })
+        .collect()
+}
+
+/// Whether a recorded read and a claimed path name the same file.
+///
+/// Matched on path boundaries, not raw string suffix: `circuit_breaker.py` ends
+/// with `breaker.py` as text while being a different file, and a guard that
+/// waves that through is worse than no guard, because it reports having
+/// checked.
+fn same_file(read: &str, claim: &str) -> bool {
+    read == claim
+        || read.ends_with(&format!("/{}", claim))
+        || claim.ends_with(&format!("/{}", read))
+}
+
 /// Word-level Jaccard similarity between two blocker lists. Used to detect
 /// a stalled loop: the reviewer keeps raising essentially the same issues.
 pub fn blockers_similar(a: &[String], b: &[String]) -> bool {
@@ -233,6 +282,7 @@ fn parse_list_section(lines: &[&str], header: &str) -> Vec<String> {
                 && (upper.contains("BLOCKERS")
                     || upper.contains("SUGGESTIONS")
                     || upper.contains("TESTS")
+                    || upper.contains("FILES READ")
                     || upper.contains("VERDICT"))
             {
                 break;
@@ -252,6 +302,86 @@ mod tests {
         let v = parse_verdict("Looks good.\n\nVERDICT: APPROVED");
         assert_eq!(v.verdict, Verdict::Approved);
         assert!(v.blockers.is_empty());
+    }
+
+    /// The claim and the record are spelled differently — a tool is handed an
+    /// absolute path, a review writes the one a reader would recognise — so a
+    /// match has to survive that without waving through a file never opened.
+    #[test]
+    fn a_read_claim_is_matched_against_the_path_the_tool_was_given() {
+        let review = "FILES READ: utils/circuit_breaker.py, routers/admin.py\n\nVERDICT: APPROVED";
+        let opened = vec![
+            "/Users/x/Projects/svc/utils/circuit_breaker.py".to_string(),
+            "/Users/x/Projects/svc/routers/admin.py".to_string(),
+        ];
+        assert!(unsupported_read_claims(review, &opened).is_empty());
+
+        // Repo-prefixed on the review's side, absolute on the tool's.
+        let prefixed = "FILES READ: svc/utils/circuit_breaker.py\n";
+        assert!(unsupported_read_claims(prefixed, &opened).is_empty());
+    }
+
+    /// A filename that happens to end another one is a different file. Matching
+    /// on raw suffix let `breaker.py` be validated by a read of
+    /// `circuit_breaker.py` — the guard reporting a check it had not made,
+    /// which is the one way it could be worse than not existing.
+    #[test]
+    fn a_shorter_name_is_not_satisfied_by_a_longer_one_ending_in_it() {
+        let review = "FILES READ: breaker.py";
+        let opened = vec!["/repo/utils/circuit_breaker.py".to_string()];
+        assert_eq!(unsupported_read_claims(review, &opened), vec!["breaker.py".to_string()]);
+
+        // The genuine match still holds, in both spellings.
+        assert!(unsupported_read_claims("FILES READ: circuit_breaker.py", &opened).is_empty());
+        assert!(unsupported_read_claims("FILES READ: utils/circuit_breaker.py", &opened).is_empty());
+    }
+
+    /// The failure this guard exists for: a review that lists files it never
+    /// opened. Nothing else in a review can be checked this way.
+    #[test]
+    fn files_listed_but_never_opened_are_reported() {
+        let review = "FILES READ: utils/vapi.py, services/billing.py\n\nVERDICT: APPROVED";
+
+        let none_opened = unsupported_read_claims(review, &[]);
+        assert_eq!(none_opened.len(), 2, "got: {:?}", none_opened);
+
+        let one_opened = unsupported_read_claims(review, &["/repo/utils/vapi.py".to_string()]);
+        assert_eq!(one_opened, vec!["services/billing.py".to_string()]);
+    }
+
+    /// Reading nothing is a legitimate review of a diff, and must not be turned
+    /// into a warning about a file called "none".
+    #[test]
+    fn claiming_no_reads_is_not_a_claim() {
+        assert!(claimed_files_read("FILES READ: none\n\nVERDICT: APPROVED").is_empty());
+        assert!(unsupported_read_claims("FILES READ: none", &[]).is_empty());
+        assert!(unsupported_read_claims("VERDICT: APPROVED", &[]).is_empty());
+    }
+
+    /// A FILES READ line sits next to the sections the loop parses, and its
+    /// paths must not be swallowed as suggestions.
+    #[test]
+    fn a_files_read_line_does_not_leak_into_the_parsed_sections() {
+        let review = "SUGGESTIONS:\n- rename the helper\n\nFILES READ: a.rs, b.rs\n\n\
+                      VERDICT: APPROVED";
+        let v = parse_verdict(review);
+        assert_eq!(v.suggestions, vec!["rename the helper".to_string()]);
+        assert_eq!(v.verdict, Verdict::Approved);
+    }
+
+    /// The review prompt asks for optional findings to be marked `Nit:`, which
+    /// is the whole reason a reviewer is free to raise many of them. The label
+    /// must survive parsing as an ordinary suggestion — and must never promote
+    /// the finding into a blocker, which is what it exists to say it is not.
+    #[test]
+    fn a_nit_is_parsed_as_an_ordinary_suggestion() {
+        let review = "SUGGESTIONS:\n- Nit: `tmp` would read better as `pending`\n\
+                      - the retry count belongs in config\n\nVERDICT: APPROVED";
+        let v = parse_verdict(review);
+        assert_eq!(v.verdict, Verdict::Approved);
+        assert!(v.blockers.is_empty(), "a nit is not a blocker: {:?}", v.blockers);
+        assert_eq!(v.suggestions.len(), 2);
+        assert!(v.suggestions[0].starts_with("Nit:"), "got: {:?}", v.suggestions[0]);
     }
 
     #[test]

@@ -123,6 +123,26 @@ pub trait ModelAdapter {
     fn can_read_files(&self) -> bool {
         false
     }
+
+    /// Files the model opened during its last `generate`, as it named them.
+    ///
+    /// The point of recording them is that a reviewer's account of its own work
+    /// is the one claim in a review that does not have to be taken on trust:
+    /// the tool calls either happened or they did not. Empty from a transport
+    /// with no tools, which is why callers pair this with `can_read_files`.
+    fn files_opened_last_turn(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Forget the conversation so far and judge from scratch.
+    ///
+    /// Sessions persist for as long as the process does, so without this a
+    /// review resumes whatever the model last concluded — about a different
+    /// diff, in an earlier round, possibly wrongly. Continuity is worth having
+    /// between the rounds of one task, where the reviewer is watching its own
+    /// findings be addressed. It is worth nothing across unrelated judgements,
+    /// where it only anchors the new one to a stale conclusion.
+    fn reset_session(&mut self) {}
 }
 
 #[cfg(test)]

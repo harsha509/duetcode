@@ -18,8 +18,20 @@ pub struct RunSummary<'a> {
     pub success: bool,
 }
 
+/// Which model held which role for one run.
+///
+/// Recorded when the session is created, not when it ends. A run that is
+/// abandoned, declined, or answered without review never reaches the summary,
+/// and a session that did not record its roles can only be labelled from
+/// whatever the config happens to say later — which relabels finished work
+/// every time the writer is switched.
+pub struct SessionRoles<'a> {
+    pub writer: &'a str,
+    pub reviewer: &'a str,
+}
+
 impl SessionLog {
-    pub fn create(base_dir: &Path, task: &str) -> Result<Self> {
+    pub fn create(base_dir: &Path, task: &str, roles: &SessionRoles) -> Result<Self> {
         let timestamp = Local::now().format("%Y%m%d-%H%M%S");
         let slug = slugify(task);
         let dir = base_dir.join(".duet").join("sessions").join(format!("{}-{}", timestamp, slug));
@@ -30,6 +42,15 @@ impl SessionLog {
         let prompt_path = dir.join("prompt.md");
         std::fs::write(&prompt_path, task)
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+
+        let roles_path = dir.join("roles.json");
+        let roles_json = serde_json::to_string_pretty(&serde_json::json!({
+            "writer": roles.writer,
+            "reviewer": roles.reviewer,
+        }))
+        .context("failed to serialize session roles")?;
+        std::fs::write(&roles_path, roles_json)
+            .with_context(|| format!("failed to write {}", roles_path.display()))?;
 
         Ok(Self { dir })
     }
@@ -176,7 +197,28 @@ fn slugify(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::slugify;
+    use super::{slugify, SessionLog, SessionRoles};
+
+    /// The roles must be on disk from the moment the session exists. A run that
+    /// is declined, abandoned, or answered without review never writes a
+    /// summary, and a session that recorded nothing can only be labelled from
+    /// the config — which renames finished work whenever the writer changes.
+    #[test]
+    fn a_session_records_its_roles_when_it_is_created() {
+        let base = std::env::temp_dir().join(format!("dt-roles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("temp dir");
+
+        let roles = SessionRoles { writer: "gemini", reviewer: "claude" };
+        let log = SessionLog::create(&base, "review the billing change", &roles).expect("session");
+
+        let recorded = std::fs::read_to_string(log.dir.join("roles.json")).expect("roles.json");
+        let recorded: serde_json::Value = serde_json::from_str(&recorded).expect("valid json");
+        assert_eq!(recorded["writer"], "gemini");
+        assert_eq!(recorded["reviewer"], "claude");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn slugify_lowercases_and_dashes() {

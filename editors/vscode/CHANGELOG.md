@@ -5,6 +5,38 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.7 - 2026-08-08
+
+Requires `dt` 0.2.7. A passing review no longer reads like a failing one, and a
+past session is no longer relabelled by a setting you changed afterwards.
+
+### Fixed
+
+- **A review that approved no longer prints lines in blocker-red.** Prose was
+  tinted line by line by keyword, with no knowledge of the verdict printed
+  directly beneath it — so a review concluding `APPROVED` with no blockers could
+  colour four lines as blockers on the same screen. On one real review the
+  triggers were the word "critical" inside "this is a critical finding", the
+  word "security", the word "Blocking" in the *name* of a UI bug, and "fails" in
+  "if removeSecretIfExists fails". When the verdict is an approval carrying no
+  blockers, blocker-red is now dropped to warning across the round. A rejected
+  round keeps its tint, including one whose verdict could not be parsed, where
+  the tinted prose is the only trace of what went wrong.
+
+- **A finding is never painted green.** "Verified" and "Sound" inside a finding
+  describe the checking the reviewer did, not an all-clear, and green stated the
+  one thing the line did not say. Three nits on that same review were coloured
+  as though there were nothing to do.
+
+- **A past session shows the models that actually ran it.** The column headings
+  and the models line came from the current configuration, so switching the
+  writer relabelled every finished session in the history — a session where
+  Claude wrote and Gemini reviewed displayed as the opposite. They now come from
+  the session's own record: `roles.json` for sessions written by `dt` 0.2.7, and
+  the recorded verdict metadata for older ones. A session with neither shows a
+  bare `writer` / `reviewer` with no model name, because nothing on disk says
+  which models ran it and a guess would read exactly like a fact.
+
 ## 0.2.6 - 2026-08-06
 
 Requires `dt` 0.2.6. A pull request review now says go or no-go before it says

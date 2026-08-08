@@ -15,6 +15,10 @@
 
   let writerName = 'claude';
   let reviewerName = 'gemini';
+  // What the column heads and the models line say. Separate from the two names
+  // above, which route live events to a column: a replayed session is labelled
+  // by what it recorded, while routing still follows the models in play.
+  let labels = { writer: undefined, reviewer: undefined };
   let currentRound = null; // { writerCol, reviewerCol }
   let streams = {}; // model -> <pre> currently receiving chunks
   let busy = false;
@@ -45,20 +49,33 @@
     return 'reviewer'; // reviewer, checks, and everything review-adjacent
   }
 
+  /** The models a live run is using: they route its events and name its columns. */
+  function setLiveRoles(writer, reviewer) {
+    writerName = writer;
+    reviewerName = reviewer;
+    labels = { writer, reviewer };
+    modelsEl.textContent = `${writer} writes · ${reviewer} reviews`;
+  }
+
   // Columns are created on first use, so a round only shows the blocks that
   // actually have content (no empty reviewer box while the writer streams).
-  function colFor(actor) {
+  function colForSide(side) {
     if (!currentRound) newRound('•', '');
-    const side = sideFor(actor);
     const key = side + 'Col';
     if (!currentRound[key]) {
       const col = el('div', 'col ' + side);
-      const label = side === 'writer' ? writerName + ' · writer' : reviewerName + ' · reviewer';
-      col.appendChild(el('div', 'col-head', label));
+      // Bare role when no model is known: a session that recorded none is not
+      // evidence that today's models ran it.
+      const name = labels[side];
+      col.appendChild(el('div', 'col-head', name ? name + ' · ' + side : side));
       currentRound.cols.appendChild(col);
       currentRound[key] = col;
     }
     return currentRound[key];
+  }
+
+  function colFor(actor) {
+    return colForSide(sideFor(actor));
   }
 
   function line(target, cls, text) {
@@ -129,7 +146,31 @@
     return approved ? 'APPROVED' : 'CHANGES REQUESTED';
   }
 
+  /**
+   * Drops prose tinted as a blocker down to a warning, across `root`.
+   *
+   * The keyword tint is a guess made line by line, before any verdict exists;
+   * the blocker list is what the reviewer actually concluded. When it is empty,
+   * blocker-red prose contradicts the verdict printed directly beneath it —
+   * which is the whole of what made a passing review read like a failing one.
+   * Yellow, not cleared: the line still says something worth reading.
+   */
+  function capSeverity(root) {
+    for (const span of root.querySelectorAll('.pl.issue')) {
+      span.className = 'pl warn';
+    }
+  }
+
   function renderVerdict(target, kind, approved, blockers, suggestions) {
+    // The round, not just this column: the verdict speaks for everything the
+    // round produced, and half a round left red reads as a disagreement.
+    //
+    // Only on an approval. A rejected round with no parsed blockers — which is
+    // what an unparseable verdict comes back as — has the tinted prose as its
+    // only signal of what went wrong, and softening that would hide it.
+    if (approved && !(blockers || []).length) {
+      capSeverity(currentRound ? currentRound.cols : target);
+    }
     const chip = el('div', 'verdict ' + (approved ? 'ok' : 'bad'),
       verdictLabel(kind, approved));
     target.appendChild(chip);
@@ -393,7 +434,11 @@
           state.section = null;
         }
       } else if (isFinding(raw)) {
-        severity = severityOf(raw) || inherited();
+        // A finding is something to act on, so it never goes green. "Verified"
+        // and "Sound" inside one describe the checking the reviewer did, not an
+        // all-clear, and green states the one thing the line does not say.
+        const own = severityOf(raw);
+        severity = (own === 'ok' ? '' : own) || inherited();
       }
 
       const span = el('span', severity ? 'pl ' + severity : 'pl');
@@ -545,13 +590,11 @@
   function onEvent(ev) {
     switch (ev.event) {
       case 'ready':
-        writerName = ev.writer;
-        reviewerName = ev.reviewer;
-        modelsEl.textContent = `${ev.writer} writes · ${ev.reviewer} reviews`;
+        setLiveRoles(ev.writer, ev.reviewer);
         break;
       case 'task_started': {
-        writerName = ev.writer;
-        reviewerName = ev.reviewer;
+        // Also restores the labels after a past session was on screen.
+        setLiveRoles(ev.writer, ev.reviewer);
         currentRound = null;
         const head = el('div', 'task-head');
         head.appendChild(el('span', 'task-title', ev.task));
@@ -667,6 +710,13 @@
   function renderHistory(data) {
     timeline.innerHTML = '';
     currentRound = null;
+    // Labelled by what this session recorded, never by the current setting —
+    // switching the writer must not rewrite who ran a finished session.
+    const roles = data.roles || {};
+    labels = { writer: roles.writer, reviewer: roles.reviewer };
+    modelsEl.textContent = labels.writer
+      ? `${labels.writer} wrote · ${labels.reviewer} reviewed`
+      : 'past session — models not recorded';
     const head = el('div', 'task-head');
     head.appendChild(el('span', 'task-title', data.task));
     if (data.state) {
@@ -678,8 +728,10 @@
 
     for (const r of data.rounds) {
       newRound(r.round === 0 ? 'planning' : r.round, '');
-      if (r.writer) renderProse(colFor(writerName), r.writer);
-      if (r.reviewer) renderProse(colFor(reviewerName), r.reviewer);
+      // By side, not by model name: a stored round's columns are fixed by which
+      // file it came from, and owe nothing to who is configured now.
+      if (r.writer) renderProse(colForSide('writer'), r.writer);
+      if (r.reviewer) renderProse(colForSide('reviewer'), r.reviewer);
       if (Array.isArray(r.checks)) {
         for (const c of r.checks) {
           line(currentRound.reviewerCol, c.passed ? 'check ok' : 'check bad',
@@ -695,6 +747,21 @@
         timeline.appendChild(row);
       }
     }
+
+    // The same subordination a live verdict applies, from the only verdict a
+    // stored session keeps — and on the same terms: a recorded approval AND no
+    // blockers. A session that ended in changes-requested keeps its tinted
+    // prose, which in a replay is the only trace of what was objected to.
+    //
+    // The blocker list must actually be an empty array. A missing field is not
+    // evidence of a clean run, and `success` is not the test either: it goes
+    // false when the checks fail on a review that approved.
+    const state = data.state || {};
+    const wasApproved = String(state.final_verdict || '').toLowerCase() === 'approved';
+    if (wasApproved && Array.isArray(state.blockers) && state.blockers.length === 0) {
+      capSeverity(timeline);
+    }
+
     currentRound = null;
     scrollDown();
   }

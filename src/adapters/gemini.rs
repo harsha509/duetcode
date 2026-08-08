@@ -5,10 +5,11 @@ use crate::ui;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -37,6 +38,9 @@ pub struct GeminiAdapter {
     /// reason the Claude adapter keys them: resuming project A's session from
     /// project B inherits a conversation about the wrong checkout.
     sessions: HashMap<PathBuf, String>,
+    /// Files opened during the most recent `generate`, so a review's account of
+    /// what it read can be checked rather than believed.
+    files_opened: Vec<String>,
     sink: Arc<dyn Sink>,
 }
 
@@ -44,6 +48,8 @@ struct CliOutput {
     text: String,
     usage: UsageStats,
     session_id: Option<String>,
+    /// Files the CLI actually opened this turn, from its own tool events.
+    files_opened: Vec<String>,
 }
 
 /// One CLI invocation, successful or not. The session id is reported either
@@ -132,6 +138,7 @@ impl GeminiAdapter {
             working_dir: working_dir.to_path_buf(),
             readable_dirs: Vec::new(),
             sessions: HashMap::new(),
+            files_opened: Vec::new(),
             sink,
         })
     }
@@ -173,13 +180,18 @@ impl GeminiAdapter {
     }
 
     fn run_cli(&mut self, prompt: &str) -> Result<(String, UsageStats)> {
+        // Cleared per turn: what matters is what this answer went and read, not
+        // what some earlier answer did.
+        self.files_opened.clear();
+
         let was_resuming = self.current_session().is_some();
         let attempt = self.spawn_cli(prompt);
         let connected = attempt.connected();
         self.record_session(&attempt);
 
         if !should_restart_session(was_resuming, connected) {
-            let CliOutput { text, usage, .. } = attempt.result?;
+            let CliOutput { text, usage, files_opened, .. } = attempt.result?;
+            self.files_opened = files_opened;
             return Ok((text, usage));
         }
 
@@ -188,7 +200,8 @@ impl GeminiAdapter {
         self.sessions.remove(&self.working_dir);
         let retry = self.spawn_cli(prompt);
         self.record_session(&retry);
-        let CliOutput { text, usage, .. } = retry.result?;
+        let CliOutput { text, usage, files_opened, .. } = retry.result?;
+        self.files_opened = files_opened;
         Ok((text, usage))
     }
 
@@ -216,11 +229,8 @@ impl GeminiAdapter {
             cmd.arg("-r").arg(id);
         }
 
-        cmd.arg("-p")
-            .arg(prompt)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        // The prompt goes in on stdin rather than in `-p`; see `feed_stdin`.
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
         if self.verbose {
             let siblings: String = extra
@@ -228,7 +238,7 @@ impl GeminiAdapter {
                 .map(|dir| format!(" --include-directories {}", dir.display()))
                 .collect();
             eprintln!(
-                "  {} {} -m {} -o stream-json --approval-mode {}{}{} -p <prompt> (in {})",
+                "  {} {} -m {} -o stream-json --approval-mode {}{}{} <prompt on stdin> (in {})",
                 "[verbose]".dimmed(),
                 self.config.command,
                 self.config.model,
@@ -247,7 +257,21 @@ impl GeminiAdapter {
             Err(e) => return CliAttempt::failed(e),
         };
 
-        self.finish_cli(&mut child)
+        let writer = feed_stdin(&mut child, prompt);
+        let mut attempt = self.finish_cli(&mut child);
+        // Joined only once the run is over: a prompt larger than the pipe
+        // buffer is still being written while the CLI is answering.
+        let delivered = prompt_delivered(writer);
+
+        // A failed write is worth reporting only when the run otherwise looks
+        // fine. If the CLI died, the pipe broke because of that, and its own
+        // exit status explains more than "broken pipe" does.
+        if attempt.result.is_ok() {
+            if let Err(e) = delivered {
+                attempt.result = Err(e);
+            }
+        }
+        attempt
     }
 
     fn finish_cli(&self, child: &mut Child) -> CliAttempt {
@@ -296,6 +320,7 @@ impl GeminiAdapter {
 
         let mut text = String::new();
         let mut started = false;
+        let mut files_opened: Vec<String> = Vec::new();
         let mut session_id: Option<String> = None;
         let mut model_name = self.config.model.clone();
         let mut input_tokens: u64 = 0;
@@ -338,6 +363,7 @@ impl GeminiAdapter {
                 }
                 "tool_use" => {
                     let tool = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("tool");
+                    files_opened.extend(opened_paths(tool, event.get("parameters")));
                     let desc = describe_tool_action(tool, event.get("parameters"));
                     self.sink.event(Event::ToolAction { model: "gemini".into(), desc });
                 }
@@ -385,7 +411,7 @@ impl GeminiAdapter {
             model: model_name,
         };
 
-        Ok(CliOutput { text, usage, session_id })
+        Ok(CliOutput { text, usage, session_id, files_opened })
     }
 
     fn emit_chunk(&self, started: &mut bool, text: &str) {
@@ -493,6 +519,7 @@ impl GeminiAdapter {
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
         let mut chunk_count: u64 = 0;
+        let mut finish_reason: Option<String> = None;
 
         for line in reader.lines() {
             let line = match line {
@@ -536,6 +563,12 @@ impl GeminiAdapter {
                 }
             }
 
+            if let Some(reason) =
+                chunk.pointer("/candidates/0/finishReason").and_then(|v| v.as_str())
+            {
+                finish_reason = Some(reason.to_string());
+            }
+
             if let Some(meta) = chunk.get("usageMetadata") {
                 if let Some(it) = meta.get("promptTokenCount").and_then(|v| v.as_u64()) {
                     input_tokens = it;
@@ -561,8 +594,9 @@ impl GeminiAdapter {
 
         if collected.is_empty() {
             anyhow::bail!(
-                "Gemini returned empty response after {:.1}s — the model may have filtered the output",
-                elapsed
+                "Gemini returned no text after {:.1}s — {}",
+                elapsed,
+                describe_empty_response(finish_reason.as_deref())
             );
         }
 
@@ -641,6 +675,18 @@ impl ModelAdapter for GeminiAdapter {
     fn can_read_files(&self) -> bool {
         self.use_cli
     }
+
+    fn files_opened_last_turn(&self) -> Vec<String> {
+        self.files_opened.clone()
+    }
+
+    /// Drops this checkout's session and the API history behind it, so the next
+    /// call starts from the prompt alone.
+    fn reset_session(&mut self) {
+        self.sessions.remove(&self.working_dir);
+        self.history.clear();
+        self.files_opened.clear();
+    }
 }
 
 /// The assistant's own text from a `message` event. The prompt is echoed back
@@ -679,6 +725,37 @@ fn parse_result_stats(event: &serde_json::Value) -> ResultStats {
             .and_then(|m| m.keys().next())
             .cloned(),
     }
+}
+
+/// The files a tool call actually opened, or nothing for a call that opened
+/// none.
+///
+/// Only the tools that read a named file count. A grep or a glob is a search
+/// across the tree rather than a reading of any one file, and counting one as
+/// "I opened src/foo.rs" would make the record it feeds no better than the
+/// claim it exists to check.
+fn opened_paths(tool: &str, params: Option<&serde_json::Value>) -> Vec<String> {
+    if !matches!(tool, "read_file" | "read_many_files") {
+        return Vec::new();
+    }
+    let Some(params) = params else {
+        return Vec::new();
+    };
+
+    let single = ["file_path", "path", "absolute_path"]
+        .iter()
+        .filter_map(|key| params.get(*key).and_then(|v| v.as_str()))
+        .map(str::to_string);
+
+    // read_many_files takes a list, so the singular keys find nothing there.
+    let many = ["paths", "file_paths"]
+        .iter()
+        .filter_map(|key| params.get(*key).and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string);
+
+    single.chain(many).collect()
 }
 
 /// One-line description of a CLI tool call, for the activity line the user
@@ -799,6 +876,47 @@ fn error_message(event: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Hands the prompt to the CLI on stdin, from its own thread.
+///
+/// The prompt does not travel in `-p`. The gemini CLI is a node script, and an
+/// endpoint-security agent can kill a node process outright — SIGKILL, before
+/// it prints a single byte — once one command-line argument runs past about a
+/// kilobyte. Every prompt does. Nothing in the argv it is left with grows with
+/// the task: a model name, a session id, a handful of paths.
+///
+/// The thread is there for the reason stderr has one. A prompt larger than the
+/// pipe buffer blocks the writer until the CLI drains it, and blocking the main
+/// thread would stop stdout being read — which is what the CLI is waiting on.
+fn feed_stdin(child: &mut Child, prompt: &str) -> Option<JoinHandle<std::io::Result<()>>> {
+    let mut pipe = child.stdin.take()?;
+    let prompt = prompt.to_string();
+    Some(std::thread::spawn(move || {
+        let result = pipe.write_all(prompt.as_bytes());
+        // Dropping the pipe closes stdin, and that EOF is what tells the CLI
+        // the prompt is complete. Without it the CLI waits forever.
+        drop(pipe);
+        result
+    }))
+}
+
+/// Whether the prompt reached the CLI whole. A short write means the CLI
+/// answered a question it only partly received, and an answer to that is worse
+/// than no answer at all.
+///
+/// No writer at all means `spawn` handed back no stdin to write to, which
+/// `Stdio::piped()` above rules out. It is reported rather than waved through:
+/// the CLI would then be answering an empty prompt, and calling that delivered
+/// would be the one failure this check exists to catch.
+fn prompt_delivered(writer: Option<JoinHandle<std::io::Result<()>>>) -> Result<()> {
+    let Some(handle) = writer else {
+        anyhow::bail!("gemini was spawned without a stdin pipe, so the prompt was never sent");
+    };
+    match handle.join() {
+        Ok(result) => result.context("failed to send the prompt to gemini"),
+        Err(_) => anyhow::bail!("the thread sending the prompt to gemini panicked"),
+    }
+}
+
 /// Starts reading the child's stderr immediately, on its own thread, and hands
 /// back a handle to the collected text. Call before reading stdout: a pipe that
 /// nobody drains fills up and stalls the process writing into it.
@@ -811,6 +929,29 @@ fn drain_stderr(child: &mut Child) -> Option<std::thread::JoinHandle<String>> {
             .collect::<Vec<_>>()
             .join("\n")
     }))
+}
+
+/// Why a response came back with no text in it. The API says which of these it
+/// was, so say that: guessing at a content filter when the model had in fact
+/// reached for a tool sends the reader looking in entirely the wrong place.
+///
+/// `MALFORMED_FUNCTION_CALL` is the one this transport provokes on its own. It
+/// declares no tools, and a prompt written for the CLI asks the model to go and
+/// read the repository — so it tries to call something that was never offered.
+fn describe_empty_response(finish_reason: Option<&str>) -> String {
+    match finish_reason {
+        Some("MALFORMED_FUNCTION_CALL") => "the model tried to call a tool, and this transport \
+             offers none. Install the gemini CLI so it can read the checkout instead of \
+             guessing at it."
+            .to_string(),
+        Some("SAFETY") | Some("PROHIBITED_CONTENT") | Some("BLOCKLIST") => {
+            "a content filter blocked the response".to_string()
+        }
+        Some("MAX_TOKENS") => "the model stopped at its output limit before writing any text"
+            .to_string(),
+        Some(other) => format!("the model stopped with finishReason {}", other),
+        None => "the stream ended without a finishReason".to_string(),
+    }
 }
 
 fn extract_api_error(response: &str) -> Option<String> {
@@ -942,6 +1083,40 @@ mod tests {
     fn tool_arguments_truncate_on_character_boundaries() {
         assert_eq!(truncate_chars("日本語のパターン", 3), "日本語…");
         assert_eq!(truncate_chars("short", 40), "short");
+    }
+
+    /// The failure this transport causes itself must not read as the model
+    /// refusing: a malformed tool call means no tools were offered, and the fix
+    /// is the CLI, not a differently-worded prompt.
+    #[test]
+    fn an_empty_response_names_the_reason_the_api_gave() {
+        let tool_call = describe_empty_response(Some("MALFORMED_FUNCTION_CALL"));
+        assert!(tool_call.contains("tool"), "got: {}", tool_call);
+        assert!(!tool_call.contains("filter"), "got: {}", tool_call);
+
+        assert!(describe_empty_response(Some("SAFETY")).contains("content filter"));
+        assert!(describe_empty_response(Some("MAX_TOKENS")).contains("output limit"));
+        // An unfamiliar reason is still passed through rather than swallowed.
+        assert!(describe_empty_response(Some("RECITATION")).contains("RECITATION"));
+        assert!(describe_empty_response(None).contains("without a finishReason"));
+    }
+
+    /// A prompt that never fully reached the CLI is not a prompt: whatever the
+    /// CLI answered, it answered to a question it only partly heard.
+    #[test]
+    fn a_prompt_that_was_never_written_is_not_reported_as_delivered() {
+        let broken = std::thread::spawn(|| {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe"))
+        });
+        let message = format!("{:#}", prompt_delivered(Some(broken)).unwrap_err());
+        assert!(message.contains("failed to send the prompt"), "got: {}", message);
+
+        // No writer means no stdin to write to, so nothing was sent at all.
+        let message = format!("{:#}", prompt_delivered(None).unwrap_err());
+        assert!(message.contains("never sent"), "got: {}", message);
+
+        let written = std::thread::spawn(|| Ok(()));
+        assert!(prompt_delivered(Some(written)).is_ok());
     }
 
     /// An explicit `mode = "cli"` must not silently degrade to the API

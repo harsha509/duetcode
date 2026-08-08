@@ -8,6 +8,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.7 - 2026-08-08
+
+A review said `APPROVED`, listed no blockers, and printed four lines in
+blocker-red on the same screen. It also named files it had never opened. Both
+were believable, and neither was checked.
+
+### Added
+
+- **Reviews declare what they read, and dt checks the declaration.** Every
+  review now ends with a `FILES READ:` line. dt records the files the reviewer
+  actually opened from its own tool calls and warns when the two disagree —
+  `gemini listed services/billing.py as read, but opened only utils/vapi.py this
+  turn`. It is the one claim in a review that does not have to be taken on
+  trust: the tool calls either happened or they did not.
+
+  The warning does not fail the review, because the finding underneath may still
+  be sound. Only a read of a named file counts — a grep searches the tree
+  without reading any one file — and paths are matched on boundaries rather than
+  raw suffix, so a read of `circuit_breaker.py` does not vouch for a claim about
+  `breaker.py`. `FILES READ: none` is a legitimate answer, and the prompt says
+  so, since a reviewer pushed to invent a read is worse than one that admits it
+  judged the diff alone.
+
+- **Optional findings are marked `Nit:` instead of being suppressed.** A long
+  review is not the problem; an unsorted one is. Anything the reviewer would not
+  insist on is raised freely under that prefix and never blocks.
+
+- **Sessions record who wrote and who reviewed.** A new `roles.json` is written
+  when the session is created — not when it ends, because a run that is
+  declined, abandoned, or answered without review never reaches the summary. A
+  finished session is now labelled by what it recorded rather than by whatever
+  the config says later.
+
+### Changed
+
+- **The review prompt was rewritten against published guidance** rather than
+  assembled from taste. It now opens with a standard of review — approve once
+  the change definitely improves the health of the codebase, even when it is not
+  perfect, and never withhold approval over something you would merely have
+  done differently. Findings must carry evidence: a quoted line with its path,
+  and for a blocker the input, state, or sequence that reaches the failure. A
+  self-check before the summary asks the reviewer to drop anything it cannot
+  support, and saying "I cannot determine this from the diff" is named as a
+  valid result rather than a failure to find something.
+
+  New checks cover tests that would still pass with the change reverted, the
+  five SOLID principles each with a concrete tell, DRY as duplicated *knowledge*
+  rather than lookalike lines, KISS and YAGNI, imports and module-level
+  declarations at the top of the file, arguments lining up end to end including
+  units, error handling, and secrets in the diff or in logs. A blocker must be a
+  defect that can be made to fail; a principle cited without one is a
+  suggestion.
+
+- **A standalone review starts from a clean model session.** `dt review` and the
+  panel's review button no longer resume whatever the reviewer last concluded
+  about an earlier diff, which anchored each new verdict to a stale one and let
+  context accumulate for as long as the process lived. Rounds within a single
+  task still resume, which is where the continuity is the point — the reviewer
+  is watching its own findings get addressed.
+
+### Fixed
+
+- **The gemini CLI is no longer killed before it starts.** The prompt now goes
+  in on stdin rather than in `-p`. An endpoint-security agent can kill a node
+  process outright — SIGKILL, before it prints a byte — once one command-line
+  argument runs past about a kilobyte, and every prompt does. Nothing left in
+  argv grows with the task. The prompt is written on its own thread, because one
+  larger than the pipe buffer would otherwise block the thread that has to be
+  reading stdout, and a short write is reported rather than allowed to look like
+  an answer to the whole question.
+
+- **An empty API response says what happened.** A reviewer prompt written for
+  the CLI asks the model to go and read the repository, and the bare HTTPS
+  transport declares no tools, so the model reached for one and returned
+  nothing. That was reported as "the model may have filtered the output". The
+  `finishReason` is now read and named, so `MALFORMED_FUNCTION_CALL` points at
+  the missing CLI instead of at an imagined content filter.
+
 ## 0.2.6 - 2026-08-06
 
 A review of a pull request could be several screens of correct, careful analysis

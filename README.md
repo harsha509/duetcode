@@ -262,21 +262,41 @@ Plan review and answer review (second opinions on plans and on text answers)
 use built-in templates. All prompts forbid the models from running `git add`,
 `git commit`, or `git push` — changes stay uncommitted for you to inspect.
 
-The reviewer ends every review with a machine-parsed verdict line:
+The reviewer ends every review with machine-parsed sections:
 
 ```
-VERDICT: APPROVED | CHANGES_REQUESTED
+FILES READ: <paths>, or none
 
 BLOCKERS:
-- <issue>
+- <defect that has to be fixed before this can merge>
 
 SUGGESTIONS:
 - <improvement>
+- Nit: <optional — taste or polish, raised freely and never blocking>
+
+VERDICT: APPROVED | CHANGES_REQUESTED
 ```
 
-A review of an *answer* ends `VERDICT: SOUND | UNSOUND` instead, and adds a
-`FILES READ:` line naming everything the reviewer actually opened — so a review
-that inspected nothing says so.
+A review of an *answer* ends `VERDICT: SOUND | UNSOUND` instead.
+
+`FILES READ:` is checked, not taken on trust. dt records the files the reviewer
+actually opened from its own tool calls, and warns when a review names one it
+never read:
+
+```
+⚠ gemini listed services/billing.py as read, but opened only utils/vapi.py
+  this turn — treat that part of the review as unverified
+```
+
+It is the one claim in a review that does not have to be believed, so `none` is
+a legitimate answer — a review of the diff alone is still a review.
+
+A blocker has to be a defect the reviewer can say how to reach; anything it
+could not verify, and anything it would merely have written differently, is a
+suggestion. Standalone reviews (`dt review`, the panel's review button) start
+from a clean model session, so a verdict is a fresh judgement rather than a
+continuation of whatever the reviewer last concluded. Rounds within one task
+keep their continuity, which is where it earns its keep.
 
 ## Session logs
 
@@ -285,6 +305,7 @@ Each run creates `.duet/sessions/{timestamp}-{task-slug}/`:
 | File | Content |
 |------|---------|
 | `prompt.md` | Original task |
+| `roles.json` | Which model wrote and which reviewed, written when the session is created |
 | `state.json` | Final outcome and metadata |
 | `round-{n}/claude_out.md` | Writer's response |
 | `round-{n}/gemini_out.md` | Reviewer's response |
