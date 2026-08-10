@@ -313,11 +313,12 @@ pub fn answer_review_only(
         return Ok(unreviewed_result(0, refused.message.into(), None));
     }
 
+    let changes = changes_block(&subject, reviewer);
     let mut prompt = prompts::build_answer_review_prompt(
         prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE,
         task,
         answer,
-        &changes_block(&subject),
+        &changes.text,
         access_block(reviewer, &subject),
         &git::repo_identity(repo_dir),
     );
@@ -341,6 +342,7 @@ pub fn answer_review_only(
     }
 
     report_unsupported_reads(reviewer, &response, sink);
+    report_unread_truncation(reviewer, changes.truncated, sink);
     let verdict = policy::parse_verdict(&response);
     emit_verdict(sink, VerdictKind::Answer, &verdict);
     costs.summary();
@@ -869,11 +871,12 @@ fn run_answer_review(
     subject: &Subject,
     sink: &dyn Sink,
 ) -> Result<ReviewOutcome> {
+    let changes = changes_block(subject, reviewer);
     let mut prompt = prompts::build_answer_review_prompt(
         prompts::DEFAULT_ANSWER_REVIEW_TEMPLATE,
         opts.task,
         input.writer_notes,
-        &changes_block(subject),
+        &changes.text,
         access_block(reviewer, subject),
         &git::repo_identity(opts.repo_dir),
     );
@@ -895,6 +898,7 @@ fn run_answer_review(
         sink.event(Event::Response { model: reviewer.name().to_string(), text: response.clone() });
     }
 
+    report_unread_truncation(reviewer, changes.truncated, sink);
     let verdict = policy::parse_verdict(&response);
     emit_verdict(sink, VerdictKind::Answer, &verdict);
 
@@ -1077,7 +1081,10 @@ enum Subject {
     /// reviewing — but the reviewer has to be told which half it cannot see,
     /// or it judges those claims from the checkout, which is the failure this
     /// whole path exists to prevent.
-    Fetched { diff: String, labels: Vec<String>, missing: Vec<String> },
+    ///
+    /// `truncated` says the diff was cut to fit its budget — which decides
+    /// whether a verdict that opened no files can be taken at its word.
+    Fetched { diff: String, labels: Vec<String>, missing: Vec<String>, truncated: bool },
     /// The answer is about a change outside the checkout that could not be
     /// retrieved. There is nothing here to review: no diff, and a reviewer whose
     /// tools would read a different revision while reporting it as the change.
@@ -1159,30 +1166,37 @@ fn resolve_subject(task: &str, repo_dir: &Path, sink: &dyn Sink) -> Subject {
             labels.join(", ")
         ),
     });
-    Subject::Fetched { diff: join_fetched_diffs(&fetched), labels, missing }
+    let (diff, truncated) = join_fetched_diffs(&fetched);
+    Subject::Fetched { diff, labels, missing, truncated }
 }
 
 /// One labelled block per pull request, sharing the budget evenly so a single
-/// huge change cannot squeeze the others out of the prompt entirely.
-fn join_fetched_diffs(parts: &[(String, String)]) -> String {
+/// huge change cannot squeeze the others out of the prompt entirely. The flag
+/// says whether any of them had to be cut.
+fn join_fetched_diffs(parts: &[(String, String)]) -> (String, bool) {
     let share = FETCHED_DIFF_BYTES / parts.len().max(1);
-    parts
+    let mut any_truncated = false;
+    let joined = parts
         .iter()
         .map(|(label, diff)| {
             let body = match truncate_bytes(diff, share) {
                 (kept, false) => kept.to_string(),
-                (kept, true) => format!(
-                    "{}\n\n[{} truncated at {} KB — later files are not shown. Say the diff is \
-                     insufficient where that matters.]",
-                    kept,
-                    label,
-                    share / 1024,
-                ),
+                (kept, true) => {
+                    any_truncated = true;
+                    format!(
+                        "{}\n\n[{} truncated at {} KB — later files are not shown. Say the diff \
+                         is insufficient where that matters.]",
+                        kept,
+                        label,
+                        share / 1024,
+                    )
+                }
             };
             format!("───── {} ─────\n{}", label, body)
         })
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+    (joined, any_truncated)
 }
 
 /// Why this review must not be run, or `None` when it can be.
@@ -1263,24 +1277,52 @@ fn access_block(reviewer: &dyn ModelAdapter, subject: &Subject) -> &'static str 
     }
 }
 
+/// The code the answer is judged against, as it appears in the prompt, and
+/// whether it had to be cut to fit — the part that decides what a verdict
+/// which opened no files is worth.
+struct ChangesBlock {
+    text: String,
+    truncated: bool,
+}
+
+/// What a truncated changes block demands of a reviewer that can read: the
+/// cut is only survivable if the reviewer covers it, so a review that opens
+/// nothing and declares nothing unverified has judged evidence it never saw.
+/// Empty for a reviewer without tools, which can only name what it is missing.
+fn read_requirement(reviewer: &dyn ModelAdapter) -> &'static str {
+    if !reviewer.can_read_files() {
+        return "";
+    }
+    "\n\n[the diff above is incomplete, so a verdict cannot rest on it alone: open the files \
+     your judgement leans on with your read-only tools, under the access rules in this prompt, \
+     and list what you still could not check under UNVERIFIED. Ending with both `FILES READ: \
+     none` and `UNVERIFIED: none` is not an acceptable review of a truncated diff.]"
+}
+
 /// The code the answer is judged against, as it appears in the prompt. Says
 /// plainly when there is nothing, so the reviewer judges the prose alone
-/// instead of assuming evidence it was never given.
-fn changes_block(subject: &Subject) -> String {
+/// instead of assuming evidence it was never given — and, when there is too
+/// much, holds a reviewer with tools to reading past the cut.
+fn changes_block(subject: &Subject, reviewer: &dyn ModelAdapter) -> ChangesBlock {
     match subject {
-        Subject::Nothing => {
-            "(nothing uncommitted in the working tree — judge the answer on its own)".into()
-        }
-        Subject::WorkingTree(diff) => match truncate_bytes(diff, ANSWER_REVIEW_DIFF_BYTES) {
-            (kept, false) => kept.to_string(),
-            (kept, true) => format!(
-                "{}\n\n[diff truncated at {} KB — later files are not shown. Judge only what is \
-                 above, and say the diff is insufficient where it matters.]",
-                kept,
-                ANSWER_REVIEW_DIFF_BYTES / 1024,
-            ),
+        Subject::Nothing => ChangesBlock {
+            text: "(nothing uncommitted in the working tree — judge the answer on its own)".into(),
+            truncated: false,
         },
-        Subject::Fetched { diff, labels, missing } => {
+        Subject::WorkingTree(diff) => match truncate_bytes(diff, ANSWER_REVIEW_DIFF_BYTES) {
+            (kept, false) => ChangesBlock { text: kept.to_string(), truncated: false },
+            (kept, true) => ChangesBlock {
+                text: format!(
+                    "{}\n\n[diff truncated at {} KB — later files are not shown. Judge only what \
+                     is above, and say the diff is insufficient where it matters.]{}",
+                    kept,
+                    ANSWER_REVIEW_DIFF_BYTES / 1024,
+                    read_requirement(reviewer),
+                ),
+                truncated: true,
+            },
+        },
+        Subject::Fetched { diff, labels, missing, truncated } => {
             let mut block = format!(
                 "{}, fetched with `gh pr diff`. This — not the working tree of the checkout you \
                  are standing in — is the change under discussion.\n\n{}",
@@ -1295,14 +1337,19 @@ fn changes_block(subject: &Subject) -> String {
                     missing.join(", "),
                 ));
             }
-            block
+            if *truncated {
+                block.push_str(read_requirement(reviewer));
+            }
+            ChangesBlock { text: block, truncated: *truncated }
         }
         // Refused before a prompt is ever built; stated rather than asserted
         // away, so a future caller that skips the refusal gets an honest block
         // instead of a confident one.
-        Subject::Absent { .. } => {
-            "(the change under discussion is not in this checkout and could not be fetched)".into()
-        }
+        Subject::Absent { .. } => ChangesBlock {
+            text: "(the change under discussion is not in this checkout and could not be fetched)"
+                .into(),
+            truncated: false,
+        },
     }
 }
 
@@ -1343,6 +1390,30 @@ fn report_unsupported_reads(reviewer: &dyn ModelAdapter, response: &str, sink: &
             } else {
                 format!("only {}", opened.join(", "))
             },
+        ),
+    });
+}
+
+/// Warns when a verdict was returned over a truncated diff without a single
+/// file opened to cover the cut.
+///
+/// The truncation notice tells a reviewer with tools to read past the cut or
+/// name what it took on trust; a review that does neither has judged evidence
+/// it never saw. Deliberately not a failure, for the same reason as
+/// [`report_unsupported_reads`]: the verdict underneath may still be right,
+/// and the reader is the one who should decide what it is worth.
+fn report_unread_truncation(reviewer: &dyn ModelAdapter, truncated: bool, sink: &dyn Sink) {
+    if !truncated || !reviewer.can_read_files() {
+        return;
+    }
+    if !reviewer.files_opened_last_turn().is_empty() {
+        return;
+    }
+    sink.event(Event::Warn {
+        text: format!(
+            "{} returned a verdict on a truncated diff without opening a single file — the \
+             claims past the cut were taken on trust; treat the verdict as unverified there",
+            reviewer.name(),
         ),
     });
 }
@@ -1528,6 +1599,7 @@ mod tests {
             diff: "+ fn added() {}".into(),
             labels: vec!["acme/api#529".into()],
             missing: Vec::new(),
+            truncated: false,
         }
     }
 
@@ -1688,23 +1760,46 @@ mod tests {
     /// an empty section as evidence it was given and never looked at.
     #[test]
     fn an_empty_tree_is_named_rather_than_left_blank() {
-        assert!(changes_block(&Subject::Nothing).contains("nothing uncommitted"));
+        let block = changes_block(&Subject::Nothing, &Reviewer { reads_files: true });
+        assert!(block.text.contains("nothing uncommitted"));
+        assert!(!block.truncated);
     }
 
     #[test]
     fn a_diff_within_the_cap_is_attached_whole() {
         let diff = "diff --git a/src/lib.rs b/src/lib.rs\n+fn added() {}\n";
-        assert_eq!(changes_block(&Subject::WorkingTree(diff.into())), diff);
+        let block =
+            changes_block(&Subject::WorkingTree(diff.into()), &Reviewer { reads_files: true });
+        assert_eq!(block.text, diff);
+        assert!(!block.truncated);
     }
 
     /// A truncated diff must announce the truncation: a reviewer that thinks it
     /// saw every file will report absences that are only missing from the cut.
+    /// One with tools is also told a review that opens nothing and declares
+    /// nothing unverified is unacceptable — the demand a zero-read rubber
+    /// stamp slipped past.
     #[test]
     fn an_oversized_diff_is_cut_and_says_so() {
         let diff = "x".repeat(ANSWER_REVIEW_DIFF_BYTES * 2);
-        let block = changes_block(&Subject::WorkingTree(diff.clone()));
-        assert!(block.contains("diff truncated"));
-        assert!(block.len() < diff.len());
+        let block =
+            changes_block(&Subject::WorkingTree(diff.clone()), &Reviewer { reads_files: true });
+        assert!(block.text.contains("diff truncated"));
+        assert!(block.text.contains("not an acceptable review"));
+        assert!(block.text.len() < diff.len());
+        assert!(block.truncated);
+    }
+
+    /// The read demand would be a taunt to a reviewer with no tools — it can
+    /// only name what it is missing, and the truncation notice already says so.
+    #[test]
+    fn a_blind_reviewer_is_not_told_to_read() {
+        let diff = "x".repeat(ANSWER_REVIEW_DIFF_BYTES * 2);
+        let block =
+            changes_block(&Subject::WorkingTree(diff), &Reviewer { reads_files: false });
+        assert!(block.text.contains("diff truncated"));
+        assert!(!block.text.contains("not an acceptable review"));
+        assert!(block.truncated);
     }
 
     /// A fetched diff has to be labelled as the subject. A reviewer that reads
@@ -1712,10 +1807,31 @@ mod tests {
     /// cover — which is the wrong revision.
     #[test]
     fn a_fetched_change_is_named_and_set_against_the_checkout() {
-        let block = changes_block(&fetched());
-        assert!(block.contains("acme/api#529"));
-        assert!(block.contains("not the working tree"));
-        assert!(block.contains("+ fn added() {}"));
+        let block = changes_block(&fetched(), &Reviewer { reads_files: true });
+        assert!(block.text.contains("acme/api#529"));
+        assert!(block.text.contains("not the working tree"));
+        assert!(block.text.contains("+ fn added() {}"));
+        assert!(!block.truncated);
+    }
+
+    /// A cut fetched diff carries the same read demand as a cut working tree:
+    /// this is the exact shape of the zero-read rubber stamp observed in the
+    /// wild — 117 KB of truncated PR, `FILES READ: none`, `VERDICT: SOUND`.
+    #[test]
+    fn a_truncated_fetched_change_demands_reads_of_a_reviewer_with_tools() {
+        let subject = Subject::Fetched {
+            diff: "+ fn added() {}".into(),
+            labels: vec!["acme/api#529".into()],
+            missing: Vec::new(),
+            truncated: true,
+        };
+        let block = changes_block(&subject, &Reviewer { reads_files: true });
+        assert!(block.text.contains("not an acceptable review"));
+        assert!(block.truncated);
+
+        let blind = changes_block(&subject, &Reviewer { reads_files: false });
+        assert!(!blind.text.contains("not an acceptable review"));
+        assert!(blind.truncated);
     }
 
     /// The pull requests share the budget, so one enormous change cannot push
@@ -1726,10 +1842,11 @@ mod tests {
             ("acme/api#1".to_string(), "x".repeat(FETCHED_DIFF_BYTES * 2)),
             ("acme/ui#2".to_string(), "+ small\n".to_string()),
         ];
-        let joined = join_fetched_diffs(&parts);
+        let (joined, truncated) = join_fetched_diffs(&parts);
         assert!(joined.contains("acme/api#1"));
         assert!(joined.contains("acme/ui#2"));
         assert!(joined.contains("truncated at"));
+        assert!(truncated);
         // The small one survives whole even though the first blew its share.
         assert!(joined.contains("+ small"));
         assert!(joined.len() < FETCHED_DIFF_BYTES + 1_000);
@@ -1745,12 +1862,13 @@ mod tests {
             diff: "+ fn added() {}".into(),
             labels: vec!["acme/api#529".into()],
             missing: vec!["acme/ui#451".into()],
+            truncated: false,
         };
-        let block = changes_block(&partial);
-        assert!(block.contains("acme/api#529"));
-        assert!(block.contains("acme/ui#451"));
-        assert!(block.contains("could not be fetched"));
-        assert!(block.contains("say the evidence is missing"));
+        let block = changes_block(&partial, &Reviewer { reads_files: true });
+        assert!(block.text.contains("acme/api#529"));
+        assert!(block.text.contains("acme/ui#451"));
+        assert!(block.text.contains("could not be fetched"));
+        assert!(block.text.contains("say the evidence is missing"));
     }
 
     /// Refused before any prompt is built — but if a future caller ever skips
@@ -1758,8 +1876,69 @@ mod tests {
     /// handed a blank it will read as "no changes".
     #[test]
     fn an_unfetchable_change_is_never_described_as_nothing() {
-        let block = changes_block(&absent());
-        assert!(block.contains("could not be fetched"));
+        let block = changes_block(&absent(), &Reviewer { reads_files: true });
+        assert!(block.text.contains("could not be fetched"));
+    }
+
+    /// A reviewer that read files during its turn, for the truncation warning
+    /// tests: the warning is about doing no reading at all, not about which
+    /// files were chosen.
+    struct ReadingReviewer {
+        opened: Vec<String>,
+    }
+
+    impl ModelAdapter for ReadingReviewer {
+        fn generate(&mut self, _: &str, _: &[ImageInput]) -> Result<(String, UsageStats)> {
+            panic!("the truncation warning must not call the reviewer");
+        }
+
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn can_read_files(&self) -> bool {
+            true
+        }
+
+        fn files_opened_last_turn(&self) -> Vec<String> {
+            self.opened.clone()
+        }
+    }
+
+    /// Collects warnings, so a test can assert one fired without a terminal.
+    struct WarnCollector(std::sync::Mutex<Vec<String>>);
+
+    impl Sink for WarnCollector {
+        fn event(&self, event: Event) {
+            if let Event::Warn { text } = event {
+                self.0.lock().unwrap().push(text);
+            }
+        }
+
+        fn ask(&self, _kind: AskKind, _question: &str) -> String {
+            String::new()
+        }
+    }
+
+    /// The observed failure: a verdict on a truncated diff from a reviewer
+    /// that opened nothing. The warning fires only when every part lines up —
+    /// a cut diff, a reviewer with tools, and not one file read to cover it.
+    #[test]
+    fn a_zero_read_verdict_on_a_truncated_diff_is_warned_about() {
+        let fires = |truncated: bool, opened: Vec<String>| {
+            let sink = WarnCollector(std::sync::Mutex::new(Vec::new()));
+            report_unread_truncation(&ReadingReviewer { opened }, truncated, &sink);
+            !sink.0.into_inner().unwrap().is_empty()
+        };
+
+        assert!(fires(true, Vec::new()));
+        assert!(!fires(false, Vec::new()));
+        assert!(!fires(true, vec!["src/lib.rs".into()]));
+
+        // A reviewer with no tools cannot be blamed for not using them.
+        let sink = WarnCollector(std::sync::Mutex::new(Vec::new()));
+        report_unread_truncation(&Reviewer { reads_files: false }, true, &sink);
+        assert!(sink.0.lock().unwrap().is_empty());
     }
 
     /// Records whether the loop stopped to ask, and answers yes if it did.

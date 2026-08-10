@@ -44,6 +44,10 @@ pub struct GeminiAdapter {
     /// Directories already sized up for the CLI's file crawler, so each is
     /// warned about at most once however many rounds run inside it.
     crawl_checked: HashSet<PathBuf>,
+    /// The subset of those whose trees are too large to crawl. Any run whose
+    /// workspace touches one gets the crawl guard from the first spawn instead
+    /// of an OOM death and a retry.
+    crawl_hazards: HashSet<PathBuf>,
     sink: Arc<dyn Sink>,
 }
 
@@ -88,6 +92,23 @@ fn should_restart_session(was_resuming: bool, connected: bool) -> bool {
 /// without them still opens files and greps through ripgrep, where the API
 /// fallback it would otherwise become reads nothing at all.
 const CRAWLER_TOOLS: &[&str] = &["glob", "read_many_files"];
+
+/// Appended to the prompt of every crawl-guarded run. The CLI drops excluded
+/// tools from the toolkit without telling the model why, and a model that
+/// finds its bulk tools missing has been observed to stop reading altogether —
+/// a 51k-token review answered with zero tool calls — rather than fall back to
+/// the tools still present. What to read stays the model's decision; this only
+/// says that reading still works.
+const CRAWL_GUARD_PROMPT_NOTE: &str = "\n\n[tooling note: this workspace is too large for the \
+    bulk file tools, so glob and read_many_files are disabled for this run. read_file and \
+    ripgrep search still work — open the specific files your answer depends on, and grep for \
+    what you can no longer glob, rather than answering from the prompt alone.]";
+
+/// `prompt` with the crawl-guard note attached, for any run spawned with the
+/// crawler tools excluded.
+fn with_crawl_guard_note(prompt: &str) -> String {
+    format!("{}{}", prompt, CRAWL_GUARD_PROMPT_NOTE)
+}
 
 /// Whether a failed CLI run died of memory exhaustion. Node prints the heap
 /// trace on its way down; a SIGKILL with no output is the OS reclaiming
@@ -224,6 +245,7 @@ impl GeminiAdapter {
             sessions: HashMap::new(),
             files_opened: Vec::new(),
             crawl_checked: HashSet::new(),
+            crawl_hazards: HashSet::new(),
             sink,
         })
     }
@@ -264,21 +286,39 @@ impl GeminiAdapter {
         }
     }
 
-    /// Warns, once per directory, when the CLI's file crawler would walk a
-    /// tree large enough to kill it. Covers the sibling dirs too: a glob
-    /// searches every workspace directory, not just the one under review.
-    fn warn_crawl_hazards(&mut self) {
+    /// Sizes up, once per directory, what the CLI's file crawler would walk,
+    /// warning about any tree large enough to kill it. Covers the sibling
+    /// dirs too: a glob searches every workspace directory, not just the one
+    /// under review.
+    ///
+    /// Returns whether the current workspace holds any such tree, so the
+    /// caller can disable the crawler up front — the assessment already knows
+    /// how a crawl here ends, and letting it run only adds the crash.
+    fn crawl_guard_needed(&mut self) -> bool {
         let dirs: Vec<PathBuf> = std::iter::once(self.working_dir.clone())
             .chain(self.readable_dirs.iter().cloned())
             .collect();
-        for dir in dirs {
+        let mut newly_hazardous = false;
+        for dir in &dirs {
             if !self.crawl_checked.insert(dir.clone()) {
                 continue;
             }
-            if let Some(warning) = super::crawl::assess(&dir).warning() {
+            if let Some(warning) = super::crawl::assess(dir).warning() {
                 self.sink.event(Event::Warn { text: warning });
+                self.crawl_hazards.insert(dir.clone());
+                newly_hazardous = true;
             }
         }
+        if newly_hazardous {
+            self.sink.event(Event::Warn {
+                text: format!(
+                    "running with gemini's crawler tools ({}) disabled so the run survives — \
+                     file reads and ripgrep search still work",
+                    CRAWLER_TOOLS.join(", ")
+                ),
+            });
+        }
+        dirs.iter().any(|dir| self.crawl_hazards.contains(dir))
     }
 
     fn run_cli(
@@ -286,7 +326,6 @@ impl GeminiAdapter {
         prompt: &str,
         crawl_guard: Option<&Path>,
     ) -> Result<(String, UsageStats)> {
-        self.warn_crawl_hazards();
         // Cleared per turn: what matters is what this answer went and read, not
         // what some earlier answer did.
         self.files_opened.clear();
@@ -748,14 +787,22 @@ impl ModelAdapter for GeminiAdapter {
             });
         }
 
-        let mut result = self.run_cli(prompt, None);
+        // A workspace the preflight sized as lethal to the crawler gets the
+        // guard from the first spawn: the same degraded run the OOM retry
+        // below would reach, without paying for the crash on the way.
+        let guard = if self.crawl_guard_needed() { crawl_guard_settings().ok() } else { None };
+        let mut result = match &guard {
+            Some(path) => self.run_cli(&with_crawl_guard_note(prompt), Some(path)),
+            None => self.run_cli(prompt, None),
+        };
 
         // An OOM death gets one retry with the crawler tools disabled before
         // any thought of the API: a reviewer that reads files but cannot glob
-        // beats one that cannot read at all.
+        // beats one that cannot read at all. Not when the guard was already
+        // on — the identical spawn cannot end differently.
         if let Err(e) = &result {
-            if is_oom_failure(e) {
-                if let Ok(guard) = crawl_guard_settings() {
+            if guard.is_none() && is_oom_failure(e) {
+                if let Ok(retry_guard) = crawl_guard_settings() {
                     self.sink.event(Event::Warn {
                         text: format!(
                             "gemini ran out of memory crawling the workspace — retrying with \
@@ -764,7 +811,7 @@ impl ModelAdapter for GeminiAdapter {
                             CRAWLER_TOOLS.join(", ")
                         ),
                     });
-                    result = self.run_cli(prompt, Some(&guard));
+                    result = self.run_cli(&with_crawl_guard_note(prompt), Some(&retry_guard));
                 }
             }
         }
@@ -1301,6 +1348,21 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(names, vec!["glob", "read_many_files"]);
+    }
+
+    /// A guarded run's prompt must name what is gone and what remains. The CLI
+    /// removes excluded tools silently, and a model that only sees two tools
+    /// missing answers from the prompt alone instead of reaching for the
+    /// reads and greps it still has.
+    #[test]
+    fn the_crawl_guard_note_names_what_is_gone_and_what_remains() {
+        for tool in CRAWLER_TOOLS {
+            assert!(CRAWL_GUARD_PROMPT_NOTE.contains(tool), "note omits {}", tool);
+        }
+        let noted = with_crawl_guard_note("PROMPT");
+        assert!(noted.starts_with("PROMPT"));
+        assert!(noted.contains("read_file"));
+        assert!(noted.contains("ripgrep"));
     }
 
     /// An explicit `mode = "cli"` must not silently degrade to the API
