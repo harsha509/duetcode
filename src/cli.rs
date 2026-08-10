@@ -1,5 +1,6 @@
 use crate::adapters::claude::ClaudeAdapter;
 use crate::adapters::gemini::GeminiAdapter;
+use crate::adapters::ripgrep::{ripgrep_status, RipgrepStatus};
 use crate::adapters::{ImageInput, ModelAdapter};
 use crate::config::Config;
 use crate::events::{Sink, TerminalSink};
@@ -439,6 +440,13 @@ fn cmd_doctor(dir: &Path, verbose: bool) -> Result<()> {
     println!("{}\n", "dt doctor".cyan().bold());
     let mut all_ok = true;
 
+    if git::is_git_available() {
+        println!("  {} git found", "✓".green());
+    } else {
+        println!("  {} git — not found (install git; every diff dt reviews comes from it)", "✗".red());
+        all_ok = false;
+    }
+
     if git::is_git_repo(dir) {
         println!("  {} git repository", "✓".green());
     } else {
@@ -525,6 +533,27 @@ fn cmd_doctor(dir: &Path, verbose: bool) -> Result<()> {
 
     if gemini_cli_ok {
         println!("  {} {} CLI found", "✓".green(), gemini_config.command);
+        // The CLI is only as good as its search tool: without a ripgrep it
+        // trusts, it greps in-process and can run out of memory mid-review.
+        match ripgrep_status() {
+            RipgrepStatus::Trusted(path) => {
+                println!("  {} ripgrep found ({})", "✓".green(), path.display());
+            }
+            status => {
+                if let Some(warning) = status.warning() {
+                    println!("  {} {}", "!".yellow(), warning);
+                }
+            }
+        }
+        let crawl = crate::adapters::crawl::assess(dir);
+        match crawl.warning() {
+            None => println!(
+                "  {} workspace size OK for gemini's file crawler ({} entries)",
+                "✓".green(),
+                crawl.entries
+            ),
+            Some(warning) => println!("  {} {}", "!".yellow(), warning),
+        }
     } else {
         println!(
             "  {} {} CLI — not found (npm i -g @google/gemini-cli)",

@@ -1,6 +1,8 @@
 pub mod claude;
+pub mod crawl;
 pub mod gemini;
 pub mod pricing;
+pub mod ripgrep;
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};

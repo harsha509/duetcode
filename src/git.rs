@@ -6,6 +6,17 @@ pub fn is_git_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
+/// Whether the `git` binary itself is runnable. `is_git_repo` only looks for
+/// a `.git` directory, so without this a machine with no git at all reports
+/// "not a repository" — the wrong problem, with the wrong fix.
+pub fn is_git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn current_branch(dir: &Path) -> Result<String> {
     let output = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])

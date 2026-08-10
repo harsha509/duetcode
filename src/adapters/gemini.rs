@@ -4,7 +4,7 @@ use crate::events::{Event, Sink};
 use crate::ui;
 use anyhow::{Context, Result};
 use colored::Colorize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -41,6 +41,9 @@ pub struct GeminiAdapter {
     /// Files opened during the most recent `generate`, so a review's account of
     /// what it read can be checked rather than believed.
     files_opened: Vec<String>,
+    /// Directories already sized up for the CLI's file crawler, so each is
+    /// warned about at most once however many rounds run inside it.
+    crawl_checked: HashSet<PathBuf>,
     sink: Arc<dyn Sink>,
 }
 
@@ -79,6 +82,78 @@ fn should_restart_session(was_resuming: bool, connected: bool) -> bool {
     was_resuming && !connected
 }
 
+/// Tools whose implementation enumerates the whole workspace in memory before
+/// filtering, which is what dies on a checkout carrying a large dependency
+/// tree. Disabled only for the retry after an out-of-memory death: a reviewer
+/// without them still opens files and greps through ripgrep, where the API
+/// fallback it would otherwise become reads nothing at all.
+const CRAWLER_TOOLS: &[&str] = &["glob", "read_many_files"];
+
+/// Whether a failed CLI run died of memory exhaustion. Node prints the heap
+/// trace on its way down; a SIGKILL with no output is the OS reclaiming
+/// memory, which `describe_status` already names as such.
+fn is_oom_failure(error: &anyhow::Error) -> bool {
+    let text = format!("{:#}", error);
+    text.contains("heap out of memory")
+        || text.contains("Ineffective mark-compacts")
+        || text.contains("SIGKILL")
+}
+
+/// `base` with the crawler tools added to `tools.exclude`, every other
+/// setting left exactly as it was. Anything that is not the expected shape is
+/// replaced rather than tripped over — these files are user-edited.
+fn with_crawler_tools_excluded(mut base: serde_json::Value) -> serde_json::Value {
+    if !base.is_object() {
+        base = serde_json::json!({});
+    }
+    let root = base.as_object_mut().expect("just made an object");
+    let tools = root.entry("tools").or_insert_with(|| serde_json::json!({}));
+    if !tools.is_object() {
+        *tools = serde_json::json!({});
+    }
+    let exclude = tools
+        .as_object_mut()
+        .expect("just made an object")
+        .entry("exclude")
+        .or_insert_with(|| serde_json::json!([]));
+    if !exclude.is_array() {
+        *exclude = serde_json::json!([]);
+    }
+    let list = exclude.as_array_mut().expect("just made an array");
+    for tool in CRAWLER_TOOLS {
+        if !list.iter().any(|v| v.as_str() == Some(tool)) {
+            list.push(serde_json::Value::String((*tool).to_string()));
+        }
+    }
+    base
+}
+
+/// Writes the settings file for an OOM retry and returns its path, handed to
+/// the CLI via `GEMINI_CLI_SYSTEM_SETTINGS_PATH`. Built on top of whatever
+/// system settings the CLI would otherwise read, so pointing it at this file
+/// shadows nothing but the two tools it exists to disable.
+fn crawl_guard_settings() -> Result<PathBuf> {
+    let base_path = std::env::var("GEMINI_CLI_SYSTEM_SETTINGS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                PathBuf::from("/Library/Application Support/GeminiCli/settings.json")
+            } else {
+                PathBuf::from("/etc/gemini-cli/settings.json")
+            }
+        });
+    let base = std::fs::read_to_string(&base_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let merged = with_crawler_tools_excluded(base);
+    let path = std::env::temp_dir().join("duetcode-gemini-crawl-guard.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&merged)?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
 impl GeminiAdapter {
     pub fn new(
         config: &GeminiConfig,
@@ -115,6 +190,15 @@ impl GeminiAdapter {
             );
         }
 
+        // Said up front, not after a crash: a CLI without ripgrep greps
+        // in-process and can die of memory exhaustion mid-review, and the
+        // OOM it leaves behind names nothing the user can act on.
+        if use_cli {
+            if let Some(warning) = super::ripgrep::ripgrep_status().warning() {
+                sink.event(Event::Warn { text: warning });
+            }
+        }
+
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(30))
             .timeout_read(Duration::from_secs(config.timeout_secs))
@@ -139,6 +223,7 @@ impl GeminiAdapter {
             readable_dirs: Vec::new(),
             sessions: HashMap::new(),
             files_opened: Vec::new(),
+            crawl_checked: HashSet::new(),
             sink,
         })
     }
@@ -179,13 +264,35 @@ impl GeminiAdapter {
         }
     }
 
-    fn run_cli(&mut self, prompt: &str) -> Result<(String, UsageStats)> {
+    /// Warns, once per directory, when the CLI's file crawler would walk a
+    /// tree large enough to kill it. Covers the sibling dirs too: a glob
+    /// searches every workspace directory, not just the one under review.
+    fn warn_crawl_hazards(&mut self) {
+        let dirs: Vec<PathBuf> = std::iter::once(self.working_dir.clone())
+            .chain(self.readable_dirs.iter().cloned())
+            .collect();
+        for dir in dirs {
+            if !self.crawl_checked.insert(dir.clone()) {
+                continue;
+            }
+            if let Some(warning) = super::crawl::assess(&dir).warning() {
+                self.sink.event(Event::Warn { text: warning });
+            }
+        }
+    }
+
+    fn run_cli(
+        &mut self,
+        prompt: &str,
+        crawl_guard: Option<&Path>,
+    ) -> Result<(String, UsageStats)> {
+        self.warn_crawl_hazards();
         // Cleared per turn: what matters is what this answer went and read, not
         // what some earlier answer did.
         self.files_opened.clear();
 
         let was_resuming = self.current_session().is_some();
-        let attempt = self.spawn_cli(prompt);
+        let attempt = self.spawn_cli(prompt, crawl_guard);
         let connected = attempt.connected();
         self.record_session(&attempt);
 
@@ -198,14 +305,14 @@ impl GeminiAdapter {
         // The stored session was rejected. Drop it and start clean rather than
         // failing a round over a session id the CLI no longer recognises.
         self.sessions.remove(&self.working_dir);
-        let retry = self.spawn_cli(prompt);
+        let retry = self.spawn_cli(prompt, crawl_guard);
         self.record_session(&retry);
         let CliOutput { text, usage, files_opened, .. } = retry.result?;
         self.files_opened = files_opened;
         Ok((text, usage))
     }
 
-    fn spawn_cli(&self, prompt: &str) -> CliAttempt {
+    fn spawn_cli(&self, prompt: &str, crawl_guard: Option<&Path>) -> CliAttempt {
         let mut cmd = Command::new(&self.config.command);
         cmd.arg("-m")
             .arg(&self.config.model)
@@ -227,6 +334,9 @@ impl GeminiAdapter {
         }
         if let Some(id) = self.current_session() {
             cmd.arg("-r").arg(id);
+        }
+        if let Some(guard) = crawl_guard {
+            cmd.env("GEMINI_CLI_SYSTEM_SETTINGS_PATH", guard);
         }
 
         // The prompt goes in on stdin rather than in `-p`; see `feed_stdin`.
@@ -638,7 +748,28 @@ impl ModelAdapter for GeminiAdapter {
             });
         }
 
-        match self.run_cli(prompt) {
+        let mut result = self.run_cli(prompt, None);
+
+        // An OOM death gets one retry with the crawler tools disabled before
+        // any thought of the API: a reviewer that reads files but cannot glob
+        // beats one that cannot read at all.
+        if let Err(e) = &result {
+            if is_oom_failure(e) {
+                if let Ok(guard) = crawl_guard_settings() {
+                    self.sink.event(Event::Warn {
+                        text: format!(
+                            "gemini ran out of memory crawling the workspace — retrying with \
+                             its crawler tools ({}) disabled; file reads and ripgrep search \
+                             still work",
+                            CRAWLER_TOOLS.join(", ")
+                        ),
+                    });
+                    result = self.run_cli(prompt, Some(&guard));
+                }
+            }
+        }
+
+        match result {
             Ok(result) => Ok(result),
             Err(e) if self.can_fall_back_to_api() => {
                 self.sink.event(Event::Warn {
@@ -1117,6 +1248,59 @@ mod tests {
 
         let written = std::thread::spawn(|| Ok(()));
         assert!(prompt_delivered(Some(written)).is_ok());
+    }
+
+    /// The OOM signature is pinned to what node actually prints on its way
+    /// down (observed in the wild), plus the SIGKILL case where the OS killed
+    /// it before it could print anything.
+    #[test]
+    fn an_oom_death_is_recognised_and_an_ordinary_failure_is_not() {
+        let heap = anyhow::anyhow!(
+            "gemini CLI exited with 1: FATAL ERROR: Ineffective mark-compacts near heap limit \
+             Allocation failed - JavaScript heap out of memory"
+        );
+        assert!(is_oom_failure(&heap));
+
+        let killed = anyhow::anyhow!(
+            "gemini CLI was killed (SIGKILL) — usually the machine running out of memory"
+        );
+        assert!(is_oom_failure(&killed));
+
+        let ordinary = anyhow::anyhow!("gemini CLI exited with 42: invalid prompt or arguments");
+        assert!(!is_oom_failure(&ordinary));
+    }
+
+    /// The guard settings ride on top of whatever the machine already has —
+    /// disabling two tools must not cost the user their other settings, their
+    /// own exclusions, or produce duplicates when applied twice.
+    #[test]
+    fn the_crawl_guard_extends_settings_without_clobbering_them() {
+        let base = serde_json::json!({
+            "theme": "dark",
+            "tools": { "exclude": ["some_tool"], "sandbox": true }
+        });
+        let merged = with_crawler_tools_excluded(with_crawler_tools_excluded(base));
+
+        assert_eq!(merged["theme"], "dark");
+        assert_eq!(merged["tools"]["sandbox"], true);
+        let exclude = merged["tools"]["exclude"].as_array().unwrap();
+        let names: Vec<&str> = exclude.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(names, vec!["some_tool", "glob", "read_many_files"]);
+    }
+
+    /// A settings file that is not the expected shape must still come out
+    /// usable — these files are user-edited, and a retry that crashes on a
+    /// malformed one dies twice for one bug.
+    #[test]
+    fn a_malformed_settings_base_is_replaced_not_tripped_over() {
+        let merged = with_crawler_tools_excluded(serde_json::json!({ "tools": "oops" }));
+        let names: Vec<&str> = merged["tools"]["exclude"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(names, vec!["glob", "read_many_files"]);
     }
 
     /// An explicit `mode = "cli"` must not silently degrade to the API

@@ -41,7 +41,11 @@ Then, while reviewing:
 - Never claim a symbol is undefined, removed, unused, or left over from a refactor unless a
   `-` line in this diff actually deletes it. If you cannot see its definition, say the diff
   is insufficient to judge and ask for the file — do not guess.
-- Cite the file path with any line number you give, and only for lines present in the diff."#;
+- Cite the file path with any line number you give, and only for lines present in the diff.
+- Search narrow, not wide. When you glob or grep, point it at a directory the diff touches
+  (`src/`, `tests/`) — never a workspace-wide pattern like `**/*`. Dependency and build trees
+  (a venv, node_modules, target, vendor) are never part of a review, and a workspace-wide
+  crawl can be large enough to kill the review process."#;
 
 /// Asked for only when the task names pull requests, where the question really
 /// being put is "does this merge?" — and several screens of correct, careful
@@ -166,6 +170,10 @@ pub const ANSWER_REVIEW_ACCESS_TOOLS: &str = r#"What you can and cannot check:
   in every line it wrote and still be wrong about the codebase.
 - A cited path that does not exist, or a cited line that says something other than what the answer
   claims, is a blocker. Name the file and say what you found there instead.
+- Search narrow, not wide: point globs and greps at a directory the answer cites, never at the
+  whole workspace with a `**/*` pattern. Dependency and build trees (a venv, node_modules,
+  target, vendor) hold nothing an answer is about, and a workspace-wide crawl can be large
+  enough to kill the review process.
 - You cannot edit anything, and must not try. Never run `git add`, `git commit`, or `git push`.
 - Never write "verified", "confirmed", or "I checked" about a claim you did not actually open the
   file to check. Restating a claim is not verifying it, and reporting verification you did not
@@ -651,5 +659,15 @@ mod tests {
     fn ensure_placeholder_leaves_templates_that_already_have_it_alone() {
         let template = "A {repo} B";
         assert_eq!(ensure_placeholder(template, "repo", "HEAD:"), template);
+    }
+
+    /// Every tool-bearing reviewer is told to scope its searches: a
+    /// workspace-wide glob makes the CLI crawl dependency trees it cannot
+    /// afford to hold in memory. The rule rides in the blocks that reach
+    /// custom prompt files too, not only the built-in templates.
+    #[test]
+    fn tool_bearing_reviewers_are_told_to_search_narrow() {
+        assert!(REVIEW_GROUND_RULES.contains("Search narrow, not wide"));
+        assert!(ANSWER_REVIEW_ACCESS_TOOLS.contains("Search narrow, not wide"));
     }
 }
