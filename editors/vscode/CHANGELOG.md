@@ -5,6 +5,15 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.9 - 2026-08-10
+
+Requires `dt` 0.2.9. No extension-side changes: the version tracks the CLI,
+which now engages gemini's crawl guard before the first spawn on oversized
+checkouts instead of after an out-of-memory death, tells a guarded reviewer
+which tools still work so it keeps reading files, and warns when a verdict
+over a truncated diff arrives with no files opened. Those warnings surface
+in the panel's output like any other.
+
 ## 0.2.8 - 2026-08-10
 
 Requires `dt` 0.2.8. No extension-side changes: the version tracks the CLI,

@@ -8,6 +8,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.9 - 2026-08-10
+
+The 0.2.8 retry kept the reviewer alive on an oversized checkout — and the
+first such review in the wild answered a 51k-token prompt in one pass with
+zero tool calls: `FILES READ: none`, verdict sound, over a diff truncated
+at 117 KB. Alive is not the same as working. The reviewer keeps its file
+tools and keeps deciding what to read; dt now stops the crash from ever
+happening, tells the model what its toolkit still holds, and refuses to
+stay silent when a verdict arrives over evidence nobody read.
+
+### Changed
+
+- **The crawl guard engages before the crash, not after it.** The preflight
+  that sizes up the crawl already knows how a walk over 90,000 entries
+  ends, so a workspace over the hazard threshold now gets the crawler
+  tools disabled on the first spawn — the same degraded run the
+  out-of-memory retry would have reached, without paying for the death and
+  the wasted minutes on the way. The retry stays as a backstop for trees
+  the preflight under-counted, and is skipped when the guard was already
+  on: the identical spawn cannot end differently.
+
+- **A guarded run is told what remains of its toolkit.** The CLI drops
+  excluded tools silently, and the observed response to two tools going
+  missing was to stop reading altogether rather than fall back to the ones
+  still present. Every crawl-guarded prompt now carries a note naming what
+  is gone (`glob`, `read_many_files`) and what still works (`read_file`,
+  ripgrep search) — what to read stays the model's decision; the note only
+  says that reading works.
+
+### Added
+
+- **A truncated diff demands reading, and a zero-read verdict is called
+  out.** When the changes block is cut to fit and the reviewer has file
+  tools, the truncation notice now states the terms: open the files the
+  judgement leans on, list what could not be checked under `UNVERIFIED`,
+  and ending with both `FILES READ: none` and `UNVERIFIED: none` is not an
+  acceptable review. If a verdict still arrives over a cut diff with not
+  one file opened, dt warns that the claims past the cut were taken on
+  trust and the verdict should be treated as unverified there — a warning,
+  not a failure, for the same reason as the unsupported-reads check beside
+  it: the verdict underneath may still be right, and the reader decides
+  what it is worth.
+
 ## 0.2.8 - 2026-08-10
 
 A gemini review died before reading a line of the diff. The CLI's file
