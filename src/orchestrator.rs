@@ -241,6 +241,13 @@ pub fn review_only(
     task: Option<&str>,
     sink: &dyn Sink,
 ) -> Result<OrchestratorResult> {
+    // A task naming a pull request is about that pull request, not about
+    // whatever happens to be uncommitted here, so its diff is fetched and
+    // reviewed in place of the working tree.
+    if let Some(task) = task.filter(|t| review_subject::names_absent_code(t)) {
+        return fetched_review_only(config, reviewer, repo_dir, task, sink);
+    }
+
     let diff = git::git_diff(repo_dir)?;
     if diff.trim().is_empty() {
         anyhow::bail!("no uncommitted changes to review");
@@ -277,6 +284,71 @@ pub fn review_only(
     }
 
     report_unsupported_reads(reviewer, &response, sink);
+    let verdict = policy::parse_verdict(&response);
+    emit_verdict(sink, VerdictKind::Code, &verdict);
+    costs.summary();
+
+    let approved = verdict.verdict == Verdict::Approved;
+    Ok(OrchestratorResult {
+        outcome: if approved { Outcome::Approved } else { Outcome::Stopped },
+        rounds: 1,
+        message: if approved { "approved".into() } else { "changes requested by AI".into() },
+        answer: None,
+    })
+}
+
+/// The review a task gets when it names a change that is not in this checkout:
+/// the named pull requests are fetched and their diff is the subject. The
+/// working tree is deliberately never consulted — reviewing whatever happened
+/// to be uncommitted here while the user pointed at a pull request judges the
+/// wrong code entirely.
+fn fetched_review_only(
+    config: &Config,
+    reviewer: &mut dyn ModelAdapter,
+    repo_dir: &Path,
+    task: &str,
+    sink: &dyn Sink,
+) -> Result<OrchestratorResult> {
+    let subject = resolve_subject(task, repo_dir, sink);
+    if let Some(refused) = refusal(&subject, reviewer) {
+        sink.event(Event::Warn { text: refused.warning });
+        return Ok(unreviewed_result(0, refused.message.into(), None));
+    }
+    let Subject::Fetched { labels, .. } = &subject else {
+        // On a task naming absent code, `resolve_subject` returns Fetched or
+        // Absent, and Absent was refused above.
+        return Ok(unreviewed_result(0, UNGROUNDED_MESSAGE.into(), None));
+    };
+
+    let review_template =
+        load_prompt_template(&config.prompts.review, prompts::DEFAULT_REVIEW_TEMPLATE, repo_dir)?;
+    let changes = changes_block(&subject, reviewer);
+    let review_prompt = prompts::build_review_prompt(
+        &review_template,
+        task,
+        &fetched_repo_block(labels),
+        &changes.text,
+        "",
+        "(not provided — judge the diff on its own)",
+    );
+
+    let mut costs = CostTracker::new(sink);
+    sink.event(Event::Working {
+        actor: reviewer.name().to_string(),
+        action: format!("reviewing {}…", labels.join(", ")),
+    });
+    // A standalone review is a fresh judgement on the change as it stands, so
+    // it starts from a clean session. See `ModelAdapter::reset_session`.
+    reviewer.reset_session();
+    let (response, usage) = reviewer.generate(&review_prompt, &[])?;
+    costs.add(usage);
+
+    if !reviewer.streams_output() {
+        sink.event(Event::Response { model: reviewer.name().to_string(), text: response.clone() });
+    }
+
+    report_unsupported_reads(reviewer, &response, sink);
+    report_unread_truncation(reviewer, changes.truncated, sink);
     let verdict = policy::parse_verdict(&response);
     emit_verdict(sink, VerdictKind::Code, &verdict);
     costs.summary();
@@ -1162,7 +1234,7 @@ fn resolve_subject(task: &str, repo_dir: &Path, sink: &dyn Sink) -> Subject {
     let labels: Vec<String> = fetched.iter().map(|(label, _)| label.clone()).collect();
     sink.event(Event::Info {
         text: format!(
-            "reviewing the answer against {} — not against the working tree",
+            "reviewing against {} — not against the working tree",
             labels.join(", ")
         ),
     });
@@ -1420,6 +1492,19 @@ fn report_unread_truncation(reviewer: &dyn ModelAdapter, truncated: bool, sink: 
 
 fn review_repo_block(dir: &Path) -> String {
     format!("{}\n{}", git::repo_identity(dir), prompts::REVIEW_GROUND_RULES)
+}
+
+/// The `{repo}` block for a review of a fetched change. Names the pull
+/// requests rather than the checkout, and carries the elsewhere ground rules:
+/// the working-tree rules would tell the reviewer to announce this repository
+/// and trust the files around it, which is exactly what ungrounds a fetched
+/// review.
+fn fetched_repo_block(labels: &[String]) -> String {
+    format!(
+        "under review: {} (fetched — not the checkout you are standing in)\n{}",
+        labels.join(", "),
+        prompts::FETCHED_REVIEW_GROUND_RULES
+    )
 }
 
 fn build_repo_context(primary: &Path, workspace: &[PathBuf]) -> Result<String> {
@@ -1696,6 +1781,38 @@ mod tests {
             }
             _ => panic!("a pull request that cannot be fetched must not be reviewable"),
         }
+    }
+
+    /// The reported bug, review-command edition: "review <PR link>" was judged
+    /// against whatever happened to be uncommitted, because the link rode along
+    /// as prose while the working tree was diffed. A task naming a pull request
+    /// that cannot be fetched must now refuse — never call the reviewer on the
+    /// tree — and the nonexistent directory proves no tree was ever read.
+    #[test]
+    fn a_review_task_naming_a_pull_request_never_reviews_the_working_tree() {
+        let config = Config::default();
+        let sink = AskCounter { asked: std::sync::atomic::AtomicUsize::new(0) };
+        let mut reviewer = Reviewer { reads_files: true };
+        let result = review_only(
+            &config,
+            &mut reviewer,
+            Path::new("/nonexistent-checkout"),
+            Some("review https://github.com/acme/api/pull/529"),
+            &sink,
+        )
+        .expect("a refused review is a result, not an error");
+        assert_eq!(result.outcome, Outcome::Unreviewed);
+    }
+
+    /// The `{repo}` block of a fetched review must name the pull request and
+    /// carry the elsewhere rules — handing it the checkout's identity is what
+    /// aimed the reviewer at the wrong code.
+    #[test]
+    fn a_fetched_review_is_grounded_in_the_pull_request_not_the_checkout() {
+        let block = fetched_repo_block(&["acme/api#529".into(), "acme/ui#451".into()]);
+        assert!(block.contains("acme/api#529, acme/ui#451"));
+        assert!(block.contains(prompts::FETCHED_REVIEW_GROUND_RULES));
+        assert!(!block.contains(prompts::REVIEW_GROUND_RULES));
     }
 
     /// The refusal is only useful if it says what was missing and what to do.

@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::events::{AskKind, Event, Sink};
 use crate::git;
 use crate::orchestrator::{self, Outcome, TaskOptions};
+use crate::review_subject;
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -417,6 +418,11 @@ struct ReviewTally {
 /// A project whose last task answered instead of writing code is reviewed as an
 /// answer: the reviewer judges what the writer concluded, against the diff it
 /// concluded it about. Reviewing that diff cold would judge the wrong thing.
+///
+/// A review whose task names a pull request is different again: it is about
+/// that pull request, not about any project's working tree, so it runs exactly
+/// once — ungated by clean trees and undiverted by pending answers, both of
+/// which would put the wrong subject in front of the reviewer.
 fn run_review(
     session_config: &Config,
     reviewer: &mut dyn ModelAdapter,
@@ -425,13 +431,18 @@ fn run_review(
     pending_answers: &HashMap<PathBuf, PendingAnswer>,
     sink: &dyn Sink,
 ) {
-    let targets = review_targets(cmd, workspace);
+    let mut targets = review_targets(cmd, workspace);
+    let pr_task = cmd.task.as_deref().is_some_and(review_subject::names_absent_code);
+    if pr_task {
+        targets = pull_request_target(targets);
+    }
     let multi = targets.len() > 1;
     let mut tally = ReviewTally::default();
 
     for target in &targets {
-        let pending = pending_answers.get(&project_key(&target.dir));
-        if pending.is_none() && !has_changes_to_review(target, multi, sink) {
+        let pending =
+            if pr_task { None } else { pending_answers.get(&project_key(&target.dir)) };
+        if !pr_task && pending.is_none() && !has_changes_to_review(target, multi, sink) {
             continue;
         }
 
@@ -496,6 +507,17 @@ fn run_review(
     }
 
     emit_review_outcome(&targets, &tally, sink);
+}
+
+/// The one checkout a pull-request review runs from. Which one barely matters
+/// — the URL decides what `gh` fetches — so the first git repository wins, and
+/// the first folder stands in when the workspace has none.
+fn pull_request_target(mut targets: Vec<ReviewTarget>) -> Vec<ReviewTarget> {
+    if let Some(at) = targets.iter().position(|t| git::is_git_repo(&t.dir)) {
+        return vec![targets.swap_remove(at)];
+    }
+    targets.truncate(1);
+    targets
 }
 
 /// True when the project is a git repo with something uncommitted. Skips are
@@ -703,6 +725,16 @@ mod tests {
         let workspace = vec![PathBuf::from("/a"), PathBuf::from("/b")];
         let found = review_targets(&command(None, None), &workspace);
         assert_eq!(found.iter().map(|t| t.dir.clone()).collect::<Vec<_>>(), workspace);
+    }
+
+    /// A pull-request review is about the pull request, not about any project,
+    /// so a multi-project workspace must not run the same review once per
+    /// folder. None of these paths is a git repository, which also proves the
+    /// fallback: the first folder stands in.
+    #[test]
+    fn a_pull_request_review_runs_once_not_once_per_project() {
+        let picked = pull_request_target(targets(&["/a", "/b", "/c"]));
+        assert_eq!(picked.iter().map(|t| t.dir.clone()).collect::<Vec<_>>(), vec![PathBuf::from("/a")]);
     }
 
     #[test]

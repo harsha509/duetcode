@@ -47,6 +47,33 @@ Then, while reviewing:
   (a venv, node_modules, target, vendor) are never part of a review, and a workspace-wide
   crawl can be large enough to kill the review process."#;
 
+/// The counterpart of [`REVIEW_GROUND_RULES`] for a fetched change. The
+/// reviewer's tools still work, but on a checkout that is not the change under
+/// review — so rules written for the working tree, which tell the reviewer to
+/// announce this repository and trust the files around it, are exactly what
+/// would unground this review.
+pub const FETCHED_REVIEW_GROUND_RULES: &str = r#"REQUIRED — the first line of your reply must be exactly:
+Reviewing <the pull request(s) named in the block above>
+Write that line before anything else.
+
+Then, while reviewing:
+- The diff above is the change under review, and you are NOT standing in it. The checkout
+  around you is a different revision of the same project, or a different project altogether.
+  Any file you open here may be older than the change, newer than it, or unrelated to it.
+- Settle every claim about what the change does, adds, or removes against the diff itself.
+  That is the only place those claims can be settled.
+- Read-only tools, if you have them, are still worth using for what the diff cannot show: a
+  definition the change calls but does not touch, a caller it never mentions, a convention it
+  departs from. Whenever you use them, say so, and say the file came from the surrounding
+  checkout rather than from the change.
+- Never quote a line number from a file you opened as though it were a line of the change, and
+  never report a finding as confirmed because the checkout agrees with it — the checkout can
+  agree with a change that is wrong, and contradict one that is right.
+- Search narrow, not wide. When you glob or grep, point it at a directory the diff touches
+  (`src/`, `tests/`) — never a workspace-wide pattern like `**/*`. Dependency and build trees
+  (a venv, node_modules, target, vendor) are never part of a review, and a workspace-wide
+  crawl can be large enough to kill the review process."#;
+
 /// Asked for only when the task names pull requests, where the question really
 /// being put is "does this merge?" — and several screens of correct, careful
 /// analysis do not answer it. The detail is what makes the review worth having;
@@ -669,5 +696,16 @@ mod tests {
     fn tool_bearing_reviewers_are_told_to_search_narrow() {
         assert!(REVIEW_GROUND_RULES.contains("Search narrow, not wide"));
         assert!(ANSWER_REVIEW_ACCESS_TOOLS.contains("Search narrow, not wide"));
+        assert!(FETCHED_REVIEW_GROUND_RULES.contains("Search narrow, not wide"));
+    }
+
+    /// The fetched rules exist because the working-tree rules unground a
+    /// fetched review: they must say the reviewer is not standing in the
+    /// change, and must not demand the working-tree announcement of this
+    /// repository's branch and changed files.
+    #[test]
+    fn fetched_ground_rules_point_away_from_the_checkout() {
+        assert!(FETCHED_REVIEW_GROUND_RULES.contains("NOT standing in it"));
+        assert!(!FETCHED_REVIEW_GROUND_RULES.contains("<branch>"));
     }
 }
