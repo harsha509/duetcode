@@ -8,6 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.10 - 2026-08-10
+
+Asking for a review of a pull request by its GitHub link reviewed the
+wrong code: the link rode along as prose in the prompt while the reviewer
+judged whatever happened to be uncommitted in the checkout. The machinery
+that fetches a named pull request already existed, but only answer reviews
+consulted it — the review command itself never did, in any frontend.
+
+### Fixed
+
+- **A review task naming a pull request reviews that pull request.** The
+  review command now runs its task through the same subject detector the
+  answer-review path uses: a task naming a GitHub pull request URL gets
+  that pull request's diff, fetched with `gh pr diff`, as the review
+  subject. When nothing can be fetched — no `gh`, not authenticated, an
+  enterprise host — the review is refused with the ungrounded warning and
+  its way out (`gh pr checkout <number>`), instead of silently falling
+  back to the working tree. Tasks naming no pull request review the
+  working tree exactly as before.
+
+### Changed
+
+- **A fetched review is grounded away from the checkout.** The prompt's
+  repository block for a pull-request review names the pull request rather
+  than the checkout, and carries ground rules written for a reviewer whose
+  tools stand in a different revision: settle every claim against the diff,
+  say when a file came from the surrounding checkout, and never report a
+  finding as confirmed because the checkout agrees with it. The
+  working-tree rules — announce this repository and branch, trust the
+  files around you — are exactly what ungrounds a fetched review.
+
+- **In serve, a pull-request review runs once.** A task naming a pull
+  request is about that pull request, not about any project's working
+  tree, so a multi-project workspace no longer repeats the same review
+  once per folder, a clean tree no longer skips it, and a pending answer
+  no longer diverts it.
+
 ## 0.2.9 - 2026-08-10
 
 The 0.2.8 retry kept the reviewer alive on an oversized checkout — and the
