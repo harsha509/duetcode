@@ -8,6 +8,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.8 - 2026-08-10
+
+A gemini review died before reading a line of the diff. The CLI's file
+crawler enumerates every workspace file in memory before consulting any
+ignore file, and the checkout carried two gitignored venv trees — 90,000
+files the review was never going to read. The node process hit its heap
+limit and was killed; the review silently degraded to the API transport,
+which cannot open files, and then claimed to have read fourteen of them.
+
+None of that crawl is dt's to fix, so dt now sees it coming, says so in
+plain words, and keeps the reviewer reading when it happens anyway.
+
+### Added
+
+- **`dt doctor` verifies a ripgrep gemini will actually use.** Without one,
+  gemini's grep falls back to an in-process implementation that reads whole
+  trees into memory — the same death by another route. Found the way a child
+  process would find it (a shell-function shim does not count), and its real
+  path checked against the CLI's own trusted-prefix allowlist, so a
+  `cargo install ripgrep` in `~/.cargo/bin` is correctly reported as one
+  gemini will refuse. The review itself warns at start when it is missing.
+  Doctor also now checks the `git` binary itself, which every diff comes
+  from — a machine without git used to be misreported as "not a repository".
+
+- **A preflight sizes up what gemini's crawler would walk.** It prunes
+  exactly the directory names the crawler prunes, ignores `.gitignore`
+  exactly as the crawler does, and warns — in doctor and at review start,
+  once per directory, siblings included — naming the offending trees and
+  what they are: `.venv: 48321 entries — Python virtualenv`. The catalog
+  spans ecosystems (venvs, build output, caches, vendored dependencies), so
+  the warning tells the user what is safe to move, not just what is big.
+
+- **Reviewers are told to search narrow.** Every tool-bearing review now
+  carries the rule: point globs and greps at a directory the diff touches,
+  never a workspace-wide pattern — dependency and build trees are never
+  part of a review, and a workspace-wide crawl can kill the process. The
+  rule rides in the blocks dt injects programmatically, so projects with
+  older prompt files get it too.
+
+- **An out-of-memory death gets one retry with the crawler tools disabled.**
+  Only `glob` and `read_many_files` are dropped — injected through
+  `GEMINI_CLI_SYSTEM_SETTINGS_PATH` on top of the machine's own settings,
+  which are preserved — so the retry still opens files and greps through
+  ripgrep. A reviewer that reads but cannot glob beats the toolless API
+  fallback, which is now the last resort instead of the first.
+
 ## 0.2.7 - 2026-08-08
 
 A review said `APPROVED`, listed no blockers, and printed four lines in

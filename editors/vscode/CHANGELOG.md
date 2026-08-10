@@ -5,6 +5,15 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.8 - 2026-08-10
+
+Requires `dt` 0.2.8. No extension-side changes: the version tracks the CLI,
+which this release teaches to survive gemini's workspace crawl on checkouts
+carrying large dependency trees — reviews now warn about the offending
+directories up front (and in `dt doctor`) instead of dying of memory
+exhaustion, and an out-of-memory death retries with the reviewer still able
+to read files. Those warnings surface in the panel's output like any other.
+
 ## 0.2.7 - 2026-08-08
 
 Requires `dt` 0.2.7. A passing review no longer reads like a failing one, and a
