@@ -184,6 +184,7 @@ mode = "auto"                # "cli", "api", or "auto" (CLI with API fallback)
 api_key_env = "ANTHROPIC_API_KEY"
 api_model = "claude-sonnet-4-20250514"
 timeout_secs = 300
+cli_timeout_secs = 1800      # wall-clock budget per CLI run; 0 = no limit
 
 [gemini]
 command = "gemini"
@@ -191,12 +192,14 @@ mode = "auto"                # "cli", "api", or "auto" (CLI with API fallback)
 model = "gemini-3.1-pro-preview"
 api_key_env = "GEMINI_API_KEY"
 timeout_secs = 300
+cli_timeout_secs = 1800      # wall-clock budget per CLI run; 0 = no limit
 
 [checks]
 # Configure these for your project's toolchain
 # test = "npm test"
 # lint = "npm run lint"
 # typecheck = "npx tsc --noEmit"
+timeout_secs = 1800          # wall-clock budget per check; 0 = no limit
 
 [policy]
 max_rounds = 4
@@ -219,11 +222,14 @@ fix = ".duet/prompts/fix.txt"
 | `claude` | `mode` | `"cli"`, `"api"`, or `"auto"` (CLI first, API fallback) | `"auto"` |
 | `claude` | `api_key_env` | Env var holding the Anthropic API key | `"ANTHROPIC_API_KEY"` |
 | `claude` | `api_model` | Model id for API mode | `"claude-sonnet-4-20250514"` |
+| `claude` | `cli_timeout_secs` | Wall-clock budget for one CLI run; 0 = no limit | `1800` |
 | `gemini` | `command` | Path to the Gemini CLI binary | `"gemini"` |
 | `gemini` | `mode` | `"cli"`, `"api"`, or `"auto"` (CLI first, API fallback). Only the CLI can read the code it reviews | `"auto"` |
 | `gemini` | `model` | Gemini model name, used by both transports | `"gemini-3.1-pro-preview"` |
 | `gemini` | `api_key_env` | Env var holding the API key | `"GEMINI_API_KEY"` |
+| `gemini` | `cli_timeout_secs` | Wall-clock budget for one CLI run; 0 = no limit | `1800` |
 | `checks` | `test` / `lint` / `typecheck` | Commands run before each review | *none* |
+| `checks` | `timeout_secs` | Wall-clock budget per check command; 0 = no limit | `1800` |
 | `policy` | `max_rounds` | Round budget (auto mode may extend once, to 2×, after your clarification) | `4` |
 | `policy` | `auto` | Run autonomously by default | `false` |
 | `policy` | `allow_dirty_worktree` | Allow starting with uncommitted changes | `true` |

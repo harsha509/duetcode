@@ -5,11 +5,11 @@ use crate::ui;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -57,6 +57,9 @@ struct CliOutput {
     session_id: Option<String>,
     /// Files the CLI actually opened this turn, from its own tool events.
     files_opened: Vec<String>,
+    /// The CLI's last typed `error` event. Kept apart from `text` so failure
+    /// classification never reads the model's prose.
+    error_detail: Option<String>,
 }
 
 /// One CLI invocation, successful or not. The session id is reported either
@@ -64,12 +67,14 @@ struct CliOutput {
 /// dies later still leaves a resumable session behind.
 struct CliAttempt {
     session_id: Option<String>,
+    /// True when the CLI's own stderr said the session outgrew its context.
+    overflowed: bool,
     result: Result<CliOutput>,
 }
 
 impl CliAttempt {
     fn failed(error: anyhow::Error) -> Self {
-        Self { session_id: None, result: Err(error) }
+        Self { session_id: None, overflowed: false, result: Err(error) }
     }
 
     /// True when the CLI got as far as announcing its session, which means a
@@ -149,11 +154,10 @@ fn with_crawler_tools_excluded(mut base: serde_json::Value) -> serde_json::Value
     base
 }
 
-/// Writes the settings file for an OOM retry and returns its path, handed to
-/// the CLI via `GEMINI_CLI_SYSTEM_SETTINGS_PATH`. Built on top of whatever
-/// system settings the CLI would otherwise read, so pointing it at this file
-/// shadows nothing but the two tools it exists to disable.
-fn crawl_guard_settings() -> Result<PathBuf> {
+/// Writes the settings file for a guarded run, handed to the CLI via
+/// `GEMINI_CLI_SYSTEM_SETTINGS_PATH`. Built on the system settings the CLI
+/// would otherwise read, so it shadows nothing but the two disabled tools.
+fn crawl_guard_settings() -> Result<GuardFile> {
     let base_path = std::env::var("GEMINI_CLI_SYSTEM_SETTINGS_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -168,11 +172,44 @@ fn crawl_guard_settings() -> Result<PathBuf> {
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_else(|| serde_json::json!({}));
 
-    let merged = with_crawler_tools_excluded(base);
-    let path = std::env::temp_dir().join("duetcode-gemini-crawl-guard.json");
-    std::fs::write(&path, serde_json::to_string_pretty(&merged)?)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(path)
+    let content = serde_json::to_string_pretty(&with_crawler_tools_excluded(base))?;
+
+    // The temp dir is shared: a fixed filename there is a file anyone else
+    // can have opened first — a symlink written through, or a concurrent
+    // `dt` race. A fresh, create_new-only name per file avoids both.
+    for _ in 0..3 {
+        let path = candidate_guard_path();
+        match write_new_file(&path, &content) {
+            Ok(()) => return Ok(GuardFile(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to write {}", path.display()));
+            }
+        }
+    }
+    anyhow::bail!("could not create a crawl-guard settings file in {}", std::env::temp_dir().display())
+}
+
+/// A guard settings file that lives exactly as long as the run using it:
+/// written fresh per run so mid-session settings edits are never shadowed by
+/// a stale snapshot, deleted on drop so nothing leaks in the temp dir.
+struct GuardFile(PathBuf);
+
+impl Drop for GuardFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn candidate_guard_path() -> PathBuf {
+    let suffix = RandomState::new().hash_one(());
+    std::env::temp_dir()
+        .join(format!("duetcode-gemini-crawl-guard-{}-{:016x}.json", std::process::id(), suffix))
+}
+
+fn write_new_file(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(content.as_bytes())
 }
 
 impl GeminiAdapter {
@@ -333,16 +370,24 @@ impl GeminiAdapter {
         let was_resuming = self.current_session().is_some();
         let attempt = self.spawn_cli(prompt, crawl_guard);
         let connected = attempt.connected();
+        let overflowed = attempt.overflowed;
         self.record_session(&attempt);
 
-        if !should_restart_session(was_resuming, connected) {
+        // A rejected resume is one failure a fresh session fixes; an overflowed
+        // one is another — the session is still on disk, but too big to continue.
+        let restart = should_restart_session(was_resuming, connected) || (was_resuming && overflowed);
+
+        if !restart {
             let CliOutput { text, usage, files_opened, .. } = attempt.result?;
             self.files_opened = files_opened;
             return Ok((text, usage));
         }
 
-        // The stored session was rejected. Drop it and start clean rather than
-        // failing a round over a session id the CLI no longer recognises.
+        if connected {
+            self.sink.event(Event::Warn {
+                text: "gemini's session outgrew its context — starting a fresh one".to_string(),
+            });
+        }
         self.sessions.remove(&self.working_dir);
         let retry = self.spawn_cli(prompt, crawl_guard);
         self.record_session(&retry);
@@ -398,19 +443,18 @@ impl GeminiAdapter {
             );
         }
 
-        let mut child = match cmd
-            .spawn()
+        let mut child = match crate::process::spawn_grouped(&mut cmd)
             .with_context(|| format!("failed to execute '{}'", self.config.command))
         {
             Ok(child) => child,
             Err(e) => return CliAttempt::failed(e),
         };
 
-        let writer = feed_stdin(&mut child, prompt);
+        let writer = super::feed_stdin(&mut child, prompt);
         let mut attempt = self.finish_cli(&mut child);
         // Joined only once the run is over: a prompt larger than the pipe
         // buffer is still being written while the CLI is answering.
-        let delivered = prompt_delivered(writer);
+        let delivered = super::prompt_delivered(writer);
 
         // A failed write is worth reporting only when the run otherwise looks
         // fine. If the CLI died, the pipe broke because of that, and its own
@@ -418,6 +462,10 @@ impl GeminiAdapter {
         if attempt.result.is_ok() {
             if let Err(e) = delivered {
                 attempt.result = Err(e);
+                // A session whose prompt only partly arrived is poisoned:
+                // dropping the id keeps it out of the store, and makes the
+                // restart path discard the resumed session it went into.
+                attempt.session_id = None;
             }
         }
         attempt
@@ -428,28 +476,68 @@ impl GeminiAdapter {
         // afterwards it would deadlock a long review: once the CLI fills the
         // stderr pipe it blocks writing, so it stops producing stdout, and both
         // processes wait on each other forever.
-        let stderr_drain = drain_stderr(child);
+        let stderr_drain = super::drain_stderr(child);
 
-        let output = match self.stream_cli_json(child) {
+        let timeout = Duration::from_secs(self.config.cli_timeout_secs);
+        // Armed before stdout is read: a wedged CLI never closes the pipe, and
+        // only a kill at the deadline unblocks the reader below.
+        let watchdog = crate::process::Watchdog::arm(child, timeout);
+        let streamed = self.stream_cli_json(child);
+        let timed_out = watchdog.disarm();
+
+        let output = match streamed {
             Ok(output) => output,
             Err(e) => return CliAttempt::failed(e),
         };
         // Read off the parsed output, so a failure below still reports it.
         let session_id = output.session_id.clone();
 
-        let status = match child.wait().context("failed to wait for gemini") {
-            Ok(status) => status,
-            Err(e) => return CliAttempt { session_id, result: Err(e) },
-        };
+        // stdout is closed by now, so the run's budget is already spent
+        // streaming; the exit wait gets a short grace, not a second budget.
+        let reap = if timeout.is_zero() { timeout } else { crate::process::REAP_GRACE };
+        let status =
+            match crate::process::wait_or_kill(child, reap).context("failed to wait for gemini") {
+                Ok(Some(status)) => status,
+                Ok(None) => {
+                    return CliAttempt {
+                        session_id,
+                        overflowed: false,
+                        result: Err(anyhow::anyhow!(
+                            "gemini CLI did not exit after finishing its output — killed after {}s",
+                            crate::process::REAP_GRACE.as_secs()
+                        )),
+                    };
+                }
+                Err(e) => return CliAttempt { session_id, overflowed: false, result: Err(e) },
+            };
         let stderr = stderr_drain.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
 
         if self.verbose && !stderr.is_empty() {
             eprintln!("  {} stderr: {}", "[verbose]".dimmed(), stderr.trim());
         }
 
-        if !status.success() {
+        // Honored only for a failed run: a child can finish cleanly in the
+        // same instant the deadline passes, and that answer is not discarded.
+        if timed_out && !status.success() {
             return CliAttempt {
                 session_id,
+                overflowed: false,
+                result: Err(anyhow::anyhow!(
+                    "gemini CLI timed out after {}s — raise cli_timeout_secs in \
+                     .duet/config.toml [gemini] to allow longer runs",
+                    timeout.as_secs()
+                )),
+            };
+        }
+
+        if !status.success() {
+            // Classified from the CLI's own diagnostics — stderr or its typed
+            // error events — never from the model's prose.
+            let overflowed = super::is_context_overflow(&stderr)
+                || output.error_detail.as_deref().is_some_and(super::is_context_overflow);
+            return CliAttempt {
+                session_id,
+                overflowed,
                 result: Err(anyhow::anyhow!(
                     "gemini CLI {}",
                     describe_status(&status, &stderr, &output.text)
@@ -457,7 +545,7 @@ impl GeminiAdapter {
             };
         }
 
-        CliAttempt { session_id, result: Ok(output) }
+        CliAttempt { session_id, overflowed: false, result: Ok(output) }
     }
 
     /// Parses the CLI's newline-delimited JSON events. Shapes are those the
@@ -471,6 +559,7 @@ impl GeminiAdapter {
         let mut started = false;
         let mut files_opened: Vec<String> = Vec::new();
         let mut session_id: Option<String> = None;
+        let mut error_detail: Option<String> = None;
         let mut model_name = self.config.model.clone();
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
@@ -524,6 +613,7 @@ impl GeminiAdapter {
                 "error" => {
                     if let Some(message) = error_message(&event) {
                         self.sink.event(Event::Warn { text: format!("gemini: {}", message) });
+                        error_detail = Some(message);
                     }
                 }
                 "result" => {
@@ -560,7 +650,7 @@ impl GeminiAdapter {
             model: model_name,
         };
 
-        Ok(CliOutput { text, usage, session_id, files_opened })
+        Ok(CliOutput { text, usage, session_id, files_opened, error_detail })
     }
 
     fn emit_chunk(&self, started: &mut bool, text: &str) {
@@ -792,7 +882,7 @@ impl ModelAdapter for GeminiAdapter {
         // below would reach, without paying for the crash on the way.
         let guard = if self.crawl_guard_needed() { crawl_guard_settings().ok() } else { None };
         let mut result = match &guard {
-            Some(path) => self.run_cli(&with_crawl_guard_note(prompt), Some(path)),
+            Some(file) => self.run_cli(&with_crawl_guard_note(prompt), Some(&file.0)),
             None => self.run_cli(prompt, None),
         };
 
@@ -811,7 +901,7 @@ impl ModelAdapter for GeminiAdapter {
                             CRAWLER_TOOLS.join(", ")
                         ),
                     });
-                    result = self.run_cli(&with_crawl_guard_note(prompt), Some(&retry_guard));
+                    result = self.run_cli(&with_crawl_guard_note(prompt), Some(&retry_guard.0));
                 }
             }
         }
@@ -1054,61 +1144,6 @@ fn error_message(event: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Hands the prompt to the CLI on stdin, from its own thread.
-///
-/// The prompt does not travel in `-p`. The gemini CLI is a node script, and an
-/// endpoint-security agent can kill a node process outright — SIGKILL, before
-/// it prints a single byte — once one command-line argument runs past about a
-/// kilobyte. Every prompt does. Nothing in the argv it is left with grows with
-/// the task: a model name, a session id, a handful of paths.
-///
-/// The thread is there for the reason stderr has one. A prompt larger than the
-/// pipe buffer blocks the writer until the CLI drains it, and blocking the main
-/// thread would stop stdout being read — which is what the CLI is waiting on.
-fn feed_stdin(child: &mut Child, prompt: &str) -> Option<JoinHandle<std::io::Result<()>>> {
-    let mut pipe = child.stdin.take()?;
-    let prompt = prompt.to_string();
-    Some(std::thread::spawn(move || {
-        let result = pipe.write_all(prompt.as_bytes());
-        // Dropping the pipe closes stdin, and that EOF is what tells the CLI
-        // the prompt is complete. Without it the CLI waits forever.
-        drop(pipe);
-        result
-    }))
-}
-
-/// Whether the prompt reached the CLI whole. A short write means the CLI
-/// answered a question it only partly received, and an answer to that is worse
-/// than no answer at all.
-///
-/// No writer at all means `spawn` handed back no stdin to write to, which
-/// `Stdio::piped()` above rules out. It is reported rather than waved through:
-/// the CLI would then be answering an empty prompt, and calling that delivered
-/// would be the one failure this check exists to catch.
-fn prompt_delivered(writer: Option<JoinHandle<std::io::Result<()>>>) -> Result<()> {
-    let Some(handle) = writer else {
-        anyhow::bail!("gemini was spawned without a stdin pipe, so the prompt was never sent");
-    };
-    match handle.join() {
-        Ok(result) => result.context("failed to send the prompt to gemini"),
-        Err(_) => anyhow::bail!("the thread sending the prompt to gemini panicked"),
-    }
-}
-
-/// Starts reading the child's stderr immediately, on its own thread, and hands
-/// back a handle to the collected text. Call before reading stdout: a pipe that
-/// nobody drains fills up and stalls the process writing into it.
-fn drain_stderr(child: &mut Child) -> Option<std::thread::JoinHandle<String>> {
-    let pipe = child.stderr.take()?;
-    Some(std::thread::spawn(move || {
-        BufReader::new(pipe)
-            .lines()
-            .map_while(Result::ok)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }))
-}
-
 /// Why a response came back with no text in it. The API says which of these it
 /// was, so say that: guessing at a content filter when the model had in fact
 /// reached for a tool sends the reader looking in entirely the wrong place.
@@ -1141,6 +1176,7 @@ fn extract_api_error(response: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::prompt_delivered;
 
     fn event(raw: &str) -> serde_json::Value {
         serde_json::from_str(raw).expect("test fixture must be valid JSON")

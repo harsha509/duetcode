@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -172,8 +173,8 @@ export class DuetPanel {
   }
 
   private savePastedImage(dataB64: string): void {
-    const file = path.join(os.tmpdir(), `dt-paste-${Date.now()}.png`);
-    fs.writeFileSync(file, Buffer.from(dataB64, 'base64'));
+    const file = path.join(os.tmpdir(), `dt-paste-${crypto.randomUUID()}.png`);
+    fs.writeFileSync(file, Buffer.from(dataB64, 'base64'), { flag: 'wx' });
     this.pendingImages.push(file);
     this.post({ type: 'attached', name: 'clipboard image' });
   }
@@ -192,7 +193,7 @@ export class DuetPanel {
     const webview = this.panel.webview;
     const js = webview.asWebviewUri(vscode.Uri.joinPath(ctx.extensionUri, 'media', 'main.js'));
     const css = webview.asWebviewUri(vscode.Uri.joinPath(ctx.extensionUri, 'media', 'main.css'));
-    const nonce = Math.random().toString(36).slice(2);
+    const nonce = crypto.randomBytes(16).toString('base64');
     return `<!DOCTYPE html>
 <html lang="en">
 <head>

@@ -19,13 +19,14 @@
 
 use crate::adapters::{ImageInput, ModelAdapter};
 use crate::cli;
-use crate::config::Config;
-use crate::events::{AskKind, Event, Sink};
+use crate::config::{ChecksConfig, Config};
+use crate::events::{ask_yes_no, AskKind, Event, Sink};
 use crate::git;
 use crate::orchestrator::{self, Outcome, TaskOptions};
 use crate::review_subject;
 use anyhow::Result;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -125,6 +126,10 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
     // nothing to judge unless the answer is kept here until it is reviewed.
     let mut pending_answers: HashMap<PathBuf, PendingAnswer> = HashMap::new();
 
+    // Tracks whether the user has consented to run checks defined in each
+    // project's own .duet/config.toml. Asked once per project per session.
+    let mut checks_consents: HashMap<PathBuf, bool> = HashMap::new();
+
     for cmd in cmd_rx {
         match cmd.cmd.as_str() {
             "ping" => sink.event(Event::Pong),
@@ -169,7 +174,14 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                 crate::prompt_sync::sync(&target.dir, sink.as_ref());
 
                 let own_config = project_config(&target, sink.as_ref());
-                let task_config = own_config.as_ref().unwrap_or(&config);
+                let task_config = effective_config(
+                    &own_config,
+                    &config,
+                    &target,
+                    dir,
+                    &mut checks_consents,
+                    sink.as_ref(),
+                );
 
                 // Both models follow the task to its project: the writer edits
                 // there, and a CLI-backed reviewer reads the same checkout.
@@ -178,7 +190,7 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                 aim_adapters(&target.dir, &workspace, writer.as_mut(), reviewer.as_mut());
 
                 let opts = TaskOptions {
-                    config: task_config,
+                    config: &task_config,
                     task,
                     images: &images,
                     repo_dir: &target.dir,
@@ -222,6 +234,8 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                     &workspace,
                     &cmd,
                     &pending_answers,
+                    &mut checks_consents,
+                    dir,
                     sink.as_ref(),
                 );
             }
@@ -394,6 +408,51 @@ fn project_key(dir: &Path) -> PathBuf {
     dir.components().collect()
 }
 
+/// The config a run against `target` uses, with checks stripped unless the
+/// user consented to running them in that project. Gated on where the commands
+/// run, not on which config defined them — either way they execute the repo.
+fn effective_config<'a>(
+    own_config: &'a Option<Config>,
+    session_config: &'a Config,
+    target: &ReviewTarget,
+    session_dir: &Path,
+    consents: &mut HashMap<PathBuf, bool>,
+    sink: &dyn Sink,
+) -> Cow<'a, Config> {
+    let config = own_config.as_ref().unwrap_or(session_config);
+    if checks_consent(target, config, session_dir, consents, sink) {
+        return Cow::Borrowed(config);
+    }
+    let mut stripped = config.clone();
+    stripped.checks = ChecksConfig::default();
+    Cow::Owned(stripped)
+}
+
+/// Whether checks may run inside `target`. The commands execute with their cwd
+/// in that project, so an untrusted folder must earn consent; the serve
+/// directory is trusted implicitly, other projects are asked once per session.
+fn checks_consent(
+    target: &ReviewTarget,
+    config: &Config,
+    session_dir: &Path,
+    consents: &mut HashMap<PathBuf, bool>,
+    sink: &dyn Sink,
+) -> bool {
+    // The same list run_checks executes from, so a new check kind can never
+    // slip past the prompt.
+    let names: Vec<&str> = config.checks.defined().into_iter().map(|(name, _)| name).collect();
+    if names.is_empty() || project_key(&target.dir) == project_key(session_dir) {
+        return true;
+    }
+    let key = project_key(&target.dir);
+    *consents.entry(key).or_insert_with(|| {
+        ask_yes_no(
+            sink,
+            &format!("run checks ({}) inside {}?", names.join(", "), target.label),
+        )
+    })
+}
+
 /// Outcome tally across the reviewed projects.
 #[derive(Default)]
 struct ReviewTally {
@@ -429,6 +488,8 @@ fn run_review(
     workspace: &[PathBuf],
     cmd: &Command,
     pending_answers: &HashMap<PathBuf, PendingAnswer>,
+    checks_consents: &mut HashMap<PathBuf, bool>,
+    session_dir: &Path,
     sink: &dyn Sink,
 ) {
     let mut targets = review_targets(cmd, workspace);
@@ -461,7 +522,8 @@ fn run_review(
         reviewer.set_readable_dirs(workspace);
 
         let own_config = project_config(target, sink);
-        let config = own_config.as_ref().unwrap_or(session_config);
+        let config =
+            effective_config(&own_config, session_config, target, session_dir, checks_consents, sink);
 
         let review = match pending {
             Some(p) => orchestrator::answer_review_only(
@@ -472,7 +534,7 @@ fn run_review(
                 cmd.task.as_deref(),
                 sink,
             ),
-            None => orchestrator::review_only(config, reviewer, &target.dir, cmd.task.as_deref(), sink),
+            None => orchestrator::review_only(&config, reviewer, &target.dir, cmd.task.as_deref(), sink),
         };
 
         match review {
@@ -794,5 +856,89 @@ mod tests {
     fn no_answer_is_not_a_choice() {
         let err = choose_target(targets(&["/w/api", "/w/web"]), &StubSink("  ")).unwrap_err();
         assert!(err.contains("no project chosen"), "{}", err);
+    }
+
+    /// The serve directory is trusted implicitly — no consent prompt needed.
+    #[test]
+    fn checks_consent_is_not_asked_of_the_serve_directory() {
+        let mut consents = HashMap::new();
+        let config = Config {
+            checks: ChecksConfig { test: Some("npm test".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let target = ReviewTarget::new(PathBuf::from("/w/api"));
+        assert!(checks_consent(&target, &config, Path::new("/w/api"), &mut consents, &StubSink("n")));
+    }
+
+    /// A different project's checks require explicit consent.
+    #[test]
+    fn another_projects_checks_need_consent() {
+        let mut consents = HashMap::new();
+        let config = Config {
+            checks: ChecksConfig { test: Some("npm test".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let target = ReviewTarget::new(PathBuf::from("/w/web"));
+        // StubSink("n") means the user declines
+        assert!(!checks_consent(&target, &config, Path::new("/w/api"), &mut consents, &StubSink("n")));
+    }
+
+    /// Consent is cached per project — asked once, not every time.
+    #[test]
+    fn checks_consent_is_asked_only_once_per_project() {
+        let mut consents = HashMap::new();
+        let config = Config {
+            checks: ChecksConfig { test: Some("npm test".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let target = ReviewTarget::new(PathBuf::from("/w/web"));
+        // First call: user says no
+        assert!(!checks_consent(&target, &config, Path::new("/w/api"), &mut consents, &StubSink("n")));
+        // Second call: even though StubSink would say "y", the cached "no" is used
+        assert!(!checks_consent(&target, &config, Path::new("/w/api"), &mut consents, &StubSink("y")));
+    }
+
+    /// The gate is on where checks run, not on which file defined them: a repo
+    /// with no config of its own must not inherit the session's checks — and
+    /// run its own code through them — without consent.
+    #[test]
+    fn session_config_checks_still_need_consent_in_another_project() {
+        let mut consents = HashMap::new();
+        let session_config = Config {
+            checks: ChecksConfig { test: Some("npm test".into()), ..Default::default() },
+            ..Default::default()
+        };
+
+        let foreign = ReviewTarget::new(PathBuf::from("/w/web"));
+        let declined = effective_config(
+            &None,
+            &session_config,
+            &foreign,
+            Path::new("/w/api"),
+            &mut consents,
+            &StubSink("n"),
+        );
+        assert!(declined.checks.test.is_none(), "checks survived a declined consent");
+
+        // The serve directory keeps its checks without being asked.
+        let own = ReviewTarget::new(PathBuf::from("/w/api"));
+        let kept = effective_config(
+            &None,
+            &session_config,
+            &own,
+            Path::new("/w/api"),
+            &mut consents,
+            &StubSink("n"),
+        );
+        assert!(kept.checks.test.is_some());
+    }
+
+    /// A config with no checks defined needs no consent.
+    #[test]
+    fn no_checks_means_no_consent_needed() {
+        let mut consents = HashMap::new();
+        let config = Config::default();
+        let target = ReviewTarget::new(PathBuf::from("/w/web"));
+        assert!(checks_consent(&target, &config, Path::new("/w/api"), &mut consents, &StubSink("n")));
     }
 }

@@ -101,7 +101,18 @@ fn untracked_as_diff(dir: &Path, rel_path: &str) -> String {
         rel_path
     );
 
-    let body = match std::fs::read(dir.join(rel_path)) {
+    let path = dir.join(rel_path);
+
+    // Check size via metadata before reading: a multi-gigabyte untracked file
+    // would otherwise be buffered whole just to be discarded.
+    let too_large = std::fs::metadata(&path)
+        .map(|m| m.len() as usize > MAX_UNTRACKED_BYTES)
+        .unwrap_or(false);
+    if too_large {
+        return format!("{}+(large file omitted)\n", header);
+    }
+
+    let body = match std::fs::read(&path) {
         Ok(bytes) if bytes.len() > MAX_UNTRACKED_BYTES => "+(large file omitted)\n".to_string(),
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => text.lines().map(|l| format!("+{}\n", l)).collect(),

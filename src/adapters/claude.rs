@@ -5,7 +5,7 @@ use crate::ui;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -50,6 +50,9 @@ pub struct ClaudeAdapter {
     /// Files opened during the most recent `generate`, so a review's account of
     /// what it read can be checked rather than believed.
     files_opened: Vec<String>,
+    /// True when this model holds the reviewer seat: the spawn then runs
+    /// read-only, the same way the gemini reviewer always does.
+    read_only: bool,
     sink: Arc<dyn Sink>,
 }
 
@@ -59,6 +62,9 @@ struct CliOutput {
     session_id: Option<String>,
     /// Files the CLI actually opened this turn, from its own tool events.
     files_opened: Vec<String>,
+    /// The CLI's own error text from a failed result frame. Kept apart from
+    /// `text` so failure classification never reads the model's prose.
+    error_detail: Option<String>,
 }
 
 /// The files a tool call actually opened, or nothing for a call that opened
@@ -92,13 +98,15 @@ fn opened_paths(tool: &str, input: Option<&serde_json::Value>) -> Vec<String> {
 /// with the error is what makes the writer forget a task it had already begun.
 struct CliAttempt {
     session_id: Option<String>,
+    /// True when the CLI's own stderr said the session outgrew its context.
+    overflowed: bool,
     result: Result<CliOutput>,
 }
 
 impl CliAttempt {
     /// A run that never got far enough to have a session.
     fn failed(error: anyhow::Error) -> Self {
-        Self { session_id: None, result: Err(error) }
+        Self { session_id: None, overflowed: false, result: Err(error) }
     }
 
     /// True when the CLI got as far as announcing its session, which means a
@@ -152,6 +160,7 @@ impl ClaudeAdapter {
             readable_dirs: Vec::new(),
             messages: Vec::new(),
             files_opened: Vec::new(),
+            read_only: false,
             sink,
         }
     }
@@ -365,6 +374,7 @@ impl ClaudeAdapter {
 
         let attempt = self.spawn_cli(prompt, images);
         let connected = attempt.connected();
+        let overflowed = attempt.overflowed;
         self.record_session(&attempt);
 
         let error = match attempt.result {
@@ -375,11 +385,22 @@ impl ClaudeAdapter {
             Err(error) => error,
         };
 
-        if !should_restart_session(was_resuming, connected) {
+        // A rejected resume is one failure a fresh session fixes; an overflowed
+        // one is another — the session is still on disk, but too big to continue.
+        let restart = should_restart_session(was_resuming, connected) || (was_resuming && overflowed);
+        if !restart {
             return Err(error);
         }
 
-        eprintln!("  {} could not resume session ({:#}) — starting fresh", "↻".yellow(), error);
+        if connected {
+            eprintln!(
+                "  {} the session outgrew its context ({:#}) — starting fresh",
+                "↻".yellow(),
+                error
+            );
+        } else {
+            eprintln!("  {} could not resume session ({:#}) — starting fresh", "↻".yellow(), error);
+        }
         self.sessions.remove(&self.working_dir);
 
         let retry = self.spawn_cli(prompt, images);
@@ -390,11 +411,54 @@ impl ClaudeAdapter {
     }
 
     fn spawn_cli(&self, prompt: &str, images: &[ImageInput]) -> CliAttempt {
-        if images.is_empty() {
-            self.spawn_cli_text(prompt)
-        } else {
-            self.spawn_cli_images(prompt, images)
+        // The prompt travels on stdin as a stream-json message, never in argv:
+        // argv is visible via `ps`, and endpoint-security agents kill a node
+        // process once one argument runs past about a kilobyte.
+        let payload = match stream_json_payload(prompt, images) {
+            Ok(payload) => payload,
+            Err(e) => return CliAttempt::failed(e),
+        };
+
+        let mut cmd = self.base_cli_command();
+        cmd.arg("-p")
+            .arg("--input-format")
+            .arg("stream-json")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if self.verbose {
+            eprintln!(
+                "  {} {} -p --input-format stream-json --output-format stream-json{} <prompt on stdin>",
+                "[verbose]".dimmed(),
+                self.config.command,
+                if self.current_session().is_some() { " --resume <session>" } else { "" },
+            );
         }
+
+        let mut child = match crate::process::spawn_grouped(&mut cmd)
+            .with_context(|| format!("failed to execute '{}'", self.config.command))
+        {
+            Ok(child) => child,
+            Err(e) => return CliAttempt::failed(e),
+        };
+
+        let writer = super::feed_stdin(&mut child, &payload);
+        let mut attempt = self.finish_cli(&mut child);
+        let delivered = super::prompt_delivered(writer);
+
+        // A failed write is worth reporting only when the run otherwise looks
+        // fine; if the CLI died, the pipe broke because of that.
+        if attempt.result.is_ok() {
+            if let Err(e) = delivered {
+                attempt.result = Err(e);
+                // A session whose prompt only partly arrived is poisoned:
+                // dropping the id keeps it out of the store, and makes the
+                // restart path discard the resumed session it went into.
+                attempt.session_id = None;
+            }
+        }
+        attempt
     }
 
     /// Remembers the session this run belongs to, so the next task in the same
@@ -414,7 +478,12 @@ impl ClaudeAdapter {
             .arg("--verbose")
             .current_dir(&self.working_dir);
 
-        if self.config.skip_permissions {
+        if self.read_only {
+            // The reviewer judges the diff as it stands: write access would
+            // let it "fix" what it is judging, or be talked into running
+            // things by code riding in the review subject.
+            cmd.arg("--permission-mode").arg("plan");
+        } else if self.config.skip_permissions {
             cmd.arg("--dangerously-skip-permissions");
         }
         // Variadic in the CLI, so every sibling project goes on one flag. Placed
@@ -432,105 +501,62 @@ impl ClaudeAdapter {
         cmd
     }
 
-    fn spawn_cli_text(&self, prompt: &str) -> CliAttempt {
-        let mut cmd = self.base_cli_command();
-        cmd.arg("-p")
-            .arg(prompt)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        if self.verbose {
-            eprintln!(
-                "  {} {} -p <prompt> --output-format stream-json{}",
-                "[verbose]".dimmed(),
-                self.config.command,
-                if self.current_session().is_some() { " --resume <session>" } else { "" },
-            );
-        }
-
-        let mut child = match cmd
-            .spawn()
-            .with_context(|| format!("failed to execute '{}'", self.config.command))
-        {
-            Ok(child) => child,
-            Err(e) => return CliAttempt::failed(e),
-        };
-
-        self.finish_cli(&mut child)
-    }
-
-    fn spawn_cli_images(&self, prompt: &str, images: &[ImageInput]) -> CliAttempt {
-        let mut content_parts = vec![serde_json::json!({
-            "type": "text",
-            "text": prompt
-        })];
-
-        for img in images {
-            content_parts.push(serde_json::json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": img.media_type,
-                    "data": img.base64_data()
-                }
-            }));
-        }
-
-        let message = serde_json::json!({
-            "type": "human",
-            "content": content_parts
-        });
-
-        let json_str = match serde_json::to_string(&message).context("failed to serialize image payload")
-        {
-            Ok(json) => json,
-            Err(e) => return CliAttempt::failed(e),
-        };
-
-        let mut cmd = self.base_cli_command();
-        cmd.arg("-p")
-            .arg("--input-format")
-            .arg("stream-json")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = match cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn '{}'", self.config.command))
-        {
-            Ok(child) => child,
-            Err(e) => return CliAttempt::failed(e),
-        };
-
-        if let Some(ref mut stdin) = child.stdin {
-            if let Err(e) = stdin.write_all(json_str.as_bytes()).context("failed to write to claude stdin")
-            {
-                return CliAttempt::failed(e);
-            }
-        }
-        drop(child.stdin.take());
-
-        self.finish_cli(&mut child)
-    }
-
     fn finish_cli(&self, child: &mut Child) -> CliAttempt {
-        let output = match self.stream_cli_json(child) {
+        // Drained on its own thread, started before stdout is read: a child
+        // that fills its stderr pipe blocks writing it, stops producing
+        // stdout, and the two processes wait on each other forever.
+        let stderr_drain = super::drain_stderr(child);
+
+        let timeout = Duration::from_secs(self.config.cli_timeout_secs);
+        // Armed before stdout is read: a wedged CLI never closes the pipe, and
+        // only a kill at the deadline unblocks the reader below.
+        let watchdog = crate::process::Watchdog::arm(child, timeout);
+        let streamed = self.stream_cli_json(child);
+        let timed_out = watchdog.disarm();
+
+        let output = match streamed {
             Ok(output) => output,
             Err(e) => return CliAttempt::failed(e),
         };
         // Read off the parsed output, so a failure below still reports it.
         let session_id = output.session_id.clone();
 
-        let status = match child.wait().context("failed to wait for claude") {
-            Ok(status) => status,
-            Err(e) => return CliAttempt { session_id, result: Err(e) },
-        };
-        let stderr = collect_stderr(child);
+        // stdout is closed by now, so the run's budget is already spent
+        // streaming; the exit wait gets a short grace, not a second budget.
+        let reap = if timeout.is_zero() { timeout } else { crate::process::REAP_GRACE };
+        let status =
+            match crate::process::wait_or_kill(child, reap).context("failed to wait for claude") {
+                Ok(Some(status)) => status,
+                Ok(None) => {
+                    return CliAttempt {
+                        session_id,
+                        overflowed: false,
+                        result: Err(anyhow::anyhow!(
+                            "claude CLI did not exit after finishing its output — killed after {}s",
+                            crate::process::REAP_GRACE.as_secs()
+                        )),
+                    };
+                }
+                Err(e) => return CliAttempt { session_id, overflowed: false, result: Err(e) },
+            };
+        let stderr = stderr_drain.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
 
         if self.verbose && !stderr.is_empty() {
             eprintln!("  {} stderr: {}", "[verbose]".dimmed(), stderr.trim());
+        }
+
+        // Honored only for a failed run: a child can finish cleanly in the
+        // same instant the deadline passes, and that answer is not discarded.
+        if timed_out && !status.success() {
+            return CliAttempt {
+                session_id,
+                overflowed: false,
+                result: Err(anyhow::anyhow!(
+                    "claude CLI timed out after {}s — raise cli_timeout_secs in \
+                     .duet/config.toml [claude] to allow longer runs",
+                    timeout.as_secs()
+                )),
+            };
         }
 
         if !status.success() {
@@ -541,13 +567,18 @@ impl ClaudeAdapter {
             } else {
                 "no output (claude may need authentication — run `claude` interactively first)".to_string()
             };
+            // Classified from the CLI's own diagnostics — stderr or its error
+            // result frame — never from the model's prose.
+            let overflowed = super::is_context_overflow(&stderr)
+                || output.error_detail.as_deref().is_some_and(super::is_context_overflow);
             return CliAttempt {
                 session_id,
+                overflowed,
                 result: Err(anyhow::anyhow!("claude CLI exited with {}: {}", status, details)),
             };
         }
 
-        CliAttempt { session_id, result: Ok(output) }
+        CliAttempt { session_id, overflowed: false, result: Ok(output) }
     }
 
     fn describe_tool_action(tool: &str, input: Option<&serde_json::Value>) -> String {
@@ -632,6 +663,7 @@ impl ClaudeAdapter {
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
         let mut session_id: Option<String> = None;
+        let mut error_detail: Option<String> = None;
 
         for line in reader.lines() {
             let line = match line {
@@ -701,6 +733,17 @@ impl ClaudeAdapter {
                 ("result", _) => {
                     if let Some(result) = event.get("result").and_then(|v| v.as_str()) {
                         full_result = result.to_string();
+                    }
+                    // A failed run reports its reason here, on stdout — often
+                    // with stderr empty — so it is kept for classification.
+                    if event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || subtype.starts_with("error")
+                    {
+                        error_detail = event
+                            .get("result")
+                            .or_else(|| event.get("error"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
                     }
                     // Older CLI: cost_usd. Newer CLI: total_cost_usd.
                     let cost = event.get("cost_usd").and_then(|v| v.as_f64())
@@ -797,7 +840,7 @@ impl ClaudeAdapter {
             delta_text
         };
 
-        Ok(CliOutput { text, usage, session_id, files_opened })
+        Ok(CliOutput { text, usage, session_id, files_opened, error_detail })
     }
 }
 
@@ -831,6 +874,19 @@ fn build_content(prompt: &str, images: &[ImageInput]) -> serde_json::Value {
     serde_json::json!(parts)
 }
 
+/// The turn as one frame for `--input-format stream-json`. The CLI's contract
+/// is a `user` frame wrapping a messages-API message — text first, images after.
+fn stream_json_payload(prompt: &str, images: &[ImageInput]) -> Result<String> {
+    let message = serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": build_content(prompt, images)
+        }
+    });
+    serde_json::to_string(&message).context("failed to serialize prompt payload")
+}
+
 fn map_api_error(e: ureq::Error) -> anyhow::Error {
     match e {
         ureq::Error::Status(code, response) => {
@@ -849,18 +905,6 @@ fn map_api_error(e: ureq::Error) -> anyhow::Error {
             )
         }
     }
-}
-
-fn collect_stderr(child: &mut Child) -> String {
-    child.stderr.take()
-        .map(|pipe| {
-            BufReader::new(pipe)
-                .lines()
-                .map_while(Result::ok)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
 }
 
 impl ModelAdapter for ClaudeAdapter {
@@ -905,6 +949,10 @@ impl ModelAdapter for ClaudeAdapter {
 
     fn files_opened_last_turn(&self) -> Vec<String> {
         self.files_opened.clone()
+    }
+
+    fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
     }
 
     /// Drops this checkout's session and the API history behind it, so the next
@@ -1020,5 +1068,17 @@ mod tests {
     #[test]
     fn zero_max_yields_only_the_ellipsis() {
         assert_eq!(truncate_chars("abc", 0), "…");
+    }
+
+    /// The CLI's stream-json input contract: a `user` frame wrapping a
+    /// messages-API message. A `human` frame is not in the contract, and a
+    /// prompt the CLI drops reads as a run that answered nothing.
+    #[test]
+    fn the_prompt_is_a_user_frame_wrapping_a_message() {
+        let payload = stream_json_payload("hello", &[]).expect("payload");
+        let frame: serde_json::Value = serde_json::from_str(&payload).expect("valid json");
+        assert_eq!(frame["type"], "user");
+        assert_eq!(frame["message"]["role"], "user");
+        assert_eq!(frame["message"]["content"][0]["text"], "hello");
     }
 }

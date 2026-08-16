@@ -8,6 +8,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## Unreleased
+
+### Security
+
+- **Claude reviewer is now read-only.** When Claude holds the reviewer seat
+  (`--writer gemini` or `dt review --reviewer claude`), it runs with
+  `--permission-mode plan` instead of `--dangerously-skip-permissions`. This
+  matches the Gemini reviewer's existing read-only enforcement and prevents a
+  reviewer from editing the code it is judging or executing commands prompted
+  by adversarial content in the review subject.
+
+- **Checks require consent before running inside another project.** In
+  `dt serve`, check commands only run inside a workspace project other than
+  the serve directory after the user explicitly approves (asked once per
+  project per session) — whichever config defined them, so a repository
+  without its own `.duet/config.toml` cannot inherit the session's checks
+  unprompted. The consent prompt and the runner share one list of check kinds,
+  so a future kind cannot slip past it. This prevents a malicious repository
+  added to a multi-root workspace from silently executing arbitrary commands.
+
+- **Claude prompts no longer travel on argv.** The prompt is now sent via
+  stdin using `--input-format stream-json`, matching the Gemini adapter's
+  approach. This prevents prompt content (which may include repository context)
+  from being visible to other local users via `ps`, and avoids endpoint-security
+  agents that kill node processes with large argv entries.
+
+- **Crawl-guard settings are written per run, with unique temp names.** The
+  Gemini crawl-guard settings file is created with a process-unique random
+  name using `create_new` (preventing symlink attacks and races between
+  concurrent `dt` processes on shared systems), rebuilt from the current
+  system settings for each guarded run so later edits are respected, and
+  deleted when the run ends.
+
+- **Image size capped at 10 MB.** `ImageInput::load` now checks file size via
+  metadata before reading, rejecting images larger than 10 MB with a clear
+  error rather than buffering arbitrarily large files into memory.
+
+- **CSP nonce uses cryptographic randomness.** The VS Code extension's webview
+  CSP nonce is now generated with `crypto.randomBytes` instead of
+  `Math.random()`, and pasted-image temp files use `crypto.randomUUID()` with
+  exclusive-create (`wx` flag).
+
+### Fixed
+
+- **Claude adapter stderr deadlock eliminated.** The Claude CLI adapter now
+  drains stderr on a dedicated thread started before reading stdout, matching
+  the Gemini adapter's pattern. Previously, a Claude CLI run producing more
+  than ~64 KB of stderr would deadlock: the CLI blocked writing stderr while
+  `dt` blocked reading stdout.
+
+- **Hung subprocesses are now killed.** All CLI spawns (Claude, Gemini), check
+  commands, and `gh pr diff` fetches run in their own process groups under a
+  wall-clock deadline (configurable via `cli_timeout_secs` for adapters,
+  `timeout_secs` for checks, fixed 120s for `gh`; 0 disables). A watchdog
+  kills a CLI that goes silent without ever closing its output, the kill
+  reaches grandchild processes — so a check's leftover watcher can neither
+  keep running nor hang `dt` after the check exits — a timed-out check still
+  reports the output it produced before hanging, and interrupting `dt`
+  (Ctrl-C) takes its subprocesses with it instead of orphaning them.
+  Previously a hung subprocess would block `dt` indefinitely.
+
+- **Session directory collisions resolved.** Two sessions created in the same
+  second with the same task slug now get distinct directories via a numeric
+  suffix, claimed atomically so even two separate `dt` processes cannot end up
+  sharing one directory.
+
+- **A failed prompt delivery no longer poisons the session.** When the prompt
+  cannot be fully written to a CLI's stdin, the session it went into is
+  discarded instead of being silently resumed later with a half-received
+  prompt in its context.
+
+### Changed
+
+- **Code-review diffs are capped at 120 KB.** The working-tree diff attached to
+  code review prompts is now truncated at 120 KB (matching the fetched-diff
+  budget), with a notice telling the reviewer that files after the cut are not
+  shown. A reviewer with tools is additionally told to read past the cut. This
+  prevents unbounded diffs from blowing up CLI session context round after
+  round.
+
+- **Context-overflow sessions are reset and retried.** When a CLI run fails due
+  to the conversation exceeding the model's context window, the session is now
+  dropped and retried fresh (for both Claude and Gemini adapters), rather than
+  repeatedly failing on the same oversized session. Overflow is recognised
+  from the CLI's own diagnostics — stderr and its typed error events — never
+  from model output, so a review that merely quotes phrases like "context
+  length" cannot destroy a resumable session.
+
+- **Untracked file size checked before reading.** `git_diff` now checks file
+  metadata size before reading untracked files, avoiding buffering
+  multi-gigabyte files into memory just to discard them.
+
 ## 0.2.10 - 2026-08-10
 
 Asking for a review of a pull request by its GitHub link reviewed the

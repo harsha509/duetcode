@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 const CONFIG_FILENAME: &str = ".duet/config.toml";
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub claude: ClaudeConfig,
@@ -37,6 +37,10 @@ pub struct ClaudeConfig {
     pub api_model: String,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Wall-clock budget for one CLI run; 0 waits forever. API calls are
+    /// bounded by `timeout_secs`, but nothing else bounds a CLI that hangs.
+    #[serde(default = "default_cli_timeout_secs")]
+    pub cli_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -59,9 +63,13 @@ pub struct GeminiConfig {
     pub api_key_env: String,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Wall-clock budget for one CLI run; 0 waits forever. API calls are
+    /// bounded by `timeout_secs`, but nothing else bounds a CLI that hangs.
+    #[serde(default = "default_cli_timeout_secs")]
+    pub cli_timeout_secs: u64,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChecksConfig {
     #[serde(default)]
     pub test: Option<String>,
@@ -69,9 +77,33 @@ pub struct ChecksConfig {
     pub lint: Option<String>,
     #[serde(default)]
     pub typecheck: Option<String>,
+    /// Wall-clock budget for one check; 0 waits forever.
+    #[serde(default = "default_cli_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+impl ChecksConfig {
+    /// Every configured check, in run order. The one list the runner and the
+    /// consent gate share, so a new check kind cannot bypass the prompt.
+    pub fn defined(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("typecheck", &self.typecheck),
+            ("lint", &self.lint),
+            ("test", &self.test),
+        ]
+        .into_iter()
+        .filter_map(|(name, cmd)| cmd.as_deref().map(|cmd| (name, cmd)))
+        .collect()
+    }
+}
+
+impl Default for ChecksConfig {
+    fn default() -> Self {
+        Self { test: None, lint: None, typecheck: None, timeout_secs: default_cli_timeout_secs() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PolicyConfig {
     #[serde(default = "default_max_rounds")]
     pub max_rounds: usize,
@@ -82,7 +114,7 @@ pub struct PolicyConfig {
     pub allow_dirty_worktree: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PromptsConfig {
     #[serde(default = "default_implement_prompt")]
     pub implementation: PathBuf,
@@ -102,6 +134,7 @@ fn default_gemini_mode() -> String { "auto".into() }
 fn default_gemini_model() -> String { "gemini-3.1-pro-preview".into() }
 fn default_gemini_api_key_env() -> String { "GEMINI_API_KEY".into() }
 fn default_timeout_secs() -> u64 { 300 }
+fn default_cli_timeout_secs() -> u64 { 1800 }
 fn default_max_rounds() -> usize { 4 }
 fn default_true() -> bool { true }
 fn default_implement_prompt() -> PathBuf { PathBuf::from(".duet/prompts/implement.txt") }
@@ -118,6 +151,7 @@ impl Default for ClaudeConfig {
             api_key_env: default_claude_api_key_env(),
             api_model: default_claude_api_model(),
             timeout_secs: default_timeout_secs(),
+            cli_timeout_secs: default_cli_timeout_secs(),
         }
     }
 }
@@ -130,6 +164,7 @@ impl Default for GeminiConfig {
             model: default_gemini_model(),
             api_key_env: default_gemini_api_key_env(),
             timeout_secs: default_timeout_secs(),
+            cli_timeout_secs: default_cli_timeout_secs(),
         }
     }
 }

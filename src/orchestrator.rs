@@ -259,11 +259,13 @@ pub fn review_only(
         "Review the current uncommitted changes for bugs, edge cases, and best practices.",
     );
 
+    let (review_diff, diff_truncated) = capped_review_diff(&diff, &*reviewer);
+
     let review_prompt = prompts::build_review_prompt(
         &review_template,
         task_context,
         &review_repo_block(repo_dir),
-        &diff,
+        &review_diff,
         "",
         "(not provided — judge the diff on its own)",
     );
@@ -284,6 +286,7 @@ pub fn review_only(
     }
 
     report_unsupported_reads(reviewer, &response, sink);
+    report_unread_truncation(reviewer, diff_truncated, sink);
     let verdict = policy::parse_verdict(&response);
     emit_verdict(sink, VerdictKind::Code, &verdict);
     costs.summary();
@@ -892,11 +895,12 @@ fn run_review(
     }
 
     let checks_summary = checks::format_check_results(&check_results);
+    let (review_diff, diff_truncated) = capped_review_diff(diff, reviewer);
     let mut review_prompt = prompts::build_review_prompt(
         &session.review_template,
         opts.task,
         &review_repo_block(opts.repo_dir),
-        diff,
+        &review_diff,
         &checks_summary,
         input.writer_notes,
     );
@@ -919,6 +923,7 @@ fn run_review(
     }
 
     report_unsupported_reads(reviewer, &response, sink);
+    report_unread_truncation(reviewer, diff_truncated, sink);
     let verdict = policy::parse_verdict(&response);
     emit_verdict(sink, VerdictKind::Code, &verdict);
 
@@ -1127,6 +1132,11 @@ const ANSWER_REVIEW_DIFF_BYTES: usize = 40_000;
 /// the subject rather than context for it, but still bounded: a change nobody
 /// can fit in one reading is not reviewed better by pasting more of it.
 const FETCHED_DIFF_BYTES: usize = 120_000;
+
+/// Budget for the working-tree diff attached to a code review. Past the cut a
+/// reviewer with tools reads the files directly, one without says the diff is
+/// insufficient; unbounded diffs blow up a CLI session's context.
+const REVIEW_DIFF_BYTES: usize = 120_000;
 
 /// Told to the user, and returned as the run's message, when a review was
 /// refused for want of anything to check.
@@ -1436,6 +1446,26 @@ fn truncate_bytes(text: &str, cap: usize) -> (&str, bool) {
         end -= 1;
     }
     (&text[..end], true)
+}
+
+/// Caps the working-tree diff attached to a code review prompt. A reviewer
+/// with tools is told to read past the cut; a reviewer without tools is told
+/// to note where the diff is insufficient.
+fn capped_review_diff(diff: &str, reviewer: &dyn ModelAdapter) -> (String, bool) {
+    let (kept, truncated) = truncate_bytes(diff, REVIEW_DIFF_BYTES);
+    if !truncated {
+        return (diff.to_string(), false);
+    }
+    (
+        format!(
+            "{}\n\n[diff truncated at {} KB — files after the cut are not shown. Say so where \
+             the missing part matters.{}]",
+            kept,
+            REVIEW_DIFF_BYTES / 1024,
+            read_requirement(reviewer),
+        ),
+        true,
+    )
 }
 
 /// Warns when a review names files it never opened.
@@ -2119,6 +2149,26 @@ mod tests {
         assert!(cut);
         assert_eq!(kept.len(), 50);
         assert!(kept.chars().all(|c| c == 'é'));
+    }
+
+    /// A code review diff is capped and the reviewer is told when it is cut.
+    #[test]
+    fn a_code_review_diff_is_capped_and_announced() {
+        let diff = "x".repeat(REVIEW_DIFF_BYTES * 2);
+        let (text, truncated) = capped_review_diff(&diff, &Reviewer { reads_files: true });
+        assert!(text.contains("diff truncated"));
+        assert!(text.contains("not an acceptable review"));
+        assert!(truncated);
+
+        let (text, truncated) = capped_review_diff(&diff, &Reviewer { reads_files: false });
+        assert!(text.contains("diff truncated"));
+        assert!(!text.contains("not an acceptable review"));
+        assert!(truncated);
+
+        let small = "+fn added() {}";
+        let (text, truncated) = capped_review_diff(small, &Reviewer { reads_files: true });
+        assert_eq!(text, small);
+        assert!(!truncated);
     }
 
     const DIFF: &str = "diff --git a/src/lib.rs b/src/lib.rs\n+fn added() {}\n";

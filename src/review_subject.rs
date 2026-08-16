@@ -14,7 +14,8 @@
 
 use anyhow::{anyhow, Result};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// A GitHub pull request named in a task.
 ///
@@ -112,16 +113,24 @@ fn is_repo_name(segment: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// Cap on one fetch: `gh` is doing a network round trip, and a review waiting
+/// on it should not wait forever.
+const GH_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The pull request's diff, by way of `gh pr diff`.
 ///
 /// Run inside `dir` so it picks up whatever `gh` configuration the checkout
 /// carries; the URL is absolute, so the directory never decides *which* pull
 /// request is fetched.
 pub fn fetch_diff(pr: &PullRequest, dir: &Path) -> Result<String> {
-    let output = Command::new("gh")
-        .args(["pr", "diff", &pr.url])
+    let mut cmd = Command::new("gh");
+    cmd.args(["pr", "diff", &pr.url])
         .current_dir(dir)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Own process group, so a timeout kill reaches gh's children too.
+    let mut child = crate::process::spawn_grouped(&mut cmd)
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 anyhow!("the gh CLI is not installed (`brew install gh`)")
@@ -129,15 +138,30 @@ pub fn fetch_diff(pr: &PullRequest, dir: &Path) -> Result<String> {
             _ => anyhow!("could not run gh: {}", e),
         })?;
 
-    if !output.status.success() {
+    // Drained as gh writes: a diff larger than the pipe buffer would otherwise
+    // stall gh mid-write and read as a timeout it did not earn.
+    let stdout = child.stdout.take().map(crate::process::drain_read);
+    let stderr = child.stderr.take().map(crate::process::drain_read);
+
+    let status = match crate::process::wait_or_kill(&mut child, GH_TIMEOUT) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return Err(anyhow!("gh timed out after {}s fetching {}", GH_TIMEOUT.as_secs(), pr.label));
+        }
+        Err(e) => return Err(anyhow!("could not wait for gh: {}", e)),
+    };
+
+    let diff = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr_text = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+
+    if !status.success() {
         return Err(anyhow!(
             "gh could not read {}: {}",
             pr.label,
-            first_line(&String::from_utf8_lossy(&output.stderr))
+            first_line(&stderr_text)
         ));
     }
 
-    let diff = String::from_utf8_lossy(&output.stdout).to_string();
     if diff.trim().is_empty() {
         return Err(anyhow!("gh returned an empty diff for {}", pr.label));
     }

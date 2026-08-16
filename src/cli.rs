@@ -304,11 +304,15 @@ pub(crate) fn setup_task(
     let gemini: Box<dyn ModelAdapter> =
         Box::new(GeminiAdapter::new(&config.gemini, dir, verbose, sink)?);
 
-    let (writer, reviewer) = match writer_name.to_lowercase().as_str() {
+    let (mut writer, mut reviewer) = match writer_name.to_lowercase().as_str() {
         "claude" => (claude, gemini),
         "gemini" => (gemini, claude),
         other => anyhow::bail!("unknown writer '{}' — use 'claude' or 'gemini'", other),
     };
+    // The reviewing seat is read-only: gemini always runs plan mode, and this
+    // is how claude learns to do the same when it holds the seat.
+    reviewer.set_read_only(true);
+    writer.set_read_only(false);
 
     Ok(TaskSetup { config, images, writer, reviewer })
 }
@@ -360,8 +364,9 @@ fn cmd_review(dir: &Path, reviewer_name: &str, task: Option<&str>, verbose: bool
     let mut reviewer: Box<dyn ModelAdapter> = match reviewer_name.to_lowercase().as_str() {
         "gemini" => Box::new(GeminiAdapter::new(&config.gemini, dir, verbose, sink.clone())?),
         "claude" => Box::new(ClaudeAdapter::new(&config.claude, dir, verbose, sink.clone())),
-        other => anyhow::bail!("unknown reviewer '{}' — use 'claude' or 'gemini'", other),
+        other => anyhow::bail!("unknown reviewer '{}' — use 'gemini' or 'claude'", other),
     };
+    reviewer.set_read_only(true);
 
     let result = orchestrator::review_only(&config, reviewer.as_mut(), dir, task, sink.as_ref())?;
 

@@ -34,10 +34,29 @@ impl SessionLog {
     pub fn create(base_dir: &Path, task: &str, roles: &SessionRoles) -> Result<Self> {
         let timestamp = Local::now().format("%Y%m%d-%H%M%S");
         let slug = slugify(task);
-        let dir = base_dir.join(".duet").join("sessions").join(format!("{}-{}", timestamp, slug));
+        let sessions_dir = base_dir.join(".duet").join("sessions");
 
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create log dir: {}", dir.display()))?;
+        std::fs::create_dir_all(&sessions_dir)
+            .with_context(|| format!("failed to create log dir: {}", sessions_dir.display()))?;
+
+        // A second session started in the same second would collide with the
+        // first; create_dir itself is the probe — an exists() check would let
+        // two processes settle on one directory and interleave their logs.
+        let mut dir = sessions_dir.join(format!("{}-{}", timestamp, slug));
+        let mut n = 2;
+        loop {
+            match std::fs::create_dir(&dir) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    dir = sessions_dir.join(format!("{}-{}-{}", timestamp, slug, n));
+                    n += 1;
+                }
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("failed to create log dir: {}", dir.display()));
+                }
+            }
+        }
 
         let prompt_path = dir.join("prompt.md");
         std::fs::write(&prompt_path, task)
@@ -236,5 +255,24 @@ mod tests {
     #[test]
     fn slugify_collapses_symbol_runs() {
         assert_eq!(slugify("fix -- the ***bug***"), "fix-the-bug");
+    }
+
+    /// Two sessions created in the same second with the same task must not
+    /// collide — the second gets a numeric suffix.
+    #[test]
+    fn same_second_sessions_get_distinct_directories() {
+        let base = std::env::temp_dir().join(format!("dt-collision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("temp dir");
+
+        let roles = SessionRoles { writer: "claude", reviewer: "gemini" };
+        let log1 = SessionLog::create(&base, "same task", &roles).expect("first session");
+        let log2 = SessionLog::create(&base, "same task", &roles).expect("second session");
+
+        assert_ne!(log1.dir, log2.dir, "sessions must have distinct directories");
+        assert!(log1.dir.exists());
+        assert!(log2.dir.exists());
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

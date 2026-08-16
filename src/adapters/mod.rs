@@ -4,8 +4,11 @@ pub mod gemini;
 pub mod pricing;
 pub mod ripgrep;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::thread::JoinHandle;
 
 /// Cap on remembered conversation turns (user + model messages).
 pub(crate) const MAX_HISTORY_TURNS: usize = 12;
@@ -26,6 +29,62 @@ pub(crate) fn trim_history(history: &mut Vec<serde_json::Value>) {
 
 fn total_bytes(history: &[serde_json::Value]) -> usize {
     history.iter().map(|v| v.to_string().len()).sum()
+}
+
+/// Whether a CLI run died because the conversation outgrew the model's
+/// context. Matched against the CLI's own diagnostics — stderr or its typed
+/// error/result events — never the model's output, which quotes such phrases
+/// whenever the code under review is LLM-adjacent.
+pub(crate) fn is_context_overflow(diagnostics: &str) -> bool {
+    let text = diagnostics.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "maximum context",
+        "context length",
+        "context_length",
+        "too many tokens",
+        "prompt is too long",
+        // Gemini's wording: "The input token count (N) exceeds the maximum
+        // number of tokens allowed".
+        "exceeds the maximum number of tokens",
+        // Also matches a prompt that is oversized on its own, where the
+        // restart's one retry cannot help — accepted, because a resumed
+        // session's history is usually what pushed the payload over.
+        "request payload size exceeds",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
+/// Hands `payload` to the CLI on stdin from its own thread; dropping the pipe
+/// sends the EOF that marks the prompt complete. A payload larger than the
+/// pipe buffer would block the caller and stop stdout being read.
+pub(crate) fn feed_stdin(child: &mut Child, payload: &str) -> Option<JoinHandle<std::io::Result<()>>> {
+    let mut pipe = child.stdin.take()?;
+    let payload = payload.to_string();
+    Some(std::thread::spawn(move || {
+        let result = pipe.write_all(payload.as_bytes());
+        drop(pipe);
+        result
+    }))
+}
+
+/// Whether the prompt reached the CLI whole. A short write means the CLI
+/// answered a question it only partly received, which is worse than no
+/// answer at all; `None` means there was no stdin pipe to write to.
+pub(crate) fn prompt_delivered(writer: Option<JoinHandle<std::io::Result<()>>>) -> Result<()> {
+    let Some(handle) = writer else {
+        anyhow::bail!("the CLI was spawned without a stdin pipe, so the prompt was never sent");
+    };
+    match handle.join() {
+        Ok(result) => result.context("failed to send the prompt to the CLI"),
+        Err(_) => anyhow::bail!("the thread sending the prompt to the CLI panicked"),
+    }
+}
+
+/// Starts reading the child's stderr immediately, on its own thread. A pipe
+/// that nobody drains fills up and stalls the process writing into it — so
+/// call this before reading stdout, and join after the run is over.
+pub(crate) fn drain_stderr(child: &mut Child) -> Option<JoinHandle<String>> {
+    child.stderr.take().map(crate::process::drain_read)
 }
 
 /// Sibling projects to hand a CLI: everything readable except the working
@@ -59,6 +118,19 @@ pub struct ImageInput {
     pub data: Vec<u8>,
 }
 
+/// Cap on one attached image: pasted screenshots are far smaller, and a file
+/// bigger than this is almost certainly a mistake rather than context.
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+fn image_size_error(path: &Path, size: usize) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} is too large ({:.1} MB — max {} MB)",
+        path.display(),
+        size as f64 / 1_048_576.0,
+        MAX_IMAGE_BYTES / 1_048_576,
+    )
+}
+
 impl ImageInput {
     pub fn load(path: PathBuf) -> Result<Self> {
         let extension = path
@@ -81,8 +153,19 @@ impl ImageInput {
         }
         .to_string();
 
+        // Sized before read: a multi-gigabyte file must not be buffered whole
+        // just to be refused.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > MAX_IMAGE_BYTES as u64 {
+                return Err(image_size_error(&path, meta.len() as usize));
+            }
+        }
+
         let data =
             std::fs::read(&path).map_err(|e| anyhow::anyhow!("cannot read {}: {}", path.display(), e))?;
+        if data.len() > MAX_IMAGE_BYTES {
+            return Err(image_size_error(&path, data.len()));
+        }
 
         Ok(Self { media_type, data })
     }
@@ -136,6 +219,11 @@ pub trait ModelAdapter {
         Vec::new()
     }
 
+    /// Whether this model is judging work rather than writing it. Judges run
+    /// read-only, so a review cannot alter the diff it is reading; transports
+    /// without tools have nothing to restrict and ignore this.
+    fn set_read_only(&mut self, _read_only: bool) {}
+
     /// Forget the conversation so far and judge from scratch.
     ///
     /// Sessions persist for as long as the process does, so without this a
@@ -186,5 +274,27 @@ mod tests {
         let mut history = vec![turn("user", "a"), turn("model", "b")];
         trim_history(&mut history);
         assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn context_overflow_is_recognised_and_ordinary_failures_are_not() {
+        assert!(is_context_overflow(
+            "Error: This model's maximum context length is 1048576 tokens"
+        ));
+        assert!(is_context_overflow("prompt is too long: 220000 tokens > 200000"));
+        // Gemini's actual wording for an overgrown session.
+        assert!(is_context_overflow(
+            "The input token count (1264349) exceeds the maximum number of tokens allowed (1048576)"
+        ));
+        assert!(!is_context_overflow("429: quota exceeded for quota metric"));
+        assert!(!is_context_overflow("exit 53: turn limit exceeded"));
+    }
+
+    #[test]
+    fn an_oversized_image_is_refused_before_being_read() {
+        let error = image_size_error(Path::new("/tmp/big.png"), MAX_IMAGE_BYTES + 1);
+        let message = format!("{:#}", error);
+        assert!(message.contains("too large"), "got: {}", message);
+        assert!(message.contains("max 10 MB"), "got: {}", message);
     }
 }
