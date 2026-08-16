@@ -8,7 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
-## Unreleased
+## 0.2.11 - 2026-08-16
+
+A hardening release. The reviewer seat is read-only for both models, checks
+never run inside a project the user has not approved, prompts stay off argv,
+and every subprocess `dt` spawns — model CLIs, checks, `gh` — now lives in
+its own process group under a real deadline: a hung run is killed instead of
+blocking the loop forever, and killing `dt` takes its children along instead
+of leaving them editing the checkout unsupervised.
 
 ### Security
 

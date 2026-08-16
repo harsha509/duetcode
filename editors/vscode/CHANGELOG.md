@@ -5,6 +5,15 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.11 - 2026-08-16
+
+Requires `dt` 0.2.11. The webview's CSP nonce is now generated with
+`crypto.randomBytes` instead of `Math.random()`, and pasted-image temp files
+get `crypto.randomUUID()` names created with the exclusive `wx` flag. The
+version otherwise tracks the CLI's hardening release: hung subprocesses are
+killed instead of stalling the panel, and checks from other workspace
+projects ask for consent before running. (0.2.10 shipped CLI-only.)
+
 ## 0.2.9 - 2026-08-10
 
 Requires `dt` 0.2.9. No extension-side changes: the version tracks the CLI,
