@@ -2,7 +2,15 @@ import * as vscode from 'vscode';
 import { ensureInitialized, isGitRepo, isInitialized } from './init';
 import { DuetPanel } from './panel';
 import { ServeClient } from './serveClient';
-import { SessionsProvider } from './sessions';
+import {
+  allSessions,
+  deleteSessions,
+  isSessionDir,
+  sessionLabel,
+  SessionInfo,
+  SessionNode,
+  SessionsProvider,
+} from './sessions';
 import { secretEnv } from './settings';
 import { SettingsPanel } from './settingsPanel';
 
@@ -50,6 +58,31 @@ async function warnTaskStillRunning(): Promise<void> {
   if (choice === STOP_IT) {
     await vscode.commands.executeCommand('dt.stopTask');
   }
+}
+
+const DELETE = 'Delete';
+
+/** A session's logs are gone for good once deleted, so both paths confirm first. */
+async function confirmDelete(message: string): Promise<boolean> {
+  const choice = await vscode.window.showWarningMessage(message, { modal: true }, DELETE);
+  return choice === DELETE;
+}
+
+/**
+ * Deletes and refreshes. The tree watcher refreshes too, but on its own delay —
+ * a row left standing after the confirmation reads as the delete having failed.
+ */
+async function removeSessions(
+  sessions: SessionInfo[],
+  provider: SessionsProvider,
+): Promise<void> {
+  const failed = await deleteSessions(sessions);
+  if (failed.length > 0) {
+    void vscode.window.showErrorMessage(
+      `DT Duet: could not delete ${failed.join(', ')} — check the file permissions on .duet/sessions.`,
+    );
+  }
+  provider.refresh();
 }
 
 export function activate(ctx: vscode.ExtensionContext): void {
@@ -121,6 +154,40 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dt.refreshSessions', () => provider.refresh()),
     vscode.commands.registerCommand('dt.openSession', (dir: string) => {
       DuetPanel.createOrShow(ctx, client).showHistory(dir);
+    }),
+    vscode.commands.registerCommand('dt.deleteSession', async (el?: SessionNode) => {
+      // Reachable from another extension with any argument it likes, so the
+      // target is checked to be a session of ours before anything is removed.
+      if (el?.kind !== 'session' || !isSessionDir(el.dir)) {
+        void vscode.window.showInformationMessage(
+          'DT Duet: right-click a session in the Sessions view to delete it.',
+        );
+        return;
+      }
+      const ok = await confirmDelete(
+        `Delete session "${sessionLabel(el)}"? Its logs are removed from disk.`,
+      );
+      if (ok) {
+        await removeSessions([el], provider);
+      }
+    }),
+    vscode.commands.registerCommand('dt.clearSessions', async (el?: SessionNode) => {
+      // From a project row, that project's sessions; from the view title or the
+      // palette, every folder's — the tree hides the project row when there is
+      // only one folder, so the title button must not be limited to it.
+      const targets = el?.kind === 'project' ? el.sessions : allSessions();
+      if (targets.length === 0) {
+        void vscode.window.showInformationMessage('DT Duet: no sessions to clear.');
+        return;
+      }
+      const scope = el?.kind === 'project' ? ` in ${el.name}` : '';
+      const ok = await confirmDelete(
+        `Delete all ${targets.length} session${targets.length === 1 ? '' : 's'}${scope}? ` +
+          'Their logs are removed from disk.',
+      );
+      if (ok) {
+        await removeSessions(targets, provider);
+      }
     }),
     vscode.commands.registerCommand('dt.settings', () => SettingsPanel.createOrShow(ctx, client)),
   );

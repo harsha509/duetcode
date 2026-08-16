@@ -15,7 +15,9 @@ tests and linters, and you watch both sides of the conversation live.
   the task and the answer opens with `✓ GO` or `✕ NO-GO`, blocker and warning
   counts, and one plain sentence per finding, above the full analysis.
 - **Sessions sidebar** — every past run from `.duet/sessions`, with outcome
-  icons; click to replay any session round by round, patches included.
+  icons; click to replay any session round by round, patches included. Delete
+  one from its row, or clear a project's — or the workspace's — from the `…`
+  menu.
 - **Stop, without losing the room** — a running task can be stopped from the
   sidebar toolbar, and **+** refuses to discard one that is still going.
 - **Task composer** — type a task, toggle `auto` (models loop unattended

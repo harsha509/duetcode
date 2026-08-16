@@ -84,7 +84,49 @@ function sessionTreeItem(el: SessionInfo): vscode.TreeItem {
   item.iconPath = new vscode.ThemeIcon(
     el.state ? (el.state.success ? 'pass' : 'circle-slash') : 'circle-outline',
   );
+  item.contextValue = 'dtSession';
   return item;
+}
+
+/** What a session is called in prompts and notifications. */
+export function sessionLabel(el: SessionInfo): string {
+  return el.state?.task ?? labelFor(el);
+}
+
+/** Every session in the workspace, across all folders. */
+export function allSessions(): SessionInfo[] {
+  return (vscode.workspace.workspaceFolders ?? []).flatMap((folder) => readProject(folder).sessions);
+}
+
+/**
+ * Whether a directory is one of ours to delete. Commands take their argument
+ * from the tree, but any extension can invoke one with a path of its choosing,
+ * and a session is only ever a direct child of a folder's .duet/sessions.
+ */
+export function isSessionDir(dir: string): boolean {
+  return (vscode.workspace.workspaceFolders ?? []).some(
+    (folder) => path.dirname(dir) === path.join(folder.uri.fsPath, '.duet', 'sessions'),
+  );
+}
+
+/**
+ * Removes each session's logs from disk, returning the names of any that could
+ * not be removed. One unwritable directory must not strand the rest of a clear,
+ * and the removals are async so a large batch does not stall the extension host.
+ */
+export async function deleteSessions(sessions: SessionInfo[]): Promise<string[]> {
+  const failed: string[] = [];
+  for (const session of sessions) {
+    if (!isSessionDir(session.dir)) {
+      continue;
+    }
+    try {
+      await fs.promises.rm(session.dir, { recursive: true, force: true });
+    } catch {
+      failed.push(sessionLabel(session));
+    }
+  }
+  return failed;
 }
 
 function readProject(folder: vscode.WorkspaceFolder): ProjectNode {

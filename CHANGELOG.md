@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.12 - 2026-08-16
+
+Sessions can be deleted one at a time. Until now the only way to remove a
+session log was `dt clear`, which removed every one of them, so a single
+mistyped run could only be cleaned up by throwing away the history beside it.
+
+### Added
+
+- **`dt clear <session>`.** Deletes a single session — its directory name
+  under `.duet/sessions`, or a unique prefix of it, since the names carry a
+  timestamp and a task slug and are too long to retype. An unknown name lists
+  what is recorded, an ambiguous prefix lists what it matched, and neither
+  deletes anything. `dt clear` with no argument still clears them all.
+
 ## 0.2.11 - 2026-08-16
 
 A hardening release. The reviewer seat is read-only for both models, checks

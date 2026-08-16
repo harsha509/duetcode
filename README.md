@@ -319,7 +319,7 @@ Each run creates `.duet/sessions/{timestamp}-{task-slug}/`:
 | `round-{n}/checks.json` | Check results |
 | `round-{n}/clarification.md` | Your guidance, when the models deadlocked |
 
-`dt clear` removes all session logs. The directory is gitignored by `dt init`.
+`dt clear` removes all session logs; `dt clear <session>` removes one, by directory name or a unique prefix of it. In VS Code, delete a session from its row in the sidebar. The directory is gitignored by `dt init`.
 
 ## Commands
 
@@ -333,7 +333,7 @@ Each run creates `.duet/sessions/{timestamp}-{task-slug}/`:
 | `dt <task> -c` | Continue from the previous session's context |
 | `dt plan <task>` | Plan → review → approve → execute |
 | `dt review [--task "…"] [--reviewer claude]` | Review uncommitted changes |
-| `dt init` / `dt doctor` / `dt clear` | Setup, diagnostics, log cleanup |
+| `dt init` / `dt doctor` / `dt clear [session]` | Setup, diagnostics, log cleanup (all sessions, or one) |
 | `dt serve` | JSON-lines server for GUI frontends (VS Code extension) |
 
 ## Exit codes

@@ -117,9 +117,9 @@ Creates `.duet/config.toml` (checks, models, policy) and `.duet/prompts/` (edita
 
 Verifies: git repo, `.duet/config.toml` parses, Claude CLI presence and auth, `ANTHROPIC_API_KEY` fallback, `GEMINI_API_KEY`, prompt templates.
 
-### `dt clear`
+### `dt clear [session]`
 
-Deletes all session logs.
+Deletes all session logs, or one named session — its directory name under `.duet/sessions`, or a unique prefix of it (`dt clear 20260805-1936`). An ambiguous or unknown name lists what is recorded instead of deleting.
 
 ### `dt serve`
 

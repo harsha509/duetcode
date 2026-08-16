@@ -5,6 +5,24 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.12 - 2026-08-16
+
+Requires `dt` 0.2.12. The sessions sidebar can now delete what it lists.
+
+### Added
+
+- **Delete a session from its row.** A trash icon on hover, and a *Delete
+  Session* entry in the right-click menu, remove that session's logs after a
+  confirmation. The tree updates immediately.
+
+- **Clear All Sessions.** In the view's `…` menu it clears every folder's
+  sessions; on a project row in a multi-root workspace, only that project's.
+  Both confirm first and name how many are going.
+
+  Deletions run asynchronously and one session at a time, so clearing a long
+  history does not stall the editor, and a directory that cannot be removed
+  is reported by name instead of stranding the rest of the batch.
+
 ## 0.2.11 - 2026-08-16
 
 Requires `dt` 0.2.11. The webview's CSP nonce is now generated with

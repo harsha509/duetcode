@@ -132,8 +132,12 @@ pub enum Commands {
         verbose: bool,
     },
 
-    /// Clear all past session logs
-    Clear,
+    /// Clear past session logs — every one, or a single named session
+    Clear {
+        /// Session to delete: its directory name under .duet/sessions, or a
+        /// unique prefix of it. Omitted clears every session.
+        session: Option<String>,
+    },
 
     /// Run as a JSON-lines server for GUI frontends (e.g. the VS Code extension)
     Serve {
@@ -202,7 +206,7 @@ pub fn run() -> Result<()> {
         Some(Commands::Review { reviewer, task, verbose: v }) => {
             cmd_review(&cwd, &reviewer, task.as_deref(), cli.verbose || v)
         }
-        Some(Commands::Clear) => cmd_clear(&cwd),
+        Some(Commands::Clear { session }) => cmd_clear(&cwd, session.as_deref()),
         Some(Commands::Serve { writer, claude_model, gemini_model }) => {
             serve::run(&cwd, &writer, ModelOverrides { claude: claude_model, gemini: gemini_model })
         }
@@ -258,6 +262,7 @@ fn print_usage() {
     println!("  {} review                          review uncommitted changes", "dt".green());
     println!("  {} review --task \"add login\"       review changes against a specific task", "dt".green());
     println!("  {} clear                           clear all past session logs", "dt".green());
+    println!("  {} clear 20260805-193600           delete one session (name or unique prefix)", "dt".green());
     println!("\nRun {} for all options.", "dt --help".cyan());
 }
 
@@ -627,11 +632,17 @@ fn cmd_doctor(dir: &Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_clear(dir: &Path) -> Result<()> {
+fn cmd_clear(dir: &Path, session: Option<&str>) -> Result<()> {
     let sessions_dir = dir.join(".duet").join("sessions");
+    match session {
+        Some(name) => clear_one_session(&sessions_dir, name),
+        None => clear_all_sessions(&sessions_dir),
+    }
+}
 
+fn clear_all_sessions(sessions_dir: &Path) -> Result<()> {
     if sessions_dir.exists() {
-        std::fs::remove_dir_all(&sessions_dir)
+        std::fs::remove_dir_all(sessions_dir)
             .with_context(|| format!("failed to remove {}", sessions_dir.display()))?;
         println!("{} Cleared all past sessions.", "✓".green());
     } else {
@@ -639,6 +650,59 @@ fn cmd_clear(dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn clear_one_session(sessions_dir: &Path, name: &str) -> Result<()> {
+    let names = session_names(sessions_dir)?;
+    let target = resolve_session(&names, name)?;
+    // Joined from a name read_dir returned, never from the argument, so
+    // `dt clear ../../x` cannot escape the sessions directory.
+    let dir = sessions_dir.join(&target);
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("failed to remove {}", dir.display()))?;
+    println!("{} Deleted session {}.", "✓".green(), target);
+    Ok(())
+}
+
+fn session_names(sessions_dir: &Path) -> Result<Vec<String>> {
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<String> = std::fs::read_dir(sessions_dir)
+        .with_context(|| format!("failed to read {}", sessions_dir.display()))?
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Session directories are named `YYYYMMDD-HHMMSS-task-slug`, too long to retype,
+/// so a prefix identifies one as long as it identifies only one.
+fn resolve_session(names: &[String], name: &str) -> Result<String> {
+    // Every name starts with "", so an empty argument would silently resolve to
+    // the only session in a repo that has one.
+    if name.trim().is_empty() {
+        anyhow::bail!("name a session to delete, or run `dt clear` to delete all of them");
+    }
+
+    if names.iter().any(|n| n == name) {
+        return Ok(name.to_string());
+    }
+
+    let matches: Vec<&String> = names.iter().filter(|n| n.starts_with(name)).collect();
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] if names.is_empty() => anyhow::bail!("no sessions recorded in this repo"),
+        [] => anyhow::bail!("no session matches '{}'. Recorded sessions:\n  {}", name, names.join("\n  ")),
+        many => anyhow::bail!(
+            "'{}' matches {} sessions:\n  {}",
+            name,
+            many.len(),
+            many.iter().map(|n| n.as_str()).collect::<Vec<_>>().join("\n  ")
+        ),
+    }
 }
 
 fn write_default_prompt(dir: &Path, name: &str, content: &str) -> Result<()> {
@@ -684,5 +748,54 @@ mod tests {
     fn similar_but_narrower_rules_do_not_count() {
         assert!(needs_sessions_ignore_entry(".duetfoo/\n"));
         assert!(needs_sessions_ignore_entry(".duet/config.toml\n"));
+    }
+
+    fn recorded() -> Vec<String> {
+        ["20260805-1936-research", "20260805-1251-review", "20260805-1227-review"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn full_session_name_resolves_to_itself() {
+        assert_eq!(resolve_session(&recorded(), "20260805-1251-review").unwrap(), "20260805-1251-review");
+    }
+
+    #[test]
+    fn prefix_matching_one_session_resolves() {
+        assert_eq!(resolve_session(&recorded(), "20260805-1936").unwrap(), "20260805-1936-research");
+    }
+
+    /// A prefix that would delete either of two sessions must delete neither.
+    #[test]
+    fn ambiguous_prefix_is_refused() {
+        let err = resolve_session(&recorded(), "20260805").unwrap_err().to_string();
+        assert!(err.contains("matches 3 sessions"), "{}", err);
+    }
+
+    #[test]
+    fn unknown_session_lists_what_is_there() {
+        let err = resolve_session(&recorded(), "nope").unwrap_err().to_string();
+        assert!(err.contains("20260805-1251-review"), "{}", err);
+    }
+
+    /// The lone session in a repo must not be deleted by an argument that names
+    /// nothing at all.
+    #[test]
+    fn empty_name_never_resolves() {
+        let names = vec!["20260805-1936-fix".to_string()];
+        for name in ["", "   "] {
+            let err = resolve_session(&names, name).unwrap_err().to_string();
+            assert!(err.contains("name a session"), "{}", err);
+        }
+    }
+
+    /// An exact name wins even when it also prefixes a longer one, so a session
+    /// cannot become undeletable by a later one being named after it.
+    #[test]
+    fn exact_name_beats_the_longer_session_it_prefixes() {
+        let names = vec!["20260805-1936-fix".to_string(), "20260805-1936-fix-2".to_string()];
+        assert_eq!(resolve_session(&names, "20260805-1936-fix").unwrap(), "20260805-1936-fix");
     }
 }
