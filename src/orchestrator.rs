@@ -202,6 +202,9 @@ pub fn run(
     reviewer: &mut dyn ModelAdapter,
     sink: &dyn Sink,
 ) -> Result<OrchestratorResult> {
+    // One task is one turn: while this guard lives, the first Ctrl+C stops the
+    // run instead of killing dt, and a second one still tears everything down.
+    let _turn = crate::process::TurnGuard::new();
     let mode = match (opts.plan_first, opts.auto) {
         (true, true) => "plan + auto",
         (true, false) => "plan",
@@ -241,6 +244,7 @@ pub fn review_only(
     task: Option<&str>,
     sink: &dyn Sink,
 ) -> Result<OrchestratorResult> {
+    let _turn = crate::process::TurnGuard::new();
     // A task naming a pull request is about that pull request, not about
     // whatever happens to be uncommitted here, so its diff is fetched and
     // reviewed in place of the working tree.
@@ -278,7 +282,11 @@ pub fn review_only(
     // A standalone review is a fresh judgement on the code as it stands, so it
     // starts from a clean session. See `ModelAdapter::reset_session`.
     reviewer.reset_session();
-    let (response, usage) = reviewer.generate(&review_prompt, &[])?;
+    let (response, usage) = match reviewer.generate(&review_prompt, &[]) {
+        Ok(ok) => ok,
+        Err(_e) if crate::process::is_cancelled() => return Ok(stopped_run(sink, 1)),
+        Err(e) => return Err(e),
+    };
     costs.add(usage);
 
     if !reviewer.streams_output() {
@@ -343,7 +351,11 @@ fn fetched_review_only(
     // A standalone review is a fresh judgement on the change as it stands, so
     // it starts from a clean session. See `ModelAdapter::reset_session`.
     reviewer.reset_session();
-    let (response, usage) = reviewer.generate(&review_prompt, &[])?;
+    let (response, usage) = match reviewer.generate(&review_prompt, &[]) {
+        Ok(ok) => ok,
+        Err(_e) if crate::process::is_cancelled() => return Ok(stopped_run(sink, 1)),
+        Err(e) => return Err(e),
+    };
     costs.add(usage);
 
     if !reviewer.streams_output() {
@@ -382,6 +394,7 @@ pub fn answer_review_only(
     instruction: Option<&str>,
     sink: &dyn Sink,
 ) -> Result<OrchestratorResult> {
+    let _turn = crate::process::TurnGuard::new();
     let subject = resolve_subject(task, repo_dir, sink);
     if let Some(refused) = refusal(&subject, reviewer) {
         sink.event(Event::Warn { text: refused.warning });
@@ -409,7 +422,11 @@ pub fn answer_review_only(
     // A standalone review is a fresh judgement on the answer as it stands, so it
     // starts from a clean session. See `ModelAdapter::reset_session`.
     reviewer.reset_session();
-    let (response, usage) = reviewer.generate(&prompt, &[])?;
+    let (response, usage) = match reviewer.generate(&prompt, &[]) {
+        Ok(ok) => ok,
+        Err(_e) if crate::process::is_cancelled() => return Ok(stopped_run(sink, 1)),
+        Err(e) => return Err(e),
+    };
     costs.add(usage);
 
     if !reviewer.streams_output() {
@@ -454,9 +471,16 @@ fn plan_phase(
         actor: writer.name().to_string(),
         action: "drafting a plan…".to_string(),
     });
-    let (plan, usage) = writer
-        .generate(&plan_prompt, opts.images)
-        .with_context(|| format!("{} failed during planning", writer.name()))?;
+    let (plan, usage) = match writer.generate(&plan_prompt, opts.images) {
+        Ok(ok) => ok,
+        Err(_e) if crate::process::is_cancelled() => {
+            costs.summary();
+            return Ok(PlanOutcome::Abort(stopped_run(sink, 0)));
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("{} failed during planning", writer.name()))
+        }
+    };
     costs.add(usage);
 
     if !writer.streams_output() {
@@ -464,13 +488,18 @@ fn plan_phase(
     }
     session.log.write_writer_response(0, &plan)?;
 
-    if !ask_yes_no(sink, &format!("review this plan with {}?", reviewer.name())) {
+    let plan_review_wanted = ask_yes_no(sink, &format!("review this plan with {}?", reviewer.name()));
+    if crate::process::is_cancelled() || !plan_review_wanted {
         sink.event(Event::Stopped { text: "Plan saved but not reviewed. Exiting.".into() });
         costs.summary();
         return Ok(PlanOutcome::Abort(OrchestratorResult {
             outcome: Outcome::Stopped,
             rounds: 0,
-            message: "plan created, user skipped review".into(),
+            message: if crate::process::is_cancelled() {
+                "stopped by user".into()
+            } else {
+                "plan created, user skipped review".into()
+            },
             answer: None,
         }));
     }
@@ -482,9 +511,16 @@ fn plan_phase(
         actor: reviewer.name().to_string(),
         action: "reviewing the plan…".to_string(),
     });
-    let (plan_review, usage) = reviewer
-        .generate(&review_prompt, &[])
-        .with_context(|| format!("{} failed during plan review", reviewer.name()))?;
+    let (plan_review, usage) = match reviewer.generate(&review_prompt, &[]) {
+        Ok(ok) => ok,
+        Err(_e) if crate::process::is_cancelled() => {
+            costs.summary();
+            return Ok(PlanOutcome::Abort(stopped_run(sink, 0)));
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("{} failed during plan review", reviewer.name()))
+        }
+    };
     costs.add(usage);
 
     if !reviewer.streams_output() {
@@ -493,13 +529,18 @@ fn plan_phase(
     session.log.write_reviewer_response(0, &plan_review)?;
     emit_verdict(sink, VerdictKind::Code, &policy::parse_verdict(&plan_review));
 
-    if !ask_yes_no(sink, "execute this task?") {
+    let execute = ask_yes_no(sink, "execute this task?");
+    if crate::process::is_cancelled() || !execute {
         sink.event(Event::Stopped { text: "Exiting without executing.".into() });
         costs.summary();
         return Ok(PlanOutcome::Abort(OrchestratorResult {
             outcome: Outcome::Stopped,
             rounds: 0,
-            message: "plan reviewed, user chose not to execute".into(),
+            message: if crate::process::is_cancelled() {
+                "stopped by user".into()
+            } else {
+                "plan reviewed, user chose not to execute".into()
+            },
             answer: None,
         }));
     }
@@ -536,6 +577,10 @@ fn execute_loop(
     let mut round = 0;
 
     while round < budget {
+        if crate::process::is_cancelled() {
+            costs.summary();
+            return Ok(stopped_run(sink, round));
+        }
         round += 1;
         sink.event(Event::RoundStarted { round, budget });
 
@@ -550,9 +595,17 @@ fn execute_loop(
             action: if round == 1 { "implementing…" } else { "addressing review feedback…" }.to_string(),
         });
         let round_images = if round == 1 { opts.images } else { &[][..] };
-        let (writer_response, usage) = writer
-            .generate(&writer_prompt, round_images)
-            .with_context(|| format!("writer ({}) failed in round {}", writer.name(), round))?;
+        let (writer_response, usage) = match writer.generate(&writer_prompt, round_images) {
+            Ok(ok) => ok,
+            Err(_e) if crate::process::is_cancelled() => {
+                costs.summary();
+                return Ok(stopped_run(sink, round));
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("writer ({}) failed in round {}", writer.name(), round))
+            }
+        };
         costs.add(usage);
 
         session.log.write_writer_response(round, &writer_response)?;
@@ -614,8 +667,16 @@ fn execute_loop(
                     writer_notes: &writer_response,
                     clarification: clar.as_deref(),
                 };
-                let review =
-                    run_answer_review(opts, reviewer, session, costs, &input, subject, sink)?;
+                let review = match run_answer_review(
+                    opts, reviewer, session, costs, &input, subject, sink,
+                ) {
+                    Ok(review) => review,
+                    Err(_e) if crate::process::is_cancelled() => {
+                        costs.summary();
+                        return Ok(stopped_run(sink, round));
+                    }
+                    Err(e) => return Err(e),
+                };
                 last_checks_passed = true;
 
                 if review.approved() {
@@ -684,7 +745,14 @@ fn execute_loop(
                     writer_notes: &writer_response,
                     clarification: clar.as_deref(),
                 };
-                let review = run_review(opts, reviewer, session, costs, &input, &diff, sink)?;
+                let review = match run_review(opts, reviewer, session, costs, &input, &diff, sink) {
+                    Ok(review) => review,
+                    Err(_e) if crate::process::is_cancelled() => {
+                        costs.summary();
+                        return Ok(stopped_run(sink, round));
+                    }
+                    Err(e) => return Err(e),
+                };
                 last_checks_passed = review.checks_passed;
 
                 if review.approved() {
@@ -1061,8 +1129,10 @@ fn notify_approval(
          No further action is required. Please acknowledge.",
         reviewer_response
     );
-    if let Ok((_text, usage)) = writer.generate(&prompt, &[]) {
-        costs.add(usage);
+    if !crate::process::is_cancelled() {
+        if let Ok((_text, usage)) = writer.generate(&prompt, &[]) {
+            costs.add(usage);
+        }
     }
 }
 
@@ -1618,6 +1688,18 @@ fn ok_result(rounds: usize, message: &str) -> OrchestratorResult {
 /// so an on-demand review still has the thing it needs to judge.
 fn unreviewed_result(rounds: usize, message: String, answer: Option<String>) -> OrchestratorResult {
     OrchestratorResult { outcome: Outcome::Unreviewed, rounds, message, answer }
+}
+
+/// The result of a run the user stopped mid-flight: announced once, then handed
+/// back so the session (REPL or serve) can carry on with the next command.
+fn stopped_run(sink: &dyn Sink, rounds: usize) -> OrchestratorResult {
+    sink.event(Event::Stopped { text: "stopped — this run ends here, the session continues".into() });
+    OrchestratorResult {
+        outcome: Outcome::Stopped,
+        rounds,
+        message: "stopped by user".into(),
+        answer: None,
+    }
 }
 
 /// Closing line for a run that ends with nothing reviewed. A terminal asked and

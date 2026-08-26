@@ -31,6 +31,17 @@ fn total_bytes(history: &[serde_json::Value]) -> usize {
     history.iter().map(|v| v.to_string().len()).sum()
 }
 
+/// Whether the user asked to stop the current turn.
+pub(crate) fn stop_requested() -> bool {
+    crate::process::is_cancelled()
+}
+
+/// The failure a transport reports when the turn was stopped mid-flight. A
+/// partial answer is discarded, never surfaced as model output.
+pub(crate) fn interrupted_error() -> anyhow::Error {
+    anyhow::anyhow!("stopped by user")
+}
+
 /// Whether a CLI run died because the conversation outgrew the model's
 /// context. Matched against the CLI's own diagnostics — stderr or its typed
 /// error/result events — never the model's output, which quotes such phrases

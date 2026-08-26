@@ -220,6 +220,10 @@ pub fn session_help() {
     println!("    {}           show this help", "/help".green());
     println!("    {}           leave the session", "/quit".green());
     println!("  anything else is sent to the duet as a coding task");
+    println!(
+        "\n  {}",
+        "Ctrl+C stops the running task/review (session stays); press it again to quit".dimmed()
+    );
 }
 
 /// Read one line for the session prompt. Returns None on EOF (ctrl-D).

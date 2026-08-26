@@ -14,6 +14,9 @@ use std::time::Duration;
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
+/// Budget for the `which` probe run at startup and in `dt doctor`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read-only tool access: the CLI may open and search the checkout but cannot
 /// edit it. A reviewer that could write would be free to "fix" what it is
 /// judging, and the diff it reported on would no longer be the one it read.
@@ -48,6 +51,9 @@ pub struct GeminiAdapter {
     /// workspace touches one gets the crawl guard from the first spawn instead
     /// of an OOM death and a retry.
     crawl_hazards: HashSet<PathBuf>,
+    /// Set by `run_cli` for a timeout or a user stop: `generate` must not
+    /// fall back to the API on top of it.
+    not_retryable: bool,
     sink: Arc<dyn Sink>,
 }
 
@@ -69,12 +75,15 @@ struct CliAttempt {
     session_id: Option<String>,
     /// True when the CLI's own stderr said the session outgrew its context.
     overflowed: bool,
+    /// True when the watchdog killed this run at its deadline. A retry or
+    /// fallback would burn another full budget on the same wedge.
+    timed_out: bool,
     result: Result<CliOutput>,
 }
 
 impl CliAttempt {
     fn failed(error: anyhow::Error) -> Self {
-        Self { session_id: None, overflowed: false, result: Err(error) }
+        Self { session_id: None, overflowed: false, timed_out: false, result: Err(error) }
     }
 
     /// True when the CLI got as far as announcing its session, which means a
@@ -283,6 +292,7 @@ impl GeminiAdapter {
             files_opened: Vec::new(),
             crawl_checked: HashSet::new(),
             crawl_hazards: HashSet::new(),
+            not_retryable: false,
             sink,
         })
     }
@@ -296,10 +306,9 @@ impl GeminiAdapter {
     }
 
     fn check_cli_available(command: &str) -> bool {
-        Command::new("which")
-            .arg(command)
-            .output()
-            .map(|o| o.status.success())
+        // Bounded so a wedged CLI cannot hang startup or `dt doctor` forever.
+        crate::process::capture_with_timeout(Command::new("which").arg(command), PROBE_TIMEOUT)
+            .map(|o| o.is_some_and(|o| o.status.success()))
             .unwrap_or(false)
     }
 
@@ -371,16 +380,27 @@ impl GeminiAdapter {
         let attempt = self.spawn_cli(prompt, crawl_guard);
         let connected = attempt.connected();
         let overflowed = attempt.overflowed;
+        // A timeout or a user stop killed this run on purpose; no retry or
+        // API fallback may re-send the prompt behind the caller's back.
+        self.not_retryable = attempt.timed_out || super::stop_requested();
         self.record_session(&attempt);
+
+        let error = match attempt.result {
+            Ok(CliOutput { text, usage, files_opened, .. }) => {
+                self.files_opened = files_opened;
+                return Ok((text, usage));
+            }
+            Err(error) => error,
+        };
+        if self.not_retryable {
+            return Err(error);
+        }
 
         // A rejected resume is one failure a fresh session fixes; an overflowed
         // one is another — the session is still on disk, but too big to continue.
         let restart = should_restart_session(was_resuming, connected) || (was_resuming && overflowed);
-
         if !restart {
-            let CliOutput { text, usage, files_opened, .. } = attempt.result?;
-            self.files_opened = files_opened;
-            return Ok((text, usage));
+            return Err(error);
         }
 
         if connected {
@@ -390,6 +410,7 @@ impl GeminiAdapter {
         }
         self.sessions.remove(&self.working_dir);
         let retry = self.spawn_cli(prompt, crawl_guard);
+        self.not_retryable = retry.timed_out || super::stop_requested();
         self.record_session(&retry);
         let CliOutput { text, usage, files_opened, .. } = retry.result?;
         self.files_opened = files_opened;
@@ -484,36 +505,60 @@ impl GeminiAdapter {
         let watchdog = crate::process::Watchdog::arm(child, timeout);
         let streamed = self.stream_cli_json(child);
         let timed_out = watchdog.disarm();
+        let reap_grace = if timeout.is_zero() { timeout } else { crate::process::REAP_GRACE };
 
         let output = match streamed {
             Ok(output) => output,
-            Err(e) => return CliAttempt::failed(e),
+            Err(e) => {
+                // The child may still be alive on this path: reap or kill it,
+                // or its group slot leaks until dt exits.
+                let _ = crate::process::wait_or_kill(child, reap_grace);
+                if let Some(handle) = stderr_drain {
+                    let _ = handle.join();
+                }
+                let e =
+                    if super::stop_requested() { super::interrupted_error() } else { e };
+                return CliAttempt::failed(e);
+            }
         };
         // Read off the parsed output, so a failure below still reports it.
         let session_id = output.session_id.clone();
 
         // stdout is closed by now, so the run's budget is already spent
         // streaming; the exit wait gets a short grace, not a second budget.
-        let reap = if timeout.is_zero() { timeout } else { crate::process::REAP_GRACE };
         let status =
-            match crate::process::wait_or_kill(child, reap).context("failed to wait for gemini") {
+            match crate::process::wait_or_kill(child, reap_grace).context("failed to wait for gemini")
+            {
                 Ok(Some(status)) => status,
                 Ok(None) => {
                     return CliAttempt {
                         session_id,
                         overflowed: false,
+                        timed_out: false,
                         result: Err(anyhow::anyhow!(
                             "gemini CLI did not exit after finishing its output — killed after {}s",
                             crate::process::REAP_GRACE.as_secs()
                         )),
                     };
                 }
-                Err(e) => return CliAttempt { session_id, overflowed: false, result: Err(e) },
+                Err(e) => {
+                    return CliAttempt { session_id, overflowed: false, timed_out: false, result: Err(e) }
+                }
             };
         let stderr = stderr_drain.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
 
         if self.verbose && !stderr.is_empty() {
             eprintln!("  {} stderr: {}", "[verbose]".dimmed(), stderr.trim());
+        }
+
+        // A user stop outranks every other classification of the corpse.
+        if super::stop_requested() {
+            return CliAttempt {
+                session_id,
+                overflowed: false,
+                timed_out,
+                result: Err(super::interrupted_error()),
+            };
         }
 
         // Honored only for a failed run: a child can finish cleanly in the
@@ -522,6 +567,7 @@ impl GeminiAdapter {
             return CliAttempt {
                 session_id,
                 overflowed: false,
+                timed_out: true,
                 result: Err(anyhow::anyhow!(
                     "gemini CLI timed out after {}s — raise cli_timeout_secs in \
                      .duet/config.toml [gemini] to allow longer runs",
@@ -538,6 +584,7 @@ impl GeminiAdapter {
             return CliAttempt {
                 session_id,
                 overflowed,
+                timed_out: false,
                 result: Err(anyhow::anyhow!(
                     "gemini CLI {}",
                     describe_status(&status, &stderr, &output.text)
@@ -545,7 +592,7 @@ impl GeminiAdapter {
             };
         }
 
-        CliAttempt { session_id, overflowed: false, result: Ok(output) }
+        CliAttempt { session_id, overflowed: false, timed_out: false, result: Ok(output) }
     }
 
     /// Parses the CLI's newline-delimited JSON events. Shapes are those the
@@ -566,6 +613,12 @@ impl GeminiAdapter {
         let start = std::time::Instant::now();
 
         for line in reader.lines() {
+            if super::stop_requested() {
+                // A stop ends the stream here: a partial answer must never be
+                // mistaken for a complete one.
+                self.sink.event(Event::StreamEnd { model: "gemini".into() });
+                return Err(super::interrupted_error());
+            }
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
@@ -761,6 +814,11 @@ impl GeminiAdapter {
         let mut finish_reason: Option<String> = None;
 
         for line in reader.lines() {
+            if super::stop_requested() {
+                // A stop ends the stream here: a partial answer must never be
+                // mistaken for a complete one.
+                return Err(super::interrupted_error());
+            }
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
@@ -891,7 +949,7 @@ impl ModelAdapter for GeminiAdapter {
         // beats one that cannot read at all. Not when the guard was already
         // on — the identical spawn cannot end differently.
         if let Err(e) = &result {
-            if guard.is_none() && is_oom_failure(e) {
+            if guard.is_none() && !self.not_retryable && is_oom_failure(e) {
                 if let Ok(retry_guard) = crawl_guard_settings() {
                     self.sink.event(Event::Warn {
                         text: format!(
@@ -908,7 +966,9 @@ impl ModelAdapter for GeminiAdapter {
 
         match result {
             Ok(result) => Ok(result),
-            Err(e) if self.can_fall_back_to_api() => {
+            // Never on a timeout or a user stop: both killed the run
+            // deliberately, and a second full call cannot help.
+            Err(e) if !self.not_retryable && self.can_fall_back_to_api() => {
                 self.sink.event(Event::Warn {
                     text: format!(
                         "gemini CLI failed ({:#}) — falling back to the API, which cannot read files",

@@ -78,7 +78,9 @@ impl RipgrepStatus {
 /// executables only, never shell functions or aliases defined in the user's
 /// interactive shell.
 fn find_on_path(binary: &str) -> Option<PathBuf> {
-    let output = Command::new("which").arg(binary).output().ok()?;
+    let mut cmd = Command::new("which");
+    cmd.arg(binary);
+    let output = crate::process::capture_with_timeout(&mut cmd, PROBE_TIMEOUT).ok()??;
     if !output.status.success() {
         return None;
     }
@@ -89,6 +91,9 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
         Some(PathBuf::from(path))
     }
 }
+
+/// Budget for the `which` probe; a wedged filesystem must not hang startup.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn is_gemini_trusted(path: &Path) -> bool {
     // Component-wise, so /usr/binx does not pass as /usr/bin.

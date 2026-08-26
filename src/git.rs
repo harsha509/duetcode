@@ -1,6 +1,30 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
+
+/// Budget for one git invocation, which normally takes milliseconds. A stale
+/// index.lock or wedged filesystem must not hang a round forever.
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Runs git capturing its output, killed if it hangs past [`GIT_TIMEOUT`].
+fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(dir);
+    crate::process::capture_with_timeout(&mut cmd, GIT_TIMEOUT)
+        .map_err(|e| anyhow::anyhow!("failed to run git {}: {e}", args.join(" ")))?
+        .ok_or_else(|| {
+            if crate::process::is_cancelled() {
+                anyhow::anyhow!("git {} stopped by user", args.join(" "))
+            } else {
+                anyhow::anyhow!(
+                    "git {} did not finish within {}s",
+                    args.join(" "),
+                    GIT_TIMEOUT.as_secs()
+                )
+            }
+        })
+}
 
 pub fn is_git_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
@@ -10,19 +34,11 @@ pub fn is_git_repo(dir: &Path) -> bool {
 /// a `.git` directory, so without this a machine with no git at all reports
 /// "not a repository" — the wrong problem, with the wrong fix.
 pub fn is_git_available() -> bool {
-    Command::new("git")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    git_output(Path::new("."), &["--version"]).map(|o| o.status.success()).unwrap_or(false)
 }
 
 pub fn current_branch(dir: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(dir)
-        .output()
-        .context("failed to run git rev-parse")?;
+    let output = git_output(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -35,12 +51,7 @@ pub fn current_branch(dir: &Path) -> Result<String> {
 }
 
 pub fn git_status(dir: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(dir)
-        .output()
-        .context("failed to run git status")?;
-
+    let output = git_output(dir, &["status", "--porcelain"])?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
@@ -60,20 +71,11 @@ pub fn git_diff(dir: &Path) -> Result<String> {
 }
 
 fn tracked_diff(dir: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .args(["diff", "HEAD"])
-        .current_dir(dir)
-        .output()
-        .context("failed to run git diff")?;
-
+    let output = git_output(dir, &["diff", "HEAD"]).context("failed to run git diff")?;
     let diff = String::from_utf8_lossy(&output.stdout).to_string();
 
     if diff.trim().is_empty() {
-        let output = Command::new("git")
-            .args(["diff"])
-            .current_dir(dir)
-            .output()
-            .context("failed to run git diff (unstaged)")?;
+        let output = git_output(dir, &["diff"])?;
         return Ok(String::from_utf8_lossy(&output.stdout).to_string());
     }
 
@@ -81,10 +83,7 @@ fn tracked_diff(dir: &Path) -> Result<String> {
 }
 
 fn untracked_files(dir: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .current_dir(dir)
-        .output()
+    let output = git_output(dir, &["ls-files", "--others", "--exclude-standard"])
         .context("failed to run git ls-files")?;
 
     Ok(String::from_utf8_lossy(&output.stdout)
@@ -140,7 +139,7 @@ pub fn changed_files(dir: &Path) -> Vec<String> {
 }
 
 fn name_status(dir: &Path, args: &[&str]) -> Option<Vec<String>> {
-    let output = Command::new("git").args(args).current_dir(dir).output().ok()?;
+    let output = git_output(dir, args).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -184,11 +183,6 @@ pub fn repo_identity(dir: &Path) -> String {
 }
 
 pub fn git_diff_stat(dir: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .args(["diff", "--stat", "HEAD"])
-        .current_dir(dir)
-        .output()
-        .context("failed to run git diff --stat")?;
-
+    let output = git_output(dir, &["diff", "--stat", "HEAD"])?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }

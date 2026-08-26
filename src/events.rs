@@ -140,12 +140,24 @@ impl Sink for TerminalSink {
     }
 
     fn ask(&self, kind: AskKind, question: &str) -> String {
+        // A stop that arrived mid-turn lands here too: skip prompting, so the
+        // orchestrator's next check unwinds the run instead of the answer
+        // going to whatever question comes later.
+        if crate::process::is_cancelled() {
+            return String::new();
+        }
         self.break_stream();
-        match kind {
+        let answer = match kind {
             AskKind::YesNo => {
                 if ui::ask_yes_no(question) { "y".into() } else { "n".into() }
             }
             AskKind::Text => ui::ask_text(question),
+        };
+        // The stop may land while the question is on screen; the read above
+        // only ends once Enter is pressed.
+        if crate::process::is_cancelled() {
+            return String::new();
         }
+        answer
     }
 }

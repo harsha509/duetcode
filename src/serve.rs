@@ -6,6 +6,7 @@
 //!   {"cmd":"plan","task":"..."}
 //!   {"cmd":"review","task":"optional context","dirs":["/proj-a","/proj-b"]}
 //!   {"cmd":"answer","id":3,"value":"y"}        // reply to an "ask" event
+//!   {"cmd":"stop"}                              // abort the running task/review
 //!   {"cmd":"ping"} / {"cmd":"quit"}
 //!
 //! `workspace` declares the projects the session spans; frontends resend it
@@ -33,6 +34,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+
+/// How often a pending ask re-checks for a stop request while waiting.
+const ANSWER_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Default, Deserialize)]
 struct Command {
@@ -63,14 +68,14 @@ struct Command {
 }
 
 /// Serializes events as JSON lines on stdout; asks block until the frontend
-/// replies with an `answer` command.
+/// replies with an `answer` command echoing the ask's id.
 pub struct JsonSink {
-    answers: Mutex<Receiver<String>>,
+    answers: Mutex<Receiver<(u64, String)>>,
     next_id: AtomicU64,
 }
 
 impl JsonSink {
-    fn new(answers: Receiver<String>) -> Self {
+    fn new(answers: Receiver<(u64, String)>) -> Self {
         Self { answers: Mutex::new(answers), next_id: AtomicU64::new(1) }
     }
 }
@@ -89,11 +94,29 @@ impl Sink for JsonSink {
     fn ask(&self, kind: AskKind, question: &str) -> String {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.event(Event::Ask { id, kind, question: question.to_string() });
-        self.answers
-            .lock()
-            .expect("answer channel poisoned")
-            .recv()
-            .unwrap_or_default()
+        // The lock is poisoned only if another thread panicked mid-receive;
+        // the receiver itself is still usable, so keep going rather than
+        // taking the server down.
+        let rx =
+            self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if crate::process::is_cancelled() {
+                // A stop ends the wait: the caller sees a non-answer and the
+                // orchestrator's next check unwinds the run.
+                return String::new();
+            }
+            match rx.recv_timeout(ANSWER_POLL) {
+                // An id-less answer (absent id arrives as 0) is accepted for
+                // whichever ask is in flight; an id'd answer must match, so a
+                // stray reply can never approve a later question.
+                Ok((answer_id, value)) if answer_id == 0 || answer_id == id => {
+                    return value;
+                }
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return String::new(),
+            }
+        }
     }
 }
 
@@ -102,7 +125,7 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
         anyhow::bail!("not a git repository — run `git init` first");
     }
 
-    let (ans_tx, ans_rx) = mpsc::channel::<String>();
+    let (ans_tx, ans_rx) = mpsc::channel::<(u64, String)>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
 
     let sink: Arc<JsonSink> = Arc::new(JsonSink::new(ans_rx));
@@ -134,6 +157,9 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
         match cmd.cmd.as_str() {
             "ping" => sink.event(Event::Pong),
             "quit" => break,
+            // Normally intercepted by the stdin reader mid-task; handled here
+            // too so one sent while idle is never reported as unknown.
+            "stop" => crate::process::request_cancel(),
             "workspace" => {
                 workspace = workspace_projects(&cmd, dir);
                 sink.event(Event::Info {
@@ -492,6 +518,7 @@ fn run_review(
     session_dir: &Path,
     sink: &dyn Sink,
 ) {
+    let _turn = crate::process::TurnGuard::new();
     let mut targets = review_targets(cmd, workspace);
     let pr_task = cmd.task.as_deref().is_some_and(review_subject::names_absent_code);
     if pr_task {
@@ -501,6 +528,11 @@ fn run_review(
     let mut tally = ReviewTally::default();
 
     for target in &targets {
+        // A stop during a previous project's review ends the whole run; the
+        // next task or review command starts fresh.
+        if crate::process::is_cancelled() {
+            break;
+        }
         let pending =
             if pr_task { None } else { pending_answers.get(&project_key(&target.dir)) };
         if !pr_task && pending.is_none() && !has_changes_to_review(target, multi, sink) {
@@ -672,9 +704,11 @@ fn review_summary(tally: &ReviewTally) -> String {
     summary
 }
 
-/// Routes stdin lines: `answer` commands unblock a pending ask; everything
-/// else queues for the main loop. EOF requests a clean shutdown.
-fn spawn_stdin_reader(cmd_tx: Sender<Command>, ans_tx: Sender<String>, sink: Arc<JsonSink>) {
+/// Routes stdin lines: `answer` commands unblock a pending ask, `stop` aborts
+/// the run in flight immediately (it must not queue behind the work it is
+/// stopping); everything else queues for the main loop. EOF requests a clean
+/// shutdown.
+fn spawn_stdin_reader(cmd_tx: Sender<Command>, ans_tx: Sender<(u64, String)>, sink: Arc<JsonSink>) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -685,8 +719,13 @@ fn spawn_stdin_reader(cmd_tx: Sender<Command>, ans_tx: Sender<String>, sink: Arc
             }
             match serde_json::from_str::<Command>(line) {
                 Ok(cmd) if cmd.cmd == "answer" => {
-                    let _ = cmd.id; // single outstanding ask; id kept for protocol clarity
-                    let _ = ans_tx.send(cmd.value.unwrap_or_default());
+                    let _ = ans_tx.send((cmd.id.unwrap_or(0), cmd.value.unwrap_or_default()));
+                }
+                // Handled right here because the main loop is busy inside the
+                // very task or review this command is meant to interrupt.
+                Ok(cmd) if cmd.cmd == "stop" => {
+                    crate::process::request_cancel();
+                    sink.event(Event::Info { text: "stopping…".into() });
                 }
                 Ok(cmd) => {
                     if cmd_tx.send(cmd).is_err() {

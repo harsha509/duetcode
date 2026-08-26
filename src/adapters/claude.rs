@@ -27,6 +27,10 @@ const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_OUTPUT_TOKENS: u32 = 8192;
 
+/// Budgets for the short probes run at startup and in `dt doctor`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct ClaudeAdapter {
     config: ClaudeConfig,
     working_dir: PathBuf,
@@ -53,6 +57,9 @@ pub struct ClaudeAdapter {
     /// True when this model holds the reviewer seat: the spawn then runs
     /// read-only, the same way the gemini reviewer always does.
     read_only: bool,
+    /// Set by `run_cli` for a timeout or a user stop: `generate` must not
+    /// fall back to the API on top of it.
+    not_retryable: bool,
     sink: Arc<dyn Sink>,
 }
 
@@ -100,13 +107,16 @@ struct CliAttempt {
     session_id: Option<String>,
     /// True when the CLI's own stderr said the session outgrew its context.
     overflowed: bool,
+    /// True when the watchdog killed this run at its deadline. A retry or
+    /// fallback would burn another full budget on the same wedge.
+    timed_out: bool,
     result: Result<CliOutput>,
 }
 
 impl CliAttempt {
     /// A run that never got far enough to have a session.
     fn failed(error: anyhow::Error) -> Self {
-        Self { session_id: None, overflowed: false, result: Err(error) }
+        Self { session_id: None, overflowed: false, timed_out: false, result: Err(error) }
     }
 
     /// True when the CLI got as far as announcing its session, which means a
@@ -161,6 +171,7 @@ impl ClaudeAdapter {
             messages: Vec::new(),
             files_opened: Vec::new(),
             read_only: false,
+            not_retryable: false,
             sink,
         }
     }
@@ -184,10 +195,9 @@ impl ClaudeAdapter {
     }
 
     fn check_cli_available(command: &str) -> bool {
-        Command::new("which")
-            .arg(command)
-            .output()
-            .map(|o| o.status.success())
+        // Bounded so a wedged CLI cannot hang startup or `dt doctor` forever.
+        crate::process::capture_with_timeout(Command::new("which").arg(command), PROBE_TIMEOUT)
+            .map(|o| o.is_some_and(|o| o.status.success()))
             .unwrap_or(false)
     }
 
@@ -200,10 +210,17 @@ impl ClaudeAdapter {
     }
 
     pub fn check_auth(&self) -> Result<String> {
-        let output = Command::new(&self.config.command)
-            .args(["auth", "status", "--text"])
-            .output()
-            .with_context(|| format!("failed to run '{} auth status'", self.config.command))?;
+        let mut cmd = Command::new(&self.config.command);
+        cmd.args(["auth", "status", "--text"]);
+        let output = crate::process::capture_with_timeout(&mut cmd, AUTH_TIMEOUT)
+            .with_context(|| format!("failed to run '{} auth status'", self.config.command))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "'{} auth status' did not finish within {}s",
+                    self.config.command,
+                    AUTH_TIMEOUT.as_secs()
+                )
+            })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -280,6 +297,13 @@ impl ClaudeAdapter {
         let mut model_name = self.config.api_model.clone();
 
         for line in reader.lines() {
+            if super::stop_requested() {
+                // A stop ends the stream here: a partial answer must never be
+                // mistaken for a complete one.
+                self.sink.event(Event::StreamEnd { model: "claude".into() });
+                ui::stream_footer();
+                return Err(super::interrupted_error());
+            }
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
@@ -375,6 +399,9 @@ impl ClaudeAdapter {
         let attempt = self.spawn_cli(prompt, images);
         let connected = attempt.connected();
         let overflowed = attempt.overflowed;
+        // A timeout or a user stop killed this run on purpose; no retry or
+        // API fallback may re-send the prompt behind the caller's back.
+        self.not_retryable = attempt.timed_out || super::stop_requested();
         self.record_session(&attempt);
 
         let error = match attempt.result {
@@ -384,6 +411,9 @@ impl ClaudeAdapter {
             }
             Err(error) => error,
         };
+        if self.not_retryable {
+            return Err(error);
+        }
 
         // A rejected resume is one failure a fresh session fixes; an overflowed
         // one is another — the session is still on disk, but too big to continue.
@@ -404,6 +434,7 @@ impl ClaudeAdapter {
         self.sessions.remove(&self.working_dir);
 
         let retry = self.spawn_cli(prompt, images);
+        self.not_retryable = retry.timed_out || super::stop_requested();
         self.record_session(&retry);
         let CliOutput { text, usage, files_opened, .. } = retry.result?;
         self.files_opened = files_opened;
@@ -513,36 +544,60 @@ impl ClaudeAdapter {
         let watchdog = crate::process::Watchdog::arm(child, timeout);
         let streamed = self.stream_cli_json(child);
         let timed_out = watchdog.disarm();
+        let reap_grace = if timeout.is_zero() { timeout } else { crate::process::REAP_GRACE };
 
         let output = match streamed {
             Ok(output) => output,
-            Err(e) => return CliAttempt::failed(e),
+            Err(e) => {
+                // The child may still be alive on this path: reap or kill it,
+                // or its group slot leaks until dt exits.
+                let _ = crate::process::wait_or_kill(child, reap_grace);
+                if let Some(handle) = stderr_drain {
+                    let _ = handle.join();
+                }
+                let e =
+                    if super::stop_requested() { super::interrupted_error() } else { e };
+                return CliAttempt::failed(e);
+            }
         };
         // Read off the parsed output, so a failure below still reports it.
         let session_id = output.session_id.clone();
 
         // stdout is closed by now, so the run's budget is already spent
         // streaming; the exit wait gets a short grace, not a second budget.
-        let reap = if timeout.is_zero() { timeout } else { crate::process::REAP_GRACE };
         let status =
-            match crate::process::wait_or_kill(child, reap).context("failed to wait for claude") {
+            match crate::process::wait_or_kill(child, reap_grace).context("failed to wait for claude")
+            {
                 Ok(Some(status)) => status,
                 Ok(None) => {
                     return CliAttempt {
                         session_id,
                         overflowed: false,
+                        timed_out: false,
                         result: Err(anyhow::anyhow!(
                             "claude CLI did not exit after finishing its output — killed after {}s",
                             crate::process::REAP_GRACE.as_secs()
                         )),
                     };
                 }
-                Err(e) => return CliAttempt { session_id, overflowed: false, result: Err(e) },
+                Err(e) => {
+                    return CliAttempt { session_id, overflowed: false, timed_out: false, result: Err(e) }
+                }
             };
         let stderr = stderr_drain.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
 
         if self.verbose && !stderr.is_empty() {
             eprintln!("  {} stderr: {}", "[verbose]".dimmed(), stderr.trim());
+        }
+
+        // A user stop outranks every other classification of the corpse.
+        if super::stop_requested() {
+            return CliAttempt {
+                session_id,
+                overflowed: false,
+                timed_out,
+                result: Err(super::interrupted_error()),
+            };
         }
 
         // Honored only for a failed run: a child can finish cleanly in the
@@ -551,6 +606,7 @@ impl ClaudeAdapter {
             return CliAttempt {
                 session_id,
                 overflowed: false,
+                timed_out: true,
                 result: Err(anyhow::anyhow!(
                     "claude CLI timed out after {}s — raise cli_timeout_secs in \
                      .duet/config.toml [claude] to allow longer runs",
@@ -574,11 +630,12 @@ impl ClaudeAdapter {
             return CliAttempt {
                 session_id,
                 overflowed,
+                timed_out: false,
                 result: Err(anyhow::anyhow!("claude CLI exited with {}: {}", status, details)),
             };
         }
 
-        CliAttempt { session_id, overflowed: false, result: Ok(output) }
+        CliAttempt { session_id, overflowed: false, timed_out: false, result: Ok(output) }
     }
 
     fn describe_tool_action(tool: &str, input: Option<&serde_json::Value>) -> String {
@@ -666,6 +723,11 @@ impl ClaudeAdapter {
         let mut error_detail: Option<String> = None;
 
         for line in reader.lines() {
+            if super::stop_requested() {
+                // A stop ends the stream here: a partial answer must never be
+                // mistaken for a complete one.
+                return Err(super::interrupted_error());
+            }
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
@@ -914,8 +976,12 @@ impl ModelAdapter for ClaudeAdapter {
         }
         match self.run_cli(prompt, images) {
             // Case-insensitive to match the constructor, which lowercases
-            // `mode` before deciding whether to build the API agent.
-            Err(e) if self.api_key.is_some() && self.config.mode.eq_ignore_ascii_case("auto") => {
+            // `mode` before deciding whether to build the API agent. Never on
+            // a timeout or a user stop: both killed the run deliberately.
+            Err(e) if !self.not_retryable
+                && self.api_key.is_some()
+                && self.config.mode.eq_ignore_ascii_case("auto") =>
+            {
                 eprintln!("  {} CLI failed ({:#}) — falling back to API", "↻".yellow(), e);
                 self.run_api(prompt, images)
             }
