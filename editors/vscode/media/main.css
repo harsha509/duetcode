@@ -83,10 +83,18 @@ body {
   margin-bottom: 6px;
 }
 
-.col.writer { border-left: 3px solid var(--vscode-charts-green); }
-.col.reviewer { border-left: 3px solid var(--vscode-charts-purple); }
+/* Seat colours: the writer's box reads green, the reviewer's yellow. The
+   tint stays faint so theme text keeps its contrast. */
+.col.writer {
+  border-color: var(--vscode-charts-green);
+  background: color-mix(in srgb, var(--vscode-charts-green) 6%, transparent);
+}
+.col.reviewer {
+  border-color: var(--vscode-charts-yellow);
+  background: color-mix(in srgb, var(--vscode-charts-yellow) 6%, transparent);
+}
 .col.writer .col-head { color: var(--vscode-charts-green); }
-.col.reviewer .col-head { color: var(--vscode-charts-purple); }
+.col.reviewer .col-head { color: var(--vscode-charts-yellow); }
 
 /* Prose wraps; code does not. `pre.stream` is the raw sink chunks land in
    while a model is still talking, `pre.prose` the laid-out result. */
@@ -159,6 +167,21 @@ code.inline {
 .dim { opacity: 0.5; margin: 2px 0; }
 .tool { opacity: 0.6; font-size: 12px; margin: 2px 0; font-family: var(--vscode-editor-font-family); }
 
+/* The one live activity line per seat, breathing while the model works. */
+.activity {
+  font-size: 12px;
+  margin: 2px 0;
+  font-family: var(--vscode-editor-font-family);
+  animation: activity-pulse 1.2s ease-in-out infinite;
+}
+@keyframes activity-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 0.9; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .activity { animation: none; opacity: 0.7; }
+}
+
 .check { font-size: 12px; margin: 2px 0; }
 .check.ok { color: var(--vscode-charts-green); }
 .check.bad { color: var(--vscode-charts-red); }
@@ -183,6 +206,8 @@ code.inline {
 pre.prose .pl.issue { color: var(--vscode-charts-red); font-weight: 600; }
 pre.prose .pl.warn { color: var(--vscode-charts-yellow); }
 pre.prose .pl.ok { color: var(--vscode-charts-green); }
+pre.prose .pl.head { font-weight: 600; font-size: 13px; }
+pre.prose strong.bold { font-weight: 600; }
 
 .row { margin: 4px 0; }
 .row.section { opacity: 0.6; text-align: center; margin: 10px 0; }

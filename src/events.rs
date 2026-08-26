@@ -9,7 +9,7 @@ use crate::orchestrator::Outcome;
 use crate::policy::VerdictKind;
 use crate::ui;
 use serde::Serialize;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -35,7 +35,9 @@ pub enum Event {
     Blocker { text: String },
     Success { text: String },
     Stopped { text: String },
-    Changes { stat: String },
+    /// `diff` carries the round's actual patch (capped) so a frontend can
+    /// show it inline; the terminal prints only the stat.
+    Changes { stat: String, #[serde(skip_serializing_if = "Option::is_none")] diff: Option<String> },
     Check { name: String, passed: bool },
     /// `kind` says which pair of words this verdict is in: a code review
     /// approves or requests changes, an answer review calls the answer sound or
@@ -74,14 +76,24 @@ pub fn ask_yes_no(sink: &dyn Sink, question: &str) -> bool {
 /// Renders events as the classic colored terminal output.
 pub struct TerminalSink {
     verbose: bool,
+    /// Thinking/tool lines redraw one in-place status line on a live
+    /// terminal; verbose or piped output keeps a line per action instead.
+    inline_activity: bool,
     /// True while streamed chunks are mid-line, so the next non-chunk output
     /// knows to terminate the line first.
     mid_stream: AtomicBool,
+    /// True while the in-place status line is on screen.
+    mid_activity: AtomicBool,
 }
 
 impl TerminalSink {
     pub fn new(verbose: bool) -> Self {
-        Self { verbose, mid_stream: AtomicBool::new(false) }
+        Self {
+            verbose,
+            inline_activity: !verbose && std::io::stderr().is_terminal(),
+            mid_stream: AtomicBool::new(false),
+            mid_activity: AtomicBool::new(false),
+        }
     }
 
     fn break_stream(&self) {
@@ -89,10 +101,27 @@ impl TerminalSink {
             eprintln!();
         }
     }
+
+    fn clear_activity(&self) {
+        if self.mid_activity.swap(false, Ordering::Relaxed) {
+            ui::clear_transient();
+        }
+    }
+
+    fn show_activity(&self, symbol: &str, text: &str) {
+        ui::transient(symbol, text);
+        self.mid_activity.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Sink for TerminalSink {
     fn event(&self, event: Event) {
+        // Anything durable erases the in-place status line first, so it never
+        // interleaves with real output.
+        match &event {
+            Event::Thinking { .. } | Event::ToolAction { .. } => {}
+            _ => self.clear_activity(),
+        }
         match event {
             Event::TaskStarted { task, writer, reviewer, mode, max_rounds } => {
                 ui::banner(&task, &writer, &reviewer, &mode, max_rounds);
@@ -106,7 +135,7 @@ impl Sink for TerminalSink {
             Event::Blocker { text } => ui::blocker(&text),
             Event::Success { text } => ui::success(&text),
             Event::Stopped { text } => ui::stopped(&text),
-            Event::Changes { stat } => ui::changes(&stat),
+            Event::Changes { stat, .. } => ui::changes(&stat),
             Event::Check { name, passed } => ui::check_result(&name, passed),
             Event::Verdict { kind, approved, blockers, suggestions } => {
                 ui::verdict(kind, approved, &blockers, &suggestions);
@@ -127,11 +156,19 @@ impl Sink for TerminalSink {
             Event::StreamEnd { .. } => self.break_stream(),
             Event::Thinking { .. } => {
                 self.break_stream();
-                ui::thinking();
+                if self.inline_activity {
+                    self.show_activity("◌", "reasoning...");
+                } else {
+                    ui::thinking();
+                }
             }
             Event::ToolAction { desc, .. } => {
                 self.break_stream();
-                ui::tool_action(&desc);
+                if self.inline_activity {
+                    self.show_activity("⚡", &desc);
+                } else {
+                    ui::tool_action(&desc);
+                }
             }
             // Protocol-only events; nothing to render in a terminal.
             Event::Ready { .. } | Event::Ask { .. } | Event::TaskDone { .. }
@@ -146,6 +183,7 @@ impl Sink for TerminalSink {
         if crate::process::is_cancelled() {
             return String::new();
         }
+        self.clear_activity();
         self.break_stream();
         let answer = match kind {
             AskKind::YesNo => {

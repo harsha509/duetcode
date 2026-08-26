@@ -97,6 +97,32 @@ pub fn tool_action(desc: &str) {
     eprintln!("  {} {}", "⚡".cyan(), desc);
 }
 
+/// Redraws the one transient status line in place — the model's current step.
+/// Truncated to the terminal width so a wrapped line never leaves a tail the
+/// erase cannot reach.
+pub fn transient(symbol: &str, text: &str) {
+    let max = terminal_width().saturating_sub(5);
+    let text: String = text.chars().take(max).collect();
+    eprint!("\r\x1b[2K  {} {}", symbol.cyan(), text.dimmed());
+    let _ = std::io::stderr().lock().flush();
+}
+
+/// Erases the transient status line before any durable output.
+pub fn clear_transient() {
+    eprint!("\r\x1b[2K");
+    let _ = std::io::stderr().lock().flush();
+}
+
+/// Stderr's current width, 80 when it cannot be read.
+fn terminal_width() -> usize {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(2, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+        ws.ws_col as usize
+    } else {
+        80
+    }
+}
+
 pub fn usage(u: &UsageStats) {
     if u.input_tokens == 0 && u.output_tokens == 0 {
         return;

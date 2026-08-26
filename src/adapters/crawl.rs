@@ -161,6 +161,25 @@ impl CrawlAssessment {
             biggest,
         ))
     }
+
+    /// One-line form for a run where the crawler is already disabled: the
+    /// offender and where, without the full explanation `dt doctor` gives.
+    pub fn brief(&self) -> Option<String> {
+        self.brief_at(HAZARD_THRESHOLD)
+    }
+
+    fn brief_at(&self, threshold: usize) -> Option<String> {
+        if self.entries < threshold {
+            return None;
+        }
+        let what = match self.offenders.first() {
+            Some((name, count)) if count * 10 >= self.entries => {
+                format!("{}: {} entries", name, count)
+            }
+            _ => format!("{} entries", self.entries),
+        };
+        Some(format!("{} under {}", what, self.root.display()))
+    }
 }
 
 fn is_pruned(name: &str) -> bool {
@@ -243,6 +262,18 @@ mod tests {
         let assessment = assess(&tree.root);
         // node_modules itself is seen (1 entry); its subtree is not.
         assert!(assessment.entries < 10, "counted {}", assessment.entries);
+    }
+
+    /// The one-line form names the offender and where — no lecture, and
+    /// nothing below the threshold.
+    #[test]
+    fn the_brief_form_is_one_short_line() {
+        let tree = TestTree::new("brief");
+        tree.files(".venv/lib", 40).files("src", 2);
+        let brief = assess(&tree.root).brief_at(10).expect("40 entries past threshold 10");
+        assert!(brief.contains(".venv"), "got: {}", brief);
+        assert!(!brief.contains(".gitignore"), "got: {}", brief);
+        assert!(assess(&tree.root).brief().is_none(), "40 entries is under the real threshold");
     }
 
     /// The warning names the tree to remove, not just a number — and says what

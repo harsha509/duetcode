@@ -134,6 +134,20 @@ fn is_oom_failure(error: &anyhow::Error) -> bool {
         || text.contains("SIGKILL")
 }
 
+/// Both attempts' tokens and cost under the retry's model, so a retried run
+/// is never underreported.
+fn merge_usage(first: UsageStats, second: UsageStats) -> UsageStats {
+    UsageStats {
+        input_tokens: first.input_tokens + second.input_tokens,
+        output_tokens: first.output_tokens + second.output_tokens,
+        cost_usd: match (first.cost_usd, second.cost_usd) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        },
+        model: second.model,
+    }
+}
+
 /// `base` with the crawler tools added to `tools.exclude`, every other
 /// setting left exactly as it was. Anything that is not the expected shape is
 /// replaced rather than tripped over — these files are user-edited.
@@ -344,23 +358,24 @@ impl GeminiAdapter {
         let dirs: Vec<PathBuf> = std::iter::once(self.working_dir.clone())
             .chain(self.readable_dirs.iter().cloned())
             .collect();
-        let mut newly_hazardous = false;
+        let mut hazards: Vec<String> = Vec::new();
         for dir in &dirs {
             if !self.crawl_checked.insert(dir.clone()) {
                 continue;
             }
-            if let Some(warning) = super::crawl::assess(dir).warning() {
-                self.sink.event(Event::Warn { text: warning });
+            if let Some(brief) = super::crawl::assess(dir).brief() {
                 self.crawl_hazards.insert(dir.clone());
-                newly_hazardous = true;
+                hazards.push(brief);
             }
         }
-        if newly_hazardous {
+        if !hazards.is_empty() {
+            // One line, not a lecture: the guard already handles the hazard,
+            // and `dt doctor` keeps the full explanation.
             self.sink.event(Event::Warn {
                 text: format!(
-                    "running with gemini's crawler tools ({}) disabled so the run survives — \
-                     file reads and ripgrep search still work",
-                    CRAWLER_TOOLS.join(", ")
+                    "running gemini without its crawler tools — too big to crawl safely ({}); \
+                     file reads and search still work",
+                    hazards.join("; ")
                 ),
             });
         }
@@ -964,6 +979,23 @@ impl ModelAdapter for GeminiAdapter {
             }
         }
 
+        // The API labels an empty answer transient and says to try again, so
+        // one retry happens here — with both attempts' usage kept, so the
+        // reported cost stays honest.
+        result = match result {
+            Ok((text, first_usage)) if text.trim().is_empty() && !self.not_retryable => {
+                self.sink.event(Event::Warn {
+                    text: "gemini returned an empty answer — retrying once".into(),
+                });
+                match &guard {
+                    Some(file) => self.run_cli(&with_crawl_guard_note(prompt), Some(&file.0)),
+                    None => self.run_cli(prompt, None),
+                }
+                .map(|(text, usage)| (text, merge_usage(first_usage, usage)))
+            }
+            other => other,
+        };
+
         match result {
             Ok(result) => Ok(result),
             // Never on a timeout or a user stop: both killed the run
@@ -1246,6 +1278,28 @@ mod tests {
     /// shapes read off documentation — the field names are what this parser
     /// depends on, so they are pinned to observed output.
     const REAL_RESULT: &str = r#"{"type":"result","timestamp":"2026-08-05T17:53:45.174Z","status":"success","stats":{"total_tokens":43498,"input_tokens":20846,"output_tokens":62,"cached":8089,"input":12757,"duration_ms":153348,"tool_calls":2,"models":{"gemini-3.1-pro-preview":{"total_tokens":43498,"input_tokens":20846,"output_tokens":62}}}}"#;
+
+    /// A retried run reports both attempts' spend, not just the second's.
+    #[test]
+    fn merged_usage_counts_both_attempts() {
+        let first = UsageStats {
+            input_tokens: 100,
+            output_tokens: 10,
+            cost_usd: Some(0.5),
+            model: "gemini-a".into(),
+        };
+        let second = UsageStats {
+            input_tokens: 30,
+            output_tokens: 5,
+            cost_usd: None,
+            model: "gemini-b".into(),
+        };
+        let merged = merge_usage(first, second);
+        assert_eq!(merged.input_tokens, 130);
+        assert_eq!(merged.output_tokens, 15);
+        assert_eq!(merged.cost_usd, Some(0.5));
+        assert_eq!(merged.model, "gemini-b");
+    }
 
     #[test]
     fn result_stats_come_from_the_named_token_fields() {

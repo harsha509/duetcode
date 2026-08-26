@@ -615,6 +615,17 @@ fn execute_loop(
         report_stray_writes(session, opts.repo_dir, sink);
 
         match writer_diff_outcome(opts, reviewer.name(), &session.log, round, &diff_before, sink)? {
+            // Nothing written and nothing said: reviewing an empty answer
+            // spends a reviewer call on confirming nothing is nothing.
+            DiffOutcome::NoChanges if writer_response.trim().is_empty() => {
+                sink.event(Event::Warn {
+                    text: format!(
+                        "{} returned an empty answer — nothing to review this round",
+                        writer.name()
+                    ),
+                });
+                stall.observe_no_changes();
+            }
             DiffOutcome::NoChanges if !answer_mode && round > 1 => {
                 sink.event(Event::Warn {
                     text: format!("{} made no changes in response to feedback", writer.name()),
@@ -919,7 +930,7 @@ fn writer_diff_outcome(
 
     let stat = git::git_diff_stat(opts.repo_dir).unwrap_or_default();
     if !stat.trim().is_empty() {
-        sink.event(Event::Changes { stat });
+        sink.event(Event::Changes { stat, diff: Some(capped_event_diff(&diff_after)) });
     }
 
     if wants_review(opts, reviewer_name, "review changes", sink) {
@@ -927,6 +938,21 @@ fn writer_diff_outcome(
     } else {
         Ok(DiffOutcome::NotReviewed)
     }
+}
+
+/// Diff carried on the changes event, bounded so one huge patch cannot bloat
+/// the protocol stream or the panel. The full patch stays in the session log.
+const EVENT_DIFF_CAP: usize = 200 * 1024;
+
+fn capped_event_diff(diff: &str) -> String {
+    if diff.len() <= EVENT_DIFF_CAP {
+        return diff.to_string();
+    }
+    let mut end = EVENT_DIFF_CAP;
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… truncated — the full patch is in the session log", &diff[..end])
 }
 
 /// Whether a reviewer runs now. Auto mode always reviews; a caller that offers

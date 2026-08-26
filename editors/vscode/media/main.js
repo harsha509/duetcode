@@ -21,6 +21,7 @@
   let labels = { writer: undefined, reviewer: undefined };
   let currentRound = null; // { writerCol, reviewerCol }
   let streams = {}; // model -> <pre> currently receiving chunks
+  let activities = {}; // model -> the one live activity line, updated in place
   let busy = false;
 
   // How each run outcome closes the timeline. 'unreviewed' is deliberately
@@ -61,6 +62,12 @@
   // actually have content (no empty reviewer box while the writer streams).
   function colForSide(side) {
     if (!currentRound) newRound('•', '');
+    // Recreated after a full-width row split the round, so later column
+    // content lands below that row instead of above it.
+    if (!currentRound.cols) {
+      currentRound.cols = el('div', 'cols');
+      currentRound.block.appendChild(currentRound.cols);
+    }
     const key = side + 'Col';
     if (!currentRound[key]) {
       const col = el('div', 'col ' + side);
@@ -83,18 +90,81 @@
     scrollDown();
   }
 
+  /** A row spanning the timeline. Mid-round it goes inside the round block,
+      in arrival order — later column content restarts below it. */
+  function fullWidthNode(node) {
+    if (currentRound) {
+      currentRound.block.appendChild(node);
+      currentRound.cols = null;
+      currentRound.writerCol = null;
+      currentRound.reviewerCol = null;
+    } else {
+      timeline.appendChild(node);
+    }
+    scrollDown();
+  }
+
   function fullWidth(cls, text) {
-    line(timeline, 'row ' + cls, text);
+    fullWidthNode(el('div', 'row ' + cls, text));
+  }
+
+  /** The diffstat row, with the round's actual patch behind a toggle. The
+      card is built once on first open and hidden on close, never rebuilt. */
+  function changesRow(stat, diff) {
+    const row = el('div', 'row changes', stat);
+    if (diff) {
+      const btn = el('button', 'link', 'view diff');
+      let card = null;
+      btn.onclick = () => {
+        if (!card) {
+          card = codeCard({ lang: 'diff', text: diff });
+          row.appendChild(card);
+          btn.textContent = 'hide diff';
+          scrollDown();
+        } else {
+          const hidden = card.style.display === 'none';
+          card.style.display = hidden ? '' : 'none';
+          btn.textContent = hidden ? 'hide diff' : 'view diff';
+        }
+      };
+      row.appendChild(document.createTextNode('\n'));
+      row.appendChild(btn);
+    }
+    return row;
+  }
+
+  /** The model's current step — thinking, a tool call — as one pulsing line
+      updated in place, instead of a stacked log of every action. */
+  function showActivity(model, text) {
+    const col = colFor(model);
+    let a = activities[model];
+    if (!a) {
+      a = el('div', 'activity', '');
+      activities[model] = a;
+    }
+    a.textContent = text;
+    col.appendChild(a); // creates or moves it to the end, following the flow
+    scrollDown();
+  }
+
+  /** Removes a model's activity line — its output speaks for itself now. */
+  function settleActivity(model) {
+    const a = activities[model];
+    if (a) a.remove();
+    delete activities[model];
+  }
+
+  function settleAllActivities() {
+    for (const model of Object.keys(activities)) settleActivity(model);
   }
 
   function newRound(label, budget) {
+    settleAllActivities();
     const block = el('section', 'round');
     const head = el('div', 'round-head', budget ? `round ${label}/${budget}` : String(label));
-    const cols = el('div', 'cols');
     block.appendChild(head);
-    block.appendChild(cols);
     timeline.appendChild(block);
-    currentRound = { cols, writerCol: null, reviewerCol: null };
+    currentRound = { block, cols: null, writerCol: null, reviewerCol: null };
     streams = {};
     scrollDown();
   }
@@ -169,7 +239,7 @@
     // what an unparseable verdict comes back as — has the tinted prose as its
     // only signal of what went wrong, and softening that would hide it.
     if (approved && !(blockers || []).length) {
-      capSeverity(currentRound ? currentRound.cols : target);
+      capSeverity(currentRound ? currentRound.block : target);
     }
     const chip = el('div', 'verdict ' + (approved ? 'ok' : 'bad'),
       verdictLabel(kind, approved));
@@ -385,17 +455,33 @@
     return card;
   }
 
-  /** Inline `code` inside a prose line, so a symbol is not read as a word. */
-  function fillInline(span, raw) {
+  /** Inline `code` within one segment, so a symbol is not read as a word. */
+  function appendCoded(parent, text) {
     let last = 0;
     const re = /`([^`\n]+)`/g;
     let m;
-    while ((m = re.exec(raw)) !== null) {
-      if (m.index > last) span.appendChild(document.createTextNode(raw.slice(last, m.index)));
-      span.appendChild(el('code', 'inline', m[1]));
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) parent.appendChild(document.createTextNode(text.slice(last, m.index)));
+      parent.appendChild(el('code', 'inline', m[1]));
       last = re.lastIndex;
     }
-    span.appendChild(document.createTextNode(raw.slice(last) + '\n'));
+    if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+  }
+
+  /** Inline `code` and **bold** inside a prose line; code works inside bold. */
+  function fillInline(span, raw) {
+    let last = 0;
+    const re = /\*\*([^*\n]+)\*\*/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      if (m.index > last) appendCoded(span, raw.slice(last, m.index));
+      const bold = el('strong', 'bold');
+      appendCoded(bold, m[1]);
+      span.appendChild(bold);
+      last = re.lastIndex;
+    }
+    appendCoded(span, raw.slice(last));
+    span.appendChild(document.createTextNode('\n'));
   }
 
   /**
@@ -441,8 +527,21 @@
         severity = (own === 'ok' ? '' : own) || inherited();
       }
 
-      const span = el('span', severity ? 'pl ' + severity : 'pl');
-      fillInline(span, raw);
+      // Severity and section state are read off the raw line above; only the
+      // display form drops the markdown scaffolding.
+      let display = raw;
+      if (level > 0) {
+        display = raw.replace(/^\s*#{1,6}\s*/, '');
+      } else if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(raw)) {
+        pre.appendChild(document.createTextNode('\n')); // a rule is just a pause
+        continue;
+      } else {
+        display = raw.replace(/^(\s*)[*-]\s+/, '$1• ');
+      }
+
+      const cls = 'pl' + (severity ? ' ' + severity : '') + (level > 0 ? ' head' : '');
+      const span = el('span', cls);
+      fillInline(span, display);
       pre.appendChild(span);
     }
     return pre;
@@ -597,8 +696,9 @@
         setLiveRoles(ev.writer, ev.reviewer);
         currentRound = null;
         const head = el('div', 'task-head');
+        // Just the task, as a separator between runs — mode and round budget
+        // are noise here; the round headers already carry the budget.
         head.appendChild(el('span', 'task-title', ev.task));
-        head.appendChild(el('span', 'task-mode', `${ev.mode} · max ${ev.max_rounds} rounds`));
         timeline.appendChild(head);
         setBusy(true);
         break;
@@ -614,30 +714,36 @@
         currentRound = null;
         // Point the composer at the project being reviewed, so a fix typed
         // straight after the review runs where the findings actually are.
+        // Announced only in a multi-project workspace; with one project the
+        // line restates the obvious.
         selectProject(ev.path);
-        fullWidth('project', '📁 ' + ev.name + ' — ' + ev.path);
+        if (projectSel.options.length > 1) {
+          fullWidth('project', '📁 ' + ev.name + ' — ' + ev.path);
+        }
         break;
       case 'working':
         line(colFor(ev.actor), 'working', '● ' + ev.actor + ' — ' + ev.action);
         break;
       case 'thinking':
         sealStream(ev.model);
-        line(colFor(ev.model), 'dim', '◌ thinking…');
+        showActivity(ev.model, '◌ thinking…');
         break;
       case 'tool_action':
         sealStream(ev.model);
-        line(colFor(ev.model), 'tool', '⚡ ' + ev.desc);
+        showActivity(ev.model, '⚡ ' + ev.desc);
         break;
       case 'stream_start': {
         // A previous stream left open — by an error, or a round that ended
         // without its end event — would otherwise be stranded as raw <pre>.
         sealStream(ev.model);
+        settleActivity(ev.model);
         const pre = el('pre', 'stream');
         colFor(ev.model).appendChild(pre);
         streams[ev.model] = pre;
         break;
       }
       case 'stream_chunk': {
+        settleActivity(ev.model);
         let pre = streams[ev.model];
         if (!pre) {
           pre = el('pre', 'stream');
@@ -652,6 +758,7 @@
         sealStream(ev.model);
         break;
       case 'response':
+        settleActivity(ev.model);
         renderProse(colFor(ev.model), ev.text);
         break;
       case 'check':
@@ -662,7 +769,7 @@
         renderVerdict(colFor(reviewerName), ev.kind, ev.approved, ev.blockers, ev.suggestions);
         break;
       case 'changes':
-        fullWidth('changes', ev.stat.trim());
+        fullWidthNode(changesRow(ev.stat.trim(), ev.diff));
         break;
       case 'usage':
         statusEl.textContent =
@@ -675,6 +782,9 @@
           (ev.cost_usd ? ` · $${ev.cost_usd.toFixed(4)}` : ''));
         break;
       case 'info':
+        // Terminal plumbing, not panel content: the sessions view covers the
+        // logs path, and the extension itself sent the workspace list.
+        if (/^(workspace|logs): /.test(ev.text)) break;
         fullWidth('info', 'ℹ ' + ev.text);
         break;
       case 'warn':
@@ -693,12 +803,14 @@
         showAsk(ev.id, ev.kind, ev.question);
         break;
       case 'task_done': {
+        settleAllActivities();
         const style = OUTCOME_STYLES[ev.outcome] ?? OUTCOME_STYLES.stopped;
         fullWidth(style.cls, `${style.label} — ${ev.message} (${ev.rounds} rounds)`);
         setBusy(false);
         break;
       }
       case 'error':
+        settleAllActivities();
         fullWidth('error', '✗ ' + ev.message);
         setBusy(false);
         break;
@@ -734,7 +846,7 @@
       if (r.reviewer) renderProse(colForSide('reviewer'), r.reviewer);
       if (Array.isArray(r.checks)) {
         for (const c of r.checks) {
-          line(currentRound.reviewerCol, c.passed ? 'check ok' : 'check bad',
+          line(colForSide('reviewer'), c.passed ? 'check ok' : 'check bad',
             (c.passed ? '✓ ' : '✗ ') + c.name);
         }
       }
