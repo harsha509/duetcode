@@ -8,6 +8,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.2.13 - 2026-08-27
+
+One press of Ctrl+C now stops the turn instead of killing the session, and
+the surfaces showing a run — terminal and VS Code panel alike — got quieter
+and truer to the order things actually happened.
+
+### Added
+
+- **Stop a turn without losing the session.** During a task or review, the
+  first Ctrl+C asks the run to stop: its children are killed, partial answers
+  are discarded rather than surfaced, and the REPL or serve session carries
+  on; a second press still quits dt. `dt serve` accepts `{"cmd":"stop"}`,
+  handled as it arrives instead of queueing behind the work it interrupts.
+- **The changes event carries the patch.** Alongside the diffstat, the
+  round's actual diff (capped at 200 KB) rides the `changes` event so a
+  frontend can show it inline; the terminal still prints the stat alone.
+- **One live status line in the terminal.** Thinking and tool actions redraw
+  a single in-place line on a TTY instead of stacking one line per action;
+  `--verbose` and piped output keep the full log.
+
+### Changed
+
+- **The crawl warning is one line.** When gemini's crawler tools are disabled
+  automatically, the preflight says so in a single warning naming the
+  offending tree; `dt doctor` keeps the full explanation.
+- **Serve answers echo their ask.** An `answer` carrying an id is matched to
+  the ask with that id, so a stray or stale reply can never approve a later
+  question; id-less answers still serve whichever ask is in flight.
+
+### Fixed
+
+- **An empty answer is never reviewed.** A writer round that produces no code
+  changes and no text ends with a warning instead of spending a reviewer call
+  confirming nothing is nothing.
+- **Gemini's empty response gets one retry.** The API labels these transient
+  and says to try again, so dt does — once, reporting both attempts' tokens
+  and cost.
+- **No retry on purpose-killed runs.** A timed-out or user-stopped CLI run no
+  longer falls back to the API or re-sends the prompt behind the caller's
+  back — both adapters, including the fresh-session retry path.
+- **Probes and git calls are bounded.** `which` probes, auth checks, and
+  every git invocation dt makes are killed if they hang, so a wedged
+  filesystem or stale `index.lock` cannot hang startup or a round forever.
+
 ## 0.2.12 - 2026-08-16
 
 Sessions can be deleted one at a time. Until now the only way to remove a

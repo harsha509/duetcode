@@ -5,6 +5,38 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.13 - 2026-08-27
+
+Requires `dt` 0.2.13. The timeline now reads in the order things happened,
+in the run's own colors.
+
+### Added
+
+- **Seat colors.** The writer's card is green and the reviewer's yellow — a
+  full tinted box each, instead of a colored left edge.
+- **A live activity bubble.** One pulsing line per seat shows the current
+  step — thinking, the file being read — updating in place instead of
+  stacking a line per tool call, and disappearing when real output streams.
+- **Inline diffs.** The diffstat row grows a *view diff* toggle that expands
+  the round's actual patch, syntax-highlighted and collapsed by default.
+- **Markdown rendering.** Headings, bold, bullet markers and horizontal
+  rules in model prose now render instead of showing their raw symbols;
+  inline code keeps working, including inside bold.
+
+### Changed
+
+- **Rows keep their order.** Diffstats, warnings and info lines land inside
+  the round at the moment they happened, instead of stacking below the
+  columns that kept growing above them.
+- **Less chrome.** The mode chip, the workspace echo and the logs path are
+  gone from the timeline, and the project banner shows only in multi-root
+  workspaces; round headers still carry the budget.
+
+### Fixed
+
+- **A stored session with recorded checks but no reviewer text no longer
+  crashes the timeline renderer.**
+
 ## 0.2.12 - 2026-08-16
 
 Requires `dt` 0.2.12. The sessions sidebar can now delete what it lists.

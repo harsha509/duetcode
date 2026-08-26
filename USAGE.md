@@ -26,6 +26,7 @@ Session commands:
 | `/plan <task>` | Plan first, then execute after approval |
 | `/review [task]` | Review uncommitted changes |
 | `/help`, `/quit` | Help / leave |
+| `Ctrl+C` | Stop the running task/review (the session stays); press again to quit |
 
 Anything else you type is sent to the duet as a task.
 
