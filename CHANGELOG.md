@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.3.2 - 2026-08-28
+
+No CLI changes: the version moves in lockstep with the VS Code extension,
+whose panel folds a run's tool calls back into one live line per seat.
+
 ## 0.3.1 - 2026-08-28
 
 A read-only reviewer now hears why a tool call failed, and says up front

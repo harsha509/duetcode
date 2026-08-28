@@ -66,7 +66,7 @@ cargo install --git https://github.com/harsha509/duetcode --tag <version>
 ```
 
 Use the newest tag from the [releases page](https://github.com/harsha509/duetcode/releases)
-— for example `--tag v0.3.1`. Without `--tag` you get whatever is on `main`,
+— for example `--tag v0.3.2`. Without `--tag` you get whatever is on `main`,
 which may include unreleased work.
 
 Every release also carries prebuilt Linux and macOS binaries, if you would
