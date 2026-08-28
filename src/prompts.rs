@@ -42,6 +42,9 @@ Then, while reviewing:
   `-` line in this diff actually deletes it. If you cannot see its definition, say the diff
   is insufficient to judge and ask for the file — do not guess.
 - Cite the file path with any line number you give, and only for lines present in the diff.
+- You are read-only. You cannot create, edit, or run anything — write and shell tools are
+  blocked, and calling them only wastes a turn. Never attempt `git add`, `git commit`, or
+  `git push`.
 - Search narrow, not wide. When you glob or grep, point it at a directory the diff touches
   (`src/`, `tests/`) — never a workspace-wide pattern like `**/*`. Dependency and build trees
   (a venv, node_modules, target, vendor) are never part of a review, and a workspace-wide
@@ -69,6 +72,9 @@ Then, while reviewing:
 - Never quote a line number from a file you opened as though it were a line of the change, and
   never report a finding as confirmed because the checkout agrees with it — the checkout can
   agree with a change that is wrong, and contradict one that is right.
+- You are read-only. You cannot create, edit, or run anything — write and shell tools are
+  blocked, and calling them only wastes a turn. Never attempt `git add`, `git commit`, or
+  `git push`.
 - Search narrow, not wide. When you glob or grep, point it at a directory the diff touches
   (`src/`, `tests/`) — never a workspace-wide pattern like `**/*`. Dependency and build trees
   (a venv, node_modules, target, vendor) are never part of a review, and a workspace-wide
@@ -442,11 +448,12 @@ whether the loop spends another round, so it is not a question of tone:
 
 Finish with these four sections, in this order:
 
-FILES READ: comma-separated paths of every file you opened, or `none`
-  This is checked against the tool calls you actually made. Listing a file you did not open is
-  the one error here that is caught every time, so list only what you opened, and write `none`
-  without embarrassment — a review of the diff alone is a legitimate review, and saying so
-  costs you nothing. Naming a file you did not read costs the whole review its credibility.
+FILES READ (beyond the diff): comma-separated paths of every file you opened, or `none`
+  The diff above was handed to you and never counts as a read — list only files you opened
+  with your tools on top of it. This is checked against the tool calls you actually made.
+  Listing a file you did not open is the one error here that is caught every time, so write
+  `none` without embarrassment — a review of the diff alone is a legitimate review, and
+  saying so costs you nothing. Naming a file you did not read costs the review its credibility.
 
 BLOCKERS:
 - one line per defect that has to be fixed before this can merge
@@ -537,7 +544,7 @@ Rules:
 
 Finish with these lines, in this order:
 
-FILES READ: <every file you actually opened, comma-separated — or "none">
+FILES READ (beyond the diff): <every file you actually opened, comma-separated — or "none">
 UNVERIFIED: <the load-bearing claims you had to take on trust, comma-separated — or "none, the answer quotes its evidence">
 THEIR CONCLUSION: <the answer's own bottom line, in one line, in its words — what it decides or recommends>
 
@@ -679,7 +686,7 @@ mod tests {
         let out = build_answer_review_prompt(
             DEFAULT_ANSWER_REVIEW_TEMPLATE, "t", "a", "d", ANSWER_REVIEW_ACCESS_TOOLS, "r",
         );
-        assert!(out.contains("FILES READ:"));
+        assert!(out.contains("FILES READ (beyond the diff):"));
     }
 
     #[test]

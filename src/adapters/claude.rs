@@ -1000,7 +1000,12 @@ impl ClaudeAdapter {
                 }
                 ("assistant", "tool_result") | ("tool_result", _) => {
                     let is_error = event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                    if is_error {
+                    if is_error && self.read_only {
+                        eprintln!(
+                            "  {} tool failed — the reviewer runs read-only; writes and shell are blocked",
+                            "✗".red()
+                        );
+                    } else if is_error {
                         eprintln!("  {} tool failed", "✗".red());
                     }
                 }

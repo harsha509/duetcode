@@ -720,7 +720,14 @@ impl GeminiAdapter {
                 }
                 "tool_result" => {
                     if event.get("status").and_then(|v| v.as_str()) == Some("error") {
-                        eprintln!("  {} tool failed", "✗".red());
+                        if self.read_only {
+                            eprintln!(
+                                "  {} tool failed — the reviewer runs read-only; writes and shell are blocked",
+                                "✗".red()
+                            );
+                        } else {
+                            eprintln!("  {} tool failed", "✗".red());
+                        }
                     }
                 }
                 "error" => {

@@ -49,7 +49,8 @@ pub fn parse_verdict(raw: &str) -> ReviewVerdict {
     }
 }
 
-/// The files a review says it opened, from its `FILES READ:` line.
+/// The files a review says it opened, from its `FILES READ (beyond the diff):`
+/// line — or the bare `FILES READ:` a custom template may still ask for.
 ///
 /// One line, comma-separated, which is the shape the review prompts ask for.
 /// `none` and its variants come back as no claim at all rather than as a file
@@ -57,7 +58,11 @@ pub fn parse_verdict(raw: &str) -> ReviewVerdict {
 pub fn claimed_files_read(review: &str) -> Vec<String> {
     review
         .lines()
-        .filter_map(|line| strip_label(line.trim(), "FILES READ:"))
+        .filter_map(|line| {
+            let line = line.trim();
+            strip_label(line, "FILES READ (beyond the diff):")
+                .or_else(|| strip_label(line, "FILES READ:"))
+        })
         .flat_map(|list| list.split(','))
         .map(|path| path.trim().trim_matches(['`', '"', '\'', '.']).trim().to_string())
         .filter(|path| !path.is_empty() && !is_nothing_to_report(path))
@@ -356,6 +361,18 @@ mod tests {
         assert!(claimed_files_read("FILES READ: none\n\nVERDICT: APPROVED").is_empty());
         assert!(unsupported_read_claims("FILES READ: none", &[]).is_empty());
         assert!(unsupported_read_claims("VERDICT: APPROVED", &[]).is_empty());
+    }
+
+    /// The default templates now ask for the labelled form; the bare label a
+    /// custom template may still use has to keep parsing alongside it.
+    #[test]
+    fn both_files_read_labels_are_parsed() {
+        assert_eq!(
+            claimed_files_read("FILES READ (beyond the diff): a.rs, b.rs"),
+            vec!["a.rs".to_string(), "b.rs".to_string()]
+        );
+        assert_eq!(claimed_files_read("FILES READ: a.rs"), vec!["a.rs".to_string()]);
+        assert!(claimed_files_read("**FILES READ (beyond the diff):** none").is_empty());
     }
 
     /// A FILES READ line sits next to the sections the loop parses, and its

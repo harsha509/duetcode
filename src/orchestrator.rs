@@ -1473,8 +1473,9 @@ fn read_requirement(reviewer: &dyn ModelAdapter) -> &'static str {
     }
     "\n\n[the diff above is incomplete, so a verdict cannot rest on it alone: open the files \
      your judgement leans on with your read-only tools, under the access rules in this prompt, \
-     and list what you still could not check under UNVERIFIED. Ending with both `FILES READ: \
-     none` and `UNVERIFIED: none` is not an acceptable review of a truncated diff.]"
+     and list what you still could not check under UNVERIFIED. Ending with both `FILES READ \
+     (beyond the diff): none` and `UNVERIFIED: none` is not an acceptable review of a \
+     truncated diff.]"
 }
 
 /// The code the answer is judged against, as it appears in the prompt. Says
