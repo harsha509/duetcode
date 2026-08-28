@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.3.1 - 2026-08-28
+
+A read-only reviewer now hears why a tool call failed, and says up front
+which files it opened beyond the diff it was handed.
+
+### Changed
+
+- **Read-only failures name the policy.** When a reviewer's tool call fails
+  on a read-only seat, the failure line says writes and shell are blocked
+  instead of a bare "tool failed", on both the Claude and Gemini transports;
+  the review prompts also state the restriction outright, so a reviewer does
+  not waste turns discovering it.
+- **`FILES READ` carries its scope.** The review templates now ask for
+  `FILES READ (beyond the diff):` — the diff itself never counts as a read —
+  and the parser accepts both that form and the bare `FILES READ:` a custom
+  template may still use.
+
 ## 0.3.0 - 2026-08-28
 
 Reviewers on the API transports can now pull the change themselves: dt

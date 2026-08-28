@@ -5,6 +5,30 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.3.1 - 2026-08-28
+
+Requires `dt` 0.3.1. The timeline sheds its boxes — bare prose on the page
+background, a dot and a faint rail per seat, one quiet line per tool call —
+all still drawn in the editor's theme.
+
+### Changed
+
+- **Seat identity is a dot and a rail.** The tinted writer/reviewer boxes
+  are gone; a colored dot beside the seat label and a faint 2px rail down
+  the column say who is talking.
+- **Tool calls persist as rows.** Each tool call leaves a chrome-free
+  one-liner — verb plus detail — instead of vanishing with the activity
+  line; thinking keeps a live text shimmer, static under reduced motion.
+- **Verdicts are text.** The filled verdict badge becomes a colored,
+  glyph-prefixed line; checks, blockers, and status rows draw their glyphs
+  from the stylesheet, with color reserved for the glyph.
+- **Code and diffs quiet down.** Fenced blocks sit in hairline cards capped
+  at 240px with hidden scrollbars; added and deleted diff lines carry a
+  full-width tint; the round's "view diff" toggle reveals on hover.
+- **The ask is a bubble.** The task line renders as the timeline's one
+  filled, right-aligned bubble, and the composer matches with a layer-one
+  input and softer corners.
+
 ## 0.3.0 - 2026-08-28
 
 Requires `dt` 0.3.0. No extension code changes: the version moves in lockstep
