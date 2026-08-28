@@ -204,17 +204,12 @@ code.inline {
 }
 
 /* Chrome-free 32px rows: who (.t-title) and what (.t-desc). */
-.working,
-.tool-row {
+.working {
   display: flex;
   align-items: center;
   gap: 8px;
   min-height: 32px;
 }
-
-/* Tool rows read quiet, and are non-expandable: only `desc` crosses the
-   wire — tool output is never sent to the webview. */
-.tool-row { color: var(--text-muted); }
 
 .t-title { font-size: 14px; font-weight: 500; }
 

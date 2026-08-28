@@ -131,19 +131,8 @@
     return row;
   }
 
-  /** A persistent one-line tool row: leading verb as title, the rest as
-      detail. Non-expandable — only `desc` crosses the wire; tool output is
-      never sent to the webview. */
-  function toolRow(desc) {
-    const row = el('div', 'tool-row');
-    const gap = desc.indexOf(' ');
-    row.appendChild(el('span', 't-title', gap < 0 ? desc : desc.slice(0, gap)));
-    if (gap >= 0) row.appendChild(el('span', 't-desc', desc.slice(gap + 1)));
-    return row;
-  }
-
-  /** The model's current step — thinking — as one shimmering line updated
-      in place, instead of a stacked log of every action. */
+  /** The model's current step — thinking, a tool call — as one shimmering
+      line updated in place, instead of a stacked log of every action. */
   function showActivity(model, text) {
     const col = colFor(model);
     let a = activities[model];
@@ -744,9 +733,7 @@
         break;
       case 'tool_action':
         sealStream(ev.model);
-        settleActivity(ev.model);
-        colFor(ev.model).appendChild(toolRow(ev.desc));
-        scrollDown();
+        showActivity(ev.model, ev.desc);
         break;
       case 'stream_start': {
         // A previous stream left open — by an error, or a round that ended
