@@ -5,6 +5,12 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.3.0 - 2026-08-28
+
+Requires `dt` 0.3.0. No extension code changes: the version moves in lockstep
+with the CLI, whose reviewers on the API transports now run read-only git
+tools — those tool calls appear in the panel's activity line like any others.
+
 ## 0.2.13 - 2026-08-27
 
 Requires `dt` 0.2.13. The timeline now reads in the order things happened,
