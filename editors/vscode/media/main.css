@@ -1,5 +1,21 @@
 :root {
   color-scheme: light dark;
+  --bg: var(--vscode-editor-background);
+  --bg-layer-1: color-mix(in srgb, var(--vscode-foreground) 5%, var(--vscode-editor-background));
+  --text: var(--vscode-foreground);
+  --text-muted: color-mix(in srgb, var(--vscode-foreground) 62%, var(--vscode-editor-background));
+  --text-faint: color-mix(in srgb, var(--vscode-foreground) 40%, var(--vscode-editor-background));
+  --border-hairline: color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+  --border-hairline-soft: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+  --hue-ok: var(--vscode-charts-green);
+  --hue-warn: var(--vscode-charts-yellow);
+  --hue-bad: var(--vscode-charts-red);
+  --seat-writer: var(--vscode-charts-green);
+  --seat-reviewer: var(--vscode-charts-yellow);
+  --diff-add-bg: color-mix(in srgb, var(--hue-ok) 12%, var(--bg));
+  --diff-del-bg: color-mix(in srgb, var(--hue-bad) 12%, var(--bg));
+  --radius-sm: 6px; --radius-md: 10px;
+  --reveal: opacity .15s ease;
 }
 
 body {
@@ -8,8 +24,8 @@ body {
   height: 100vh;
   margin: 0;
   font-family: var(--vscode-font-family);
-  color: var(--vscode-foreground);
-  background: var(--vscode-editor-background);
+  color: var(--text);
+  background: var(--bg);
   font-size: 13px;
 }
 
@@ -18,12 +34,12 @@ body {
   gap: 12px;
   align-items: baseline;
   padding: 8px 12px;
-  border-bottom: 1px solid var(--vscode-panel-border);
+  border-bottom: 0.5px solid var(--border-hairline);
 }
 
 #title { font-weight: 600; }
-#models { opacity: 0.7; }
-#status { margin-left: auto; opacity: 0.7; font-size: 12px; }
+#models { color: var(--text-faint); }
+#status { margin-left: auto; color: var(--text-faint); font-size: 12px; }
 
 #timeline {
   flex: 1;
@@ -33,21 +49,29 @@ body {
 
 .task-head {
   display: flex;
-  justify-content: space-between;
+  align-items: baseline;
   gap: 8px;
   margin: 14px 0 6px;
-  padding: 6px 8px;
-  background: var(--vscode-editorWidget-background);
-  border-left: 3px solid var(--vscode-focusBorder);
 }
 
-.task-title { font-weight: 600; }
-.task-mode { opacity: 0.6; font-size: 12px; }
+/* The user's ask, as the one filled bubble in the timeline. */
+.task-bubble {
+  background: var(--bg-layer-1);
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 6px 10px;
+  max-width: min(82%, 64ch);
+  margin-left: auto;
+}
+
+/* Rendered after the bubble; order puts it left so the two sit at opposite
+   ends, the bubble's auto margin absorbing the space between. */
+.task-mode { color: var(--text-muted); font-size: 12px; order: -1; }
 
 .round { margin: 10px 0; }
 
 .round-head {
-  opacity: 0.6;
+  color: var(--text-muted);
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 1px;
@@ -63,9 +87,9 @@ body {
 }
 
 .col {
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: 6px;
-  padding: 6px 10px;
+  border: none;
+  background: none;
+  padding: 6px 10px 6px 12px;
   overflow-x: hidden;
   /* Lets a wide code block scroll inside its own card instead of stretching
      the column to the width of its longest line. */
@@ -79,64 +103,75 @@ body {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 1px;
-  opacity: 0.6;
   margin-bottom: 6px;
 }
 
-/* Seat colours: the writer's box reads green, the reviewer's yellow. The
-   tint stays faint so theme text keeps its contrast. */
-.col.writer {
-  border-color: var(--vscode-charts-green);
-  background: color-mix(in srgb, var(--vscode-charts-green) 6%, transparent);
+/* The seat dot: colour identity without a tinted box. */
+.col-head::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  margin-right: 6px;
 }
-.col.reviewer {
-  border-color: var(--vscode-charts-yellow);
-  background: color-mix(in srgb, var(--vscode-charts-yellow) 6%, transparent);
-}
-.col.writer .col-head { color: var(--vscode-charts-green); }
-.col.reviewer .col-head { color: var(--vscode-charts-yellow); }
+
+/* Seat identity: a faint rail down the column plus dot + coloured label. */
+.col.writer { border-left: 2px solid color-mix(in srgb, var(--seat-writer) 25%, transparent); }
+.col.reviewer { border-left: 2px solid color-mix(in srgb, var(--seat-reviewer) 25%, transparent); }
+.col.writer .col-head { color: var(--seat-writer); }
+.col.reviewer .col-head { color: var(--seat-reviewer); }
 
 /* Prose wraps; code does not. `pre.stream` is the raw sink chunks land in
-   while a model is still talking, `pre.prose` the laid-out result. */
+   while a model is still talking, `pre.prose` the laid-out result. Bare on
+   the page background — no card. */
 pre.stream,
 pre.prose {
   white-space: pre-wrap;
   word-break: break-word;
   font-family: var(--vscode-editor-font-family);
-  font-size: 12px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
   margin: 4px 0;
 }
 
-/* A fenced block, set apart from the prose around it: its own surface, its own
-   border, and a horizontal scroll of its own so long lines never wrap into
-   something that reads like a sentence. */
+/* A fenced block, set apart from the prose around it: a hairline card with
+   a horizontal scroll of its own so long lines never wrap into something
+   that reads like a sentence. */
 .code {
   margin: 8px 0;
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: 6px;
-  background: var(--vscode-textCodeBlock-background, var(--vscode-editorWidget-background));
+  border: 0.5px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  background: none;
   overflow: hidden;
 }
+
+.code.hidden { display: none; }
 
 .code-lang {
   padding: 3px 10px;
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  opacity: 0.55;
-  border-bottom: 1px solid var(--vscode-panel-border);
+  color: var(--text-faint);
 }
 
 pre.code-body {
   margin: 0;
   padding: 10px 12px;
-  overflow-x: auto;
+  max-height: 240px;
+  overflow: auto;
+  scrollbar-width: none;
   white-space: pre;
   tab-size: 4;
   font-family: var(--vscode-editor-font-family);
   font-size: 12px;
   line-height: 1.5;
 }
+
+pre.code-body::-webkit-scrollbar { display: none; }
 
 /* Syntax tint. Chart colours rather than fixed hues, so a block stays legible
    in whatever theme the editor is wearing. */
@@ -147,10 +182,15 @@ pre.code-body {
 .tok.fn { color: var(--vscode-charts-yellow); }
 .tok.typ { color: var(--vscode-charts-blue); }
 
-.dl.add { color: var(--vscode-charts-green); }
-.dl.del { color: var(--vscode-charts-red); }
+/* Added/deleted lines carry a full-width tint. Block, not inline-block:
+   under `white-space: pre` nothing outside an atomic inline can break the
+   line, so consecutive tinted lines would render side by side. */
+.dl.add,
+.dl.del { display: block; width: max-content; min-width: 100%; }
+.dl.add { color: var(--hue-ok); background: var(--diff-add-bg); }
+.dl.del { color: var(--hue-bad); background: var(--diff-del-bg); }
 .dl.hunk { color: var(--vscode-charts-blue); }
-.dl.meta { opacity: 0.55; }
+.dl.meta { color: var(--text-faint); }
 
 /* A symbol named mid-sentence, marked so it is not read as a word. Editor
    variables give it the same colour VS Code gives inline code elsewhere. */
@@ -163,73 +203,116 @@ code.inline {
   background: var(--vscode-textPreformat-background, var(--vscode-textCodeBlock-background));
 }
 
-.working { opacity: 0.85; margin: 3px 0; }
-.dim { opacity: 0.5; margin: 2px 0; }
-.tool { opacity: 0.6; font-size: 12px; margin: 2px 0; font-family: var(--vscode-editor-font-family); }
+/* Chrome-free 32px rows: who (.t-title) and what (.t-desc). */
+.working,
+.tool-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
 
-/* The one live activity line per seat, breathing while the model works. */
+/* Tool rows read quiet, and are non-expandable: only `desc` crosses the
+   wire — tool output is never sent to the webview. */
+.tool-row { color: var(--text-muted); }
+
+.t-title { font-size: 14px; font-weight: 500; }
+
+.t-desc {
+  color: var(--text-muted);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The one live activity line per seat: a text shimmer while the model works.
+   fit-content keeps the gradient sized to the text, not the row. */
 .activity {
+  width: fit-content;
   font-size: 12px;
   margin: 2px 0;
   font-family: var(--vscode-editor-font-family);
-  animation: activity-pulse 1.2s ease-in-out infinite;
+  color: transparent;
+  background: linear-gradient(90deg, var(--text-muted), var(--text), var(--text-muted));
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: activity-shimmer 1.6s linear infinite;
 }
-@keyframes activity-pulse {
-  0%, 100% { opacity: 0.35; }
-  50% { opacity: 0.9; }
+@keyframes activity-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: 0% 0; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .activity { animation: none; opacity: 0.7; }
+  .activity {
+    animation: none;
+    background: none;
+    color: var(--text-muted);
+  }
 }
 
-.check { font-size: 12px; margin: 2px 0; }
-.check.ok { color: var(--vscode-charts-green); }
-.check.bad { color: var(--vscode-charts-red); }
+.check { font-size: 12px; margin: 2px 0; color: var(--text-muted); }
+.check.ok::before { content: '✓ '; color: var(--hue-ok); }
+.check.bad::before { content: '✗ '; color: var(--hue-bad); }
 
+/* Text-only verdict: glyph, weight, and hue — no filled badge. */
 .verdict {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-weight: 700;
+  font-weight: 600;
   font-size: 12px;
   margin: 6px 0;
 }
 
-.verdict.ok { background: var(--vscode-charts-green); color: #000; }
-.verdict.bad { background: var(--vscode-charts-red); color: #fff; }
+.verdict.ok { color: var(--hue-ok); }
+.verdict.bad { color: var(--hue-bad); }
+.verdict.ok::before { content: '✓ '; }
+.verdict.bad::before { content: '✗ '; }
 
-.blocker { color: var(--vscode-charts-red); margin: 2px 0; }
-.suggestion { color: var(--vscode-charts-yellow); margin: 2px 0; }
+/* Hanging indent, so a blocker that wraps stays visually one item. */
+.blocker {
+  color: var(--text);
+  margin: 2px 0;
+  padding-left: 12px;
+  text-indent: -12px;
+}
+.blocker::before { content: '✗ '; color: var(--hue-bad); }
+.suggestion { color: var(--text-muted); margin: 2px 0; }
+.suggestion::before { content: '~ '; color: var(--hue-warn); }
 
 /* Severity tint, applied only to the lines that label a finding. Body prose
    keeps the default colour so the tint still means something. */
 pre.prose .pl.issue { color: var(--vscode-charts-red); font-weight: 600; }
 pre.prose .pl.warn { color: var(--vscode-charts-yellow); }
 pre.prose .pl.ok { color: var(--vscode-charts-green); }
-pre.prose .pl.head { font-weight: 600; font-size: 13px; }
+pre.prose .pl.head { font-weight: 600; font-size: 14px; }
 pre.prose strong.bold { font-weight: 600; }
 
 .row { margin: 4px 0; }
-.row.section { opacity: 0.6; text-align: center; margin: 10px 0; }
-.row.project {
-  margin: 12px 0 6px;
-  padding: 4px 8px;
-  border-left: 3px solid var(--vscode-charts-blue);
-  background: var(--vscode-textBlockQuote-background);
-  font-weight: 600;
-}
-.row.info { opacity: 0.75; }
-.row.warn { color: var(--vscode-charts-yellow); }
-.row.error { color: var(--vscode-charts-red); }
-.row.success { color: var(--vscode-charts-green); font-weight: 600; }
+.row.section { color: var(--text-muted); text-align: center; margin: 10px 0; }
+.row.project { margin: 12px 0 6px; font-weight: 600; }
+.row.project::before { content: '📁 '; }
+.row.info { color: var(--text-muted); }
+.row.info::before { content: 'ℹ '; }
+.row.warn { color: var(--text); }
+.row.warn::before { content: '⚠ '; color: var(--hue-warn); }
+.row.error { color: var(--text); }
+.row.error::before { content: '✗ '; color: var(--hue-bad); }
+.row.success { color: var(--text); font-weight: 600; }
+.row.success::before { content: '✓ '; color: var(--hue-ok); }
 .row.neutral { color: var(--vscode-descriptionForeground); font-weight: 600; }
-.row.cost { opacity: 0.6; font-size: 12px; }
+.row.cost { color: var(--text-muted); font-size: 12px; }
 .row.changes {
   font-family: var(--vscode-editor-font-family);
   font-size: 12px;
   white-space: pre-wrap;
-  opacity: 0.8;
+  color: var(--text-muted);
 }
+
+/* The diff toggle earns its place on approach, not by default. */
+.row.changes button.link { opacity: 0; transition: var(--reveal); }
+.row.changes:hover button.link,
+.row.changes:focus-within button.link { opacity: 1; }
 
 #askbar {
   display: flex;
@@ -252,7 +335,7 @@ pre.prose strong.bold { font-weight: 600; }
 }
 
 #composer {
-  border-top: 1px solid var(--vscode-panel-border);
+  border-top: 0.5px solid var(--border-hairline);
   padding: 8px 12px;
 }
 
@@ -260,27 +343,26 @@ pre.prose strong.bold { font-weight: 600; }
 
 .chip {
   font-size: 11px;
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
-  border-radius: 8px;
+  background: var(--bg-layer-1);
+  border-radius: var(--radius-md);
   padding: 1px 8px;
   margin-bottom: 4px;
 }
 
 /* PR verdict card. Pinned above the analysis it summarises, and deliberately
-   the loudest thing in the column: the whole point is answering "does this
-   merge?" without reading the several screens underneath it. */
+   the one intentional card in the column: the whole point is answering "does
+   this merge?" without reading the several screens underneath it. */
 .pr-verdict {
   margin: 10px 0;
-  border: 1px solid var(--vscode-panel-border);
-  border-left: 4px solid var(--vscode-charts-red);
-  border-radius: 4px;
-  background: var(--vscode-editorWidget-background);
+  border: 0.5px solid var(--border-hairline);
+  border-left: 3px solid var(--hue-bad);
+  border-radius: var(--radius-md);
+  background: none;
   padding: 10px 12px;
 }
 
 .pr-verdict.go {
-  border-left-color: var(--vscode-charts-green);
+  border-left-color: var(--hue-ok);
 }
 
 .pr-verdict-head {
@@ -294,15 +376,15 @@ pre.prose strong.bold { font-weight: 600; }
   font-weight: 700;
   font-size: 15px;
   letter-spacing: 0.04em;
-  color: var(--vscode-charts-red);
+  color: var(--hue-bad);
 }
 
 .pr-verdict.go .pr-verdict-badge {
-  color: var(--vscode-charts-green);
+  color: var(--hue-ok);
 }
 
 .pr-verdict-counts {
-  opacity: 0.75;
+  color: var(--text-muted);
   font-size: 12px;
 }
 
@@ -311,7 +393,7 @@ pre.prose strong.bold { font-weight: 600; }
   font-size: 11px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  opacity: 0.6;
+  color: var(--text-muted);
 }
 
 /* Hanging indent, so a finding that wraps stays visually one item. */
@@ -329,22 +411,22 @@ pre.prose strong.bold { font-weight: 600; }
 
 .pr-verdict-item.bad::before {
   content: '✕';
-  color: var(--vscode-charts-red);
+  color: var(--hue-bad);
 }
 
 .pr-verdict-item.warn::before {
   content: '~';
-  color: var(--vscode-charts-yellow);
+  color: var(--hue-warn);
 }
 
 #input {
   width: 100%;
   box-sizing: border-box;
   resize: vertical;
-  background: var(--vscode-input-background);
-  color: var(--vscode-input-foreground);
+  background: var(--bg-layer-1);
+  color: var(--text);
   border: 1px solid var(--vscode-input-border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 6px 8px;
   font-family: var(--vscode-font-family);
 }
@@ -371,7 +453,7 @@ pre.prose strong.bold { font-weight: 600; }
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  opacity: 0.8;
+  color: var(--text-muted);
 }
 
 /* Default checkbox metrics are set for 13px+ text and sit a pixel or two proud
@@ -396,7 +478,7 @@ pre.prose strong.bold { font-weight: 600; }
   background: var(--vscode-button-secondaryBackground);
   color: var(--vscode-button-secondaryForeground);
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: 4px 10px;
   cursor: pointer;
 }
@@ -436,7 +518,7 @@ pre.prose strong.bold { font-weight: 600; }
   background: var(--vscode-button-secondaryBackground);
   color: var(--vscode-button-secondaryForeground);
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: 4px 12px;
   cursor: pointer;
 }

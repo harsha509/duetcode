@@ -119,13 +119,11 @@
         if (!card) {
           card = codeCard({ lang: 'diff', text: diff });
           row.appendChild(card);
-          btn.textContent = 'hide diff';
           scrollDown();
         } else {
-          const hidden = card.style.display === 'none';
-          card.style.display = hidden ? '' : 'none';
-          btn.textContent = hidden ? 'hide diff' : 'view diff';
+          card.classList.toggle('hidden');
         }
+        btn.textContent = card.classList.contains('hidden') ? 'view diff' : 'hide diff';
       };
       row.appendChild(document.createTextNode('\n'));
       row.appendChild(btn);
@@ -133,8 +131,19 @@
     return row;
   }
 
-  /** The model's current step — thinking, a tool call — as one pulsing line
-      updated in place, instead of a stacked log of every action. */
+  /** A persistent one-line tool row: leading verb as title, the rest as
+      detail. Non-expandable — only `desc` crosses the wire; tool output is
+      never sent to the webview. */
+  function toolRow(desc) {
+    const row = el('div', 'tool-row');
+    const gap = desc.indexOf(' ');
+    row.appendChild(el('span', 't-title', gap < 0 ? desc : desc.slice(0, gap)));
+    if (gap >= 0) row.appendChild(el('span', 't-desc', desc.slice(gap + 1)));
+    return row;
+  }
+
+  /** The model's current step — thinking — as one shimmering line updated
+      in place, instead of a stacked log of every action. */
   function showActivity(model, text) {
     const col = colFor(model);
     let a = activities[model];
@@ -244,8 +253,8 @@
     const chip = el('div', 'verdict ' + (approved ? 'ok' : 'bad'),
       verdictLabel(kind, approved));
     target.appendChild(chip);
-    for (const b of blockers || []) line(target, 'blocker', '✗ ' + b);
-    for (const s of suggestions || []) line(target, 'suggestion', '~ ' + s);
+    for (const b of blockers || []) line(target, 'blocker', b);
+    for (const s of suggestions || []) line(target, 'suggestion', s);
     scrollDown();
   }
 
@@ -698,7 +707,7 @@
         const head = el('div', 'task-head');
         // Just the task, as a separator between runs — mode and round budget
         // are noise here; the round headers already carry the budget.
-        head.appendChild(el('span', 'task-title', ev.task));
+        head.appendChild(el('span', 'task-bubble', ev.task));
         timeline.appendChild(head);
         setBusy(true);
         break;
@@ -718,19 +727,26 @@
         // line restates the obvious.
         selectProject(ev.path);
         if (projectSel.options.length > 1) {
-          fullWidth('project', '📁 ' + ev.name + ' — ' + ev.path);
+          fullWidth('project', ev.name + ' — ' + ev.path);
         }
         break;
-      case 'working':
-        line(colFor(ev.actor), 'working', '● ' + ev.actor + ' — ' + ev.action);
+      case 'working': {
+        const row = el('div', 'working');
+        row.appendChild(el('span', 't-title', ev.actor));
+        row.appendChild(el('span', 't-desc', ev.action));
+        colFor(ev.actor).appendChild(row);
+        scrollDown();
         break;
+      }
       case 'thinking':
         sealStream(ev.model);
-        showActivity(ev.model, '◌ thinking…');
+        showActivity(ev.model, 'thinking…');
         break;
       case 'tool_action':
         sealStream(ev.model);
-        showActivity(ev.model, '⚡ ' + ev.desc);
+        settleActivity(ev.model);
+        colFor(ev.model).appendChild(toolRow(ev.desc));
+        scrollDown();
         break;
       case 'stream_start': {
         // A previous stream left open — by an error, or a round that ended
@@ -762,8 +778,7 @@
         renderProse(colFor(ev.model), ev.text);
         break;
       case 'check':
-        line(colFor(reviewerName), ev.passed ? 'check ok' : 'check bad',
-          (ev.passed ? '✓ ' : '✗ ') + ev.name);
+        line(colFor(reviewerName), ev.passed ? 'check ok' : 'check bad', ev.name);
         break;
       case 'verdict':
         renderVerdict(colFor(reviewerName), ev.kind, ev.approved, ev.blockers, ev.suggestions);
@@ -785,13 +800,13 @@
         // Terminal plumbing, not panel content: the sessions view covers the
         // logs path, and the extension itself sent the workspace list.
         if (/^(workspace|logs): /.test(ev.text)) break;
-        fullWidth('info', 'ℹ ' + ev.text);
+        fullWidth('info', ev.text);
         break;
       case 'warn':
-        fullWidth('warn', '⚠ ' + ev.text);
+        fullWidth('warn', ev.text);
         break;
       case 'blocker':
-        fullWidth('warn', '✗ ' + ev.text);
+        fullWidth('error', ev.text);
         break;
       case 'success':
         fullWidth('success', ev.text);
@@ -811,7 +826,7 @@
       }
       case 'error':
         settleAllActivities();
-        fullWidth('error', '✗ ' + ev.message);
+        fullWidth('error', ev.message);
         setBusy(false);
         break;
     }
@@ -830,7 +845,7 @@
       ? `${labels.writer} wrote · ${labels.reviewer} reviewed`
       : 'past session — models not recorded';
     const head = el('div', 'task-head');
-    head.appendChild(el('span', 'task-title', data.task));
+    head.appendChild(el('span', 'task-bubble', data.task));
     if (data.state) {
       head.appendChild(el('span', 'task-mode',
         (data.state.success ? 'approved' : data.state.final_verdict || 'incomplete') +
@@ -846,8 +861,7 @@
       if (r.reviewer) renderProse(colForSide('reviewer'), r.reviewer);
       if (Array.isArray(r.checks)) {
         for (const c of r.checks) {
-          line(colForSide('reviewer'), c.passed ? 'check ok' : 'check bad',
-            (c.passed ? '✓ ' : '✗ ') + c.name);
+          line(colForSide('reviewer'), c.passed ? 'check ok' : 'check bad', c.name);
         }
       }
       if (r.clarification) fullWidth('info', 'user clarification: ' + r.clarification);
