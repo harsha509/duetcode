@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.3.0 - 2026-08-28
+
+Reviewers on the API transports can now pull the change themselves: dt
+declares a read-only git toolkit to any API-backed reviewer, whatever the
+vendor, and runs each call itself in the checkout.
+
+### Added
+
+- **Read-only git tools for API reviewers.** When a model holds the reviewer
+  seat over the bare API — no CLI installed — the request now declares four
+  tools: `git_status`, `git_diff`, `git_log`, and `git_show`. The model asks,
+  dt validates the arguments (flags are never taken from the model), runs the
+  command in the repository under review, and feeds the output back — up to
+  eight rounds before the reviewer must answer with what it has. Tool calls
+  surface in the terminal and panel as they run, and the paths a call read
+  are recorded, so a review's account of what it checked can be verified
+  rather than believed.
+
 ## 0.2.13 - 2026-08-27
 
 One press of Ctrl+C now stops the turn instead of killing the session, and

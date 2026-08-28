@@ -55,8 +55,9 @@ You give a task
   review answers about a pull request that is not checked out locally
 
 Install the Gemini CLI if you can. Only the CLI can open the files it is
-reviewing — over the API the reviewer is a bare HTTPS call with no tools, and
-its verdict can never be more than an opinion on the text it was handed.
+reviewing — over the API the reviewer instead carries a read-only git toolkit
+(status, diff, log, show) that dt runs on its behalf in the checkout, so it
+can pull the change and its history, but not open working-tree files.
 
 ### Using Cargo (recommended)
 
