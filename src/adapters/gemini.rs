@@ -44,6 +44,9 @@ pub struct GeminiAdapter {
     /// Files opened during the most recent `generate`, so a review's account of
     /// what it read can be checked rather than believed.
     files_opened: Vec<String>,
+    /// True when this model holds the reviewer seat. The API transport then
+    /// declares the read-only git toolkit, executed by duetcode itself.
+    read_only: bool,
     /// Directories already sized up for the CLI's file crawler, so each is
     /// warned about at most once however many rounds run inside it.
     crawl_checked: HashSet<PathBuf>,
@@ -145,6 +148,47 @@ fn merge_usage(first: UsageStats, second: UsageStats) -> UsageStats {
             (a, b) => a.or(b),
         },
         model: second.model,
+    }
+}
+
+/// One API response: the answer text, every part kept verbatim for replay,
+/// and the function calls the model made.
+struct GeminiTurn {
+    text: String,
+    parts: Vec<serde_json::Value>,
+    calls: Vec<(String, serde_json::Value)>,
+    usage: UsageStats,
+}
+
+/// The read-only toolkit in Gemini wire format. A no-argument tool omits
+/// `parameters`: v1beta rejects an object schema with empty properties.
+fn gemini_tools() -> serde_json::Value {
+    let declarations: Vec<serde_json::Value> = crate::review_tools::specs()
+        .into_iter()
+        .map(|spec| {
+            let mut declaration = serde_json::json!({
+                "name": spec.name,
+                "description": spec.description,
+            });
+            let has_params = spec
+                .schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .is_some_and(|o| !o.is_empty());
+            if has_params {
+                declaration["parameters"] = spec.schema;
+            }
+            declaration
+        })
+        .collect();
+    serde_json::json!([{ "functionDeclarations": declarations }])
+}
+
+/// Folds buffered plain text into one replay part, so a streamed answer does
+/// not replay as hundreds of fragments.
+fn flush_pending_text(replay: &mut Vec<serde_json::Value>, pending: &mut String) {
+    if !pending.is_empty() {
+        replay.push(serde_json::json!({ "text": std::mem::take(pending) }));
     }
 }
 
@@ -304,6 +348,7 @@ impl GeminiAdapter {
             readable_dirs: Vec::new(),
             sessions: HashMap::new(),
             files_opened: Vec::new(),
+            read_only: false,
             crawl_checked: HashSet::new(),
             crawl_hazards: HashSet::new(),
             not_retryable: false,
@@ -761,40 +806,98 @@ impl GeminiAdapter {
         })
     }
 
+    /// One API call, or several when the model uses its read-only git tools:
+    /// duetcode executes each round and feeds it back; the final permitted
+    /// round forbids tools, and tool turns are never persisted to history.
     fn stream_generate(
         &mut self,
         prompt: &str,
         images: &[ImageInput],
     ) -> Result<(String, UsageStats)> {
+        self.files_opened.clear();
         super::trim_history(&mut self.history);
         self.history.push(serde_json::json!({
             "role": "user",
             "parts": Self::build_parts(prompt, images)
         }));
 
-        let body = serde_json::json!({ "contents": self.history });
         let url = format!(
             "{}{}:streamGenerateContent?alt=sse",
             GEMINI_API_BASE,
             self.model_path(),
         );
 
-        match self.exchange(&url, &body) {
-            Ok((text, usage)) => {
+        let mut convo = self.history.clone();
+        let tools = self.read_only.then(gemini_tools);
+        let mut usage_total = UsageStats::default();
+
+        for round in 0..=crate::review_tools::MAX_TOOL_ROUNDS {
+            if super::stop_requested() {
+                self.history.pop();
+                return Err(super::interrupted_error());
+            }
+
+            let mut body = serde_json::json!({ "contents": convo });
+            if let Some(tools) = &tools {
+                body["tools"] = tools.clone();
+                if round == crate::review_tools::MAX_TOOL_ROUNDS {
+                    body["toolConfig"] =
+                        serde_json::json!({ "functionCallingConfig": { "mode": "NONE" } });
+                }
+            }
+
+            let turn = match self.exchange(&url, &body) {
+                Ok(turn) => turn,
+                Err(e) => {
+                    self.history.pop();
+                    return Err(e);
+                }
+            };
+            usage_total = merge_usage(usage_total, turn.usage.clone());
+
+            if turn.calls.is_empty() {
                 self.history.push(serde_json::json!({
                     "role": "model",
-                    "parts": [{ "text": text }]
+                    "parts": [{ "text": turn.text }]
                 }));
-                Ok((text, usage))
+                return Ok((turn.text, usage_total));
             }
-            Err(e) => {
-                self.history.pop();
-                Err(e)
-            }
+
+            convo.push(serde_json::json!({ "role": "model", "parts": turn.parts }));
+            let responses: Vec<serde_json::Value> = turn
+                .calls
+                .iter()
+                .map(|(name, args)| {
+                    self.sink.event(Event::ToolAction {
+                        model: "gemini".into(),
+                        desc: crate::review_tools::describe(name, args),
+                    });
+                    if let Some(path) = crate::review_tools::opened_path(name, args) {
+                        self.files_opened.push(path);
+                    }
+                    serde_json::json!({
+                        "functionResponse": {
+                            "name": name,
+                            "response": {
+                                "output": crate::review_tools::execute(
+                                    &self.working_dir, name, args
+                                )
+                            }
+                        }
+                    })
+                })
+                .collect();
+            convo.push(serde_json::json!({ "role": "user", "parts": responses }));
         }
+
+        self.history.pop();
+        Err(anyhow::anyhow!(
+            "gemini was still calling tools after {} rounds",
+            crate::review_tools::MAX_TOOL_ROUNDS
+        ))
     }
 
-    fn exchange(&self, url: &str, body: &serde_json::Value) -> Result<(String, UsageStats)> {
+    fn exchange(&self, url: &str, body: &serde_json::Value) -> Result<GeminiTurn> {
         eprintln!("  {} streaming from {}", "●".green(), self.config.model);
         eprintln!("  {} thinking...", "◌".cyan());
 
@@ -822,6 +925,9 @@ impl GeminiAdapter {
 
         let reader = BufReader::new(response.into_reader());
         let mut collected = String::new();
+        let mut replay: Vec<serde_json::Value> = Vec::new();
+        let mut pending_text = String::new();
+        let mut calls: Vec<(String, serde_json::Value)> = Vec::new();
         let mut header_printed = false;
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
@@ -858,11 +964,40 @@ impl GeminiAdapter {
 
             chunk_count += 1;
 
-            if let Some(text) = chunk
-                .pointer("/candidates/0/content/parts/0/text")
-                .and_then(|v| v.as_str())
-            {
-                if !text.is_empty() {
+            let parts = chunk
+                .pointer("/candidates/0/content/parts")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for part in parts {
+                if let Some(call) = part.get("functionCall") {
+                    let name =
+                        call.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let args =
+                        call.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    flush_pending_text(&mut replay, &mut pending_text);
+                    replay.push(part.clone());
+                    calls.push((name, args));
+                    continue;
+                }
+                let Some(text) = part.get("text").and_then(|v| v.as_str()) else {
+                    flush_pending_text(&mut replay, &mut pending_text);
+                    replay.push(part.clone());
+                    continue;
+                };
+                let is_thought =
+                    part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
+                let plain = part
+                    .as_object()
+                    .map(|o| o.keys().all(|k| k == "text"))
+                    .unwrap_or(false);
+                if is_thought || !plain {
+                    flush_pending_text(&mut replay, &mut pending_text);
+                    replay.push(part.clone());
+                } else {
+                    pending_text.push_str(text);
+                }
+                if !is_thought && !text.is_empty() {
                     if !header_printed {
                         self.sink.event(Event::StreamStart { model: "gemini".into() });
                         header_printed = true;
@@ -904,7 +1039,8 @@ impl GeminiAdapter {
         );
         ui::stream_footer();
 
-        if collected.is_empty() {
+        flush_pending_text(&mut replay, &mut pending_text);
+        if collected.is_empty() && calls.is_empty() {
             anyhow::bail!(
                 "Gemini returned no text after {:.1}s — {}",
                 elapsed,
@@ -919,7 +1055,7 @@ impl GeminiAdapter {
             model: self.config.model.clone(),
         };
 
-        Ok((collected, usage))
+        Ok(GeminiTurn { text: collected, parts: replay, calls, usage })
     }
 }
 
@@ -1031,13 +1167,18 @@ impl ModelAdapter for GeminiAdapter {
         self.readable_dirs = dirs.to_vec();
     }
 
-    /// Only the CLI carries tools; the API path is a bare generateContent call.
+    /// Only the CLI carries file tools; the API path at most carries the
+    /// read-only git toolkit, which opens no working-tree files.
     fn can_read_files(&self) -> bool {
         self.use_cli
     }
 
     fn files_opened_last_turn(&self) -> Vec<String> {
         self.files_opened.clone()
+    }
+
+    fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
     }
 
     /// Drops this checkout's session and the API history behind it, so the next

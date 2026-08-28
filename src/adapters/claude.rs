@@ -126,6 +126,108 @@ impl CliAttempt {
     }
 }
 
+/// One streamed content block, kept in stream order so a tool turn can be
+/// replayed to the API exactly as the model produced it. Thinking blocks go
+/// back verbatim: the API requires them ahead of the tool use they precede.
+enum ApiBlock {
+    Text(String),
+    Thinking { text: String, signature: String },
+    RedactedThinking(serde_json::Value),
+    ToolUse { id: String, name: String, input_json: String },
+}
+
+/// One tool call the model made, with its input parsed.
+struct ToolCall {
+    id: String,
+    name: String,
+    input: serde_json::Value,
+}
+
+/// One API response: its content blocks in order, and how the turn ended.
+struct ApiTurn {
+    blocks: Vec<ApiBlock>,
+    usage: UsageStats,
+}
+
+impl ApiTurn {
+    fn text(&self) -> String {
+        self.blocks
+            .iter()
+            .filter_map(|b| match b {
+                ApiBlock::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_calls(&self) -> Vec<ToolCall> {
+        self.blocks
+            .iter()
+            .filter_map(|b| match b {
+                ApiBlock::ToolUse { id, name, input_json } => Some(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: serde_json::from_str(input_json)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The assistant turn to send back when the tool loop continues. Empty
+    /// text blocks are dropped — the API refuses them.
+    fn replay_content(&self) -> Vec<serde_json::Value> {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block {
+                ApiBlock::Text(text) if text.trim().is_empty() => None,
+                ApiBlock::Text(text) => Some(serde_json::json!({ "type": "text", "text": text })),
+                ApiBlock::Thinking { text, signature } => Some(serde_json::json!({
+                    "type": "thinking", "thinking": text, "signature": signature
+                })),
+                ApiBlock::RedactedThinking(data) => Some(serde_json::json!({
+                    "type": "redacted_thinking", "data": data
+                })),
+                ApiBlock::ToolUse { id, name, input_json } => Some(serde_json::json!({
+                    "type": "tool_use", "id": id, "name": name,
+                    "input": serde_json::from_str::<serde_json::Value>(input_json)
+                        .unwrap_or_else(|_| serde_json::json!({}))
+                })),
+            })
+            .collect()
+    }
+}
+
+/// The read-only toolkit in Anthropic wire format.
+fn api_tools() -> serde_json::Value {
+    serde_json::Value::Array(
+        crate::review_tools::specs()
+            .into_iter()
+            .map(|spec| {
+                serde_json::json!({
+                    "name": spec.name,
+                    "description": spec.description,
+                    "input_schema": spec.schema,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Both rounds' tokens and cost, so a tool turn reports what it truly cost.
+fn merge_usage(first: UsageStats, second: UsageStats) -> UsageStats {
+    UsageStats {
+        input_tokens: first.input_tokens + second.input_tokens,
+        output_tokens: first.output_tokens + second.output_tokens,
+        cost_usd: match (first.cost_usd, second.cost_usd) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+        },
+        model: second.model,
+    }
+}
+
 impl ClaudeAdapter {
     pub fn new(config: &ClaudeConfig, working_dir: &Path, verbose: bool, sink: Arc<dyn Sink>) -> Self {
         let mode = config.mode.to_lowercase();
@@ -235,6 +337,9 @@ impl ClaudeAdapter {
 
     // ── API mode (direct Anthropic REST API with SSE streaming) ──
 
+    /// One API call, or several when the model uses its read-only git tools:
+    /// duetcode executes each round and feeds it back; the final permitted
+    /// round forbids tools, and tool turns are never persisted to history.
     fn run_api(&mut self, prompt: &str, images: &[ImageInput]) -> Result<(String, UsageStats)> {
         let api_key = self.api_key.clone().ok_or_else(|| anyhow::anyhow!(
             "{} not set — export it or add to your shell profile",
@@ -243,53 +348,107 @@ impl ClaudeAdapter {
         let agent = self.agent.clone()
             .ok_or_else(|| anyhow::anyhow!("HTTP client not initialized"))?;
 
+        self.files_opened.clear();
         super::trim_history(&mut self.messages);
         self.messages.push(serde_json::json!({
             "role": "user",
             "content": build_content(prompt, images)
         }));
 
-        let body = serde_json::json!({
-            "model": self.config.api_model,
-            "max_tokens": MAX_OUTPUT_TOKENS,
-            "stream": true,
-            "messages": self.messages,
-        });
+        let mut convo = self.messages.clone();
+        let tools = self.read_only.then(api_tools);
+        let mut usage_total = UsageStats::default();
 
-        if self.verbose {
-            eprintln!(
-                "  {} POST {} (model: {}, history: {} turns)",
-                "[verbose]".dimmed(), ANTHROPIC_API_URL, self.config.api_model, self.messages.len()
-            );
-        }
+        for round in 0..=crate::review_tools::MAX_TOOL_ROUNDS {
+            if super::stop_requested() {
+                self.messages.pop();
+                return Err(super::interrupted_error());
+            }
 
-        let result = agent
-            .post(ANTHROPIC_API_URL)
-            .set("x-api-key", &api_key)
-            .set("anthropic-version", ANTHROPIC_VERSION)
-            .set("content-type", "application/json")
-            .send_json(&body)
-            .map_err(map_api_error)
-            .and_then(|response| self.parse_sse_stream(response.into_reader()));
+            let mut body = serde_json::json!({
+                "model": self.config.api_model,
+                "max_tokens": MAX_OUTPUT_TOKENS,
+                "stream": true,
+                "messages": convo,
+            });
+            if let Some(tools) = &tools {
+                body["tools"] = tools.clone();
+                if round == crate::review_tools::MAX_TOOL_ROUNDS {
+                    body["tool_choice"] = serde_json::json!({ "type": "none" });
+                }
+            }
 
-        match result {
-            Ok((text, usage)) => {
+            if self.verbose {
+                eprintln!(
+                    "  {} POST {} (model: {}, history: {} turns)",
+                    "[verbose]".dimmed(), ANTHROPIC_API_URL, self.config.api_model,
+                    convo.len()
+                );
+            }
+
+            let turn = match agent
+                .post(ANTHROPIC_API_URL)
+                .set("x-api-key", &api_key)
+                .set("anthropic-version", ANTHROPIC_VERSION)
+                .set("content-type", "application/json")
+                .send_json(&body)
+                .map_err(map_api_error)
+                .and_then(|response| self.parse_sse_stream(response.into_reader()))
+            {
+                Ok(turn) => turn,
+                Err(e) => {
+                    self.messages.pop();
+                    return Err(e);
+                }
+            };
+            usage_total = merge_usage(usage_total, turn.usage.clone());
+
+            let calls = turn.tool_calls();
+            if calls.is_empty() {
+                let text = turn.text();
                 self.messages.push(serde_json::json!({
                     "role": "assistant",
                     "content": [{ "type": "text", "text": text }]
                 }));
-                Ok((text, usage))
+                return Ok((text, usage_total));
             }
-            Err(e) => {
-                self.messages.pop();
-                Err(e)
-            }
+
+            convo.push(serde_json::json!({
+                "role": "assistant",
+                "content": turn.replay_content()
+            }));
+            let results: Vec<serde_json::Value> = calls
+                .iter()
+                .map(|call| {
+                    self.sink.event(Event::ToolAction {
+                        model: "claude".into(),
+                        desc: crate::review_tools::describe(&call.name, &call.input),
+                    });
+                    if let Some(path) = crate::review_tools::opened_path(&call.name, &call.input) {
+                        self.files_opened.push(path);
+                    }
+                    serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": crate::review_tools::execute(
+                            &self.working_dir, &call.name, &call.input
+                        ),
+                    })
+                })
+                .collect();
+            convo.push(serde_json::json!({ "role": "user", "content": results }));
         }
+
+        self.messages.pop();
+        Err(anyhow::anyhow!(
+            "claude was still calling tools after {} rounds",
+            crate::review_tools::MAX_TOOL_ROUNDS
+        ))
     }
 
-    fn parse_sse_stream(&self, body: impl Read) -> Result<(String, UsageStats)> {
+    fn parse_sse_stream(&self, body: impl Read) -> Result<ApiTurn> {
         let reader = BufReader::new(body);
-        let mut collected = String::new();
+        let mut blocks: std::collections::BTreeMap<u64, ApiBlock> = std::collections::BTreeMap::new();
         let mut header_printed = false;
         let start = std::time::Instant::now();
         let mut input_tokens: u64 = 0;
@@ -330,11 +489,34 @@ impl ClaudeAdapter {
 
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+            let index = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+
             match event_type {
                 "content_block_delta" => {
                     if let Some(text) = event.pointer("/delta/text").and_then(|v| v.as_str()) {
                         self.emit_chunk(&mut header_printed, text);
-                        collected.push_str(text);
+                        match blocks.entry(index).or_insert_with(|| ApiBlock::Text(String::new())) {
+                            ApiBlock::Text(buf) => buf.push_str(text),
+                            _ => {}
+                        }
+                    } else if let Some(json) =
+                        event.pointer("/delta/partial_json").and_then(|v| v.as_str())
+                    {
+                        if let Some(ApiBlock::ToolUse { input_json, .. }) = blocks.get_mut(&index) {
+                            input_json.push_str(json);
+                        }
+                    } else if let Some(text) =
+                        event.pointer("/delta/thinking").and_then(|v| v.as_str())
+                    {
+                        if let Some(ApiBlock::Thinking { text: buf, .. }) = blocks.get_mut(&index) {
+                            buf.push_str(text);
+                        }
+                    } else if let Some(sig) =
+                        event.pointer("/delta/signature").and_then(|v| v.as_str())
+                    {
+                        if let Some(ApiBlock::Thinking { signature, .. }) = blocks.get_mut(&index) {
+                            signature.push_str(sig);
+                        }
                     }
                 }
                 "message_start" => {
@@ -348,8 +530,38 @@ impl ClaudeAdapter {
                 }
                 "content_block_start" => {
                     let block_type = event.pointer("/content_block/type").and_then(|v| v.as_str()).unwrap_or("");
-                    if block_type == "thinking" {
-                        self.sink.event(Event::Thinking { model: "claude".into() });
+                    match block_type {
+                        "thinking" => {
+                            self.sink.event(Event::Thinking { model: "claude".into() });
+                            blocks.insert(index, ApiBlock::Thinking {
+                                text: String::new(),
+                                signature: String::new(),
+                            });
+                        }
+                        "redacted_thinking" => {
+                            let data = event
+                                .pointer("/content_block/data")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            blocks.insert(index, ApiBlock::RedactedThinking(data));
+                        }
+                        "tool_use" => {
+                            let field = |key: &str| {
+                                event
+                                    .pointer(&format!("/content_block/{}", key))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string()
+                            };
+                            blocks.insert(index, ApiBlock::ToolUse {
+                                id: field("id"),
+                                name: field("name"),
+                                input_json: String::new(),
+                            });
+                        }
+                        _ => {
+                            blocks.insert(index, ApiBlock::Text(String::new()));
+                        }
                     }
                 }
                 "message_delta" => {
@@ -384,7 +596,7 @@ impl ClaudeAdapter {
             model: model_name,
         };
 
-        Ok((collected, usage))
+        Ok(ApiTurn { blocks: blocks.into_values().collect(), usage })
     }
 
     // ── CLI mode (spawn claude command, resume the session across calls) ──
@@ -1008,7 +1220,8 @@ impl ModelAdapter for ClaudeAdapter {
         self.readable_dirs = dirs.to_vec();
     }
 
-    /// Only the CLI carries tools; the API path is a bare messages call.
+    /// Only the CLI carries file tools; the API path at most carries the
+    /// read-only git toolkit, which opens no working-tree files.
     fn can_read_files(&self) -> bool {
         !self.use_api
     }

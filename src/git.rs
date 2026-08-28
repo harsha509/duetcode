@@ -8,7 +8,7 @@ use std::time::Duration;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Runs git capturing its output, killed if it hangs past [`GIT_TIMEOUT`].
-fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
+pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
     let mut cmd = Command::new("git");
     cmd.args(args).current_dir(dir);
     crate::process::capture_with_timeout(&mut cmd, GIT_TIMEOUT)

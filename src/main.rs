@@ -12,6 +12,7 @@ mod prompt_sync;
 mod prompts;
 mod repl;
 mod review_subject;
+mod review_tools;
 mod serve;
 mod ui;
 
