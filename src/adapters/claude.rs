@@ -634,15 +634,13 @@ impl ClaudeAdapter {
             return Err(error);
         }
 
-        if connected {
-            eprintln!(
-                "  {} the session outgrew its context ({:#}) — starting fresh",
-                "↻".yellow(),
-                error
-            );
-        } else {
-            eprintln!("  {} could not resume session ({:#}) — starting fresh", "↻".yellow(), error);
-        }
+        self.sink.event(Event::Warn {
+            text: if connected {
+                format!("claude's session outgrew its context ({:#}) — starting fresh", error)
+            } else {
+                format!("claude could not resume its session ({:#}) — starting fresh", error)
+            },
+        });
         self.sessions.remove(&self.working_dir);
 
         let retry = self.spawn_cli(prompt, images);
@@ -1192,14 +1190,20 @@ impl ModelAdapter for ClaudeAdapter {
             return self.run_api(prompt, images);
         }
         match self.run_cli(prompt, images) {
-            // Case-insensitive to match the constructor, which lowercases
-            // `mode` before deciding whether to build the API agent. Never on
-            // a timeout or a user stop: both killed the run deliberately.
+            // Never on a timeout or a user stop: both killed the run deliberately.
             Err(e) if !self.not_retryable
-                && self.api_key.is_some()
-                && self.config.mode.eq_ignore_ascii_case("auto") =>
+                && super::should_fall_back_to_api(
+                    &self.config.mode,
+                    self.api_key.is_some(),
+                    self.current_session().is_some(),
+                ) =>
             {
-                eprintln!("  {} CLI failed ({:#}) — falling back to API", "↻".yellow(), e);
+                self.sink.event(Event::Warn {
+                    text: format!(
+                        "claude CLI failed ({:#}) — falling back to the API, which cannot read files",
+                        e
+                    ),
+                });
                 self.run_api(prompt, images)
             }
             other => other,

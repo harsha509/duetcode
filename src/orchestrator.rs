@@ -38,6 +38,10 @@ pub struct OrchestratorResult {
     /// its own review action has something to judge: an answer leaves no diff,
     /// and a diff review would judge the wrong thing.
     pub answer: Option<String>,
+    /// The writer's account of code it changed and nobody reviewed. Held for
+    /// the same reason as `answer`: an on-demand review should judge the diff
+    /// with the task and the writer's notes, as an in-loop review does.
+    pub writer_notes: Option<String>,
 }
 
 /// Everything a task run needs, bundled so call sites stay small.
@@ -225,6 +229,8 @@ pub fn run(
 
     let mut costs = CostTracker::new(sink);
 
+    reviewer.reset_session();
+
     let plan = if opts.plan_first {
         match plan_phase(opts, writer, reviewer, &session, &mut costs, sink)? {
             PlanOutcome::Proceed(plan) => Some(plan),
@@ -252,6 +258,41 @@ pub fn review_only(
         return fetched_review_only(config, reviewer, repo_dir, task, sink);
     }
 
+    let task = task.unwrap_or(
+        "Review the current uncommitted changes for bugs, edge cases, and best practices.",
+    );
+    working_tree_review(
+        config, reviewer, repo_dir, task, "(not provided — judge the diff on its own)", None, sink,
+    )
+}
+
+/// Review of changes a task left unreviewed — the panel's review button after
+/// a task. Judged with the task they were written for and the writer's notes
+/// on them, as an in-loop review is; `instruction` is what the user typed.
+pub fn changes_review_only(
+    config: &Config,
+    reviewer: &mut dyn ModelAdapter,
+    repo_dir: &Path,
+    task: &str,
+    writer_notes: &str,
+    instruction: Option<&str>,
+    sink: &dyn Sink,
+) -> Result<OrchestratorResult> {
+    let _turn = crate::process::TurnGuard::new();
+    working_tree_review(config, reviewer, repo_dir, task, writer_notes, instruction, sink)
+}
+
+/// One fresh-session review of the working tree, shared by both standalone
+/// review entry points.
+fn working_tree_review(
+    config: &Config,
+    reviewer: &mut dyn ModelAdapter,
+    repo_dir: &Path,
+    task: &str,
+    writer_notes: &str,
+    instruction: Option<&str>,
+    sink: &dyn Sink,
+) -> Result<OrchestratorResult> {
     let diff = git::git_diff(repo_dir)?;
     if diff.trim().is_empty() {
         anyhow::bail!("no uncommitted changes to review");
@@ -259,20 +300,20 @@ pub fn review_only(
 
     let review_template =
         load_prompt_template(&config.prompts.review, prompts::DEFAULT_REVIEW_TEMPLATE, repo_dir)?;
-    let task_context = task.unwrap_or(
-        "Review the current uncommitted changes for bugs, edge cases, and best practices.",
-    );
 
     let (review_diff, diff_truncated) = capped_review_diff(&diff, &*reviewer);
 
-    let review_prompt = prompts::build_review_prompt(
+    let mut review_prompt = prompts::build_review_prompt(
         &review_template,
-        task_context,
+        task,
         &review_repo_block(repo_dir),
         &review_diff,
         "",
-        "(not provided — judge the diff on its own)",
+        writer_notes,
     );
+    if let Some(text) = instruction.map(str::trim).filter(|t| !t.is_empty()) {
+        review_prompt.push_str(&format!("\n\nUSER INSTRUCTION (authoritative):\n{}", text));
+    }
 
     let mut costs = CostTracker::new(sink);
     sink.event(Event::Working {
@@ -305,6 +346,7 @@ pub fn review_only(
         rounds: 1,
         message: if approved { "approved".into() } else { "changes requested by AI".into() },
         answer: None,
+        writer_notes: None,
     })
 }
 
@@ -323,12 +365,12 @@ fn fetched_review_only(
     let subject = resolve_subject(task, repo_dir, sink);
     if let Some(refused) = refusal(&subject, reviewer) {
         sink.event(Event::Warn { text: refused.warning });
-        return Ok(unreviewed_result(0, refused.message.into(), None));
+        return Ok(unreviewed_result(0, refused.message.into(), None, None));
     }
     let Subject::Fetched { labels, .. } = &subject else {
         // On a task naming absent code, `resolve_subject` returns Fetched or
         // Absent, and Absent was refused above.
-        return Ok(unreviewed_result(0, UNGROUNDED_MESSAGE.into(), None));
+        return Ok(unreviewed_result(0, UNGROUNDED_MESSAGE.into(), None, None));
     };
 
     let review_template =
@@ -374,6 +416,7 @@ fn fetched_review_only(
         rounds: 1,
         message: if approved { "approved".into() } else { "changes requested by AI".into() },
         answer: None,
+        writer_notes: None,
     })
 }
 
@@ -398,7 +441,7 @@ pub fn answer_review_only(
     let subject = resolve_subject(task, repo_dir, sink);
     if let Some(refused) = refusal(&subject, reviewer) {
         sink.event(Event::Warn { text: refused.warning });
-        return Ok(unreviewed_result(0, refused.message.into(), None));
+        return Ok(unreviewed_result(0, refused.message.into(), None, None));
     }
 
     let changes = changes_block(&subject, reviewer);
@@ -449,6 +492,7 @@ pub fn answer_review_only(
             "the answer was found unsound".into()
         },
         answer: None,
+        writer_notes: None,
     })
 }
 
@@ -501,6 +545,7 @@ fn plan_phase(
                 "plan created, user skipped review".into()
             },
             answer: None,
+            writer_notes: None,
         }));
     }
 
@@ -542,6 +587,7 @@ fn plan_phase(
                 "plan reviewed, user chose not to execute".into()
             },
             answer: None,
+            writer_notes: None,
         }));
     }
 
@@ -652,6 +698,7 @@ fn execute_loop(
                             opts.review_on_demand, writer.name(), reviewer.name(), "answer",
                         ),
                         Some(writer_response.clone()),
+                        None,
                     ));
                 }
 
@@ -670,6 +717,7 @@ fn execute_loop(
                         round,
                         refused.message.into(),
                         Some(writer_response.clone()),
+                        None,
                     ));
                 }
 
@@ -747,6 +795,7 @@ fn execute_loop(
                         opts.review_on_demand, writer.name(), reviewer.name(), "changes",
                     ),
                     None,
+                    Some(writer_response),
                 ));
             }
             DiffOutcome::Review(diff) => {
@@ -840,6 +889,7 @@ fn execute_loop(
         rounds: round,
         message: format!("stopped after {} rounds without full approval", round),
         answer: None,
+        writer_notes: None,
     })
 }
 
@@ -1707,14 +1757,25 @@ fn report_stray_writes(session: &mut Session, primary: &Path, sink: &dyn Sink) {
 }
 
 fn ok_result(rounds: usize, message: &str) -> OrchestratorResult {
-    OrchestratorResult { outcome: Outcome::Approved, rounds, message: message.into(), answer: None }
+    OrchestratorResult {
+        outcome: Outcome::Approved,
+        rounds,
+        message: message.into(),
+        answer: None,
+        writer_notes: None,
+    }
 }
 
 /// The work stands, but no reviewer ever judged it — reported as neither a pass
 /// nor a failure. `answer` carries the writer's text when the run produced one,
-/// so an on-demand review still has the thing it needs to judge.
-fn unreviewed_result(rounds: usize, message: String, answer: Option<String>) -> OrchestratorResult {
-    OrchestratorResult { outcome: Outcome::Unreviewed, rounds, message, answer }
+/// `writer_notes` its account of code it changed, for an on-demand review.
+fn unreviewed_result(
+    rounds: usize,
+    message: String,
+    answer: Option<String>,
+    writer_notes: Option<String>,
+) -> OrchestratorResult {
+    OrchestratorResult { outcome: Outcome::Unreviewed, rounds, message, answer, writer_notes }
 }
 
 /// The result of a run the user stopped mid-flight: announced once, then handed
@@ -1726,6 +1787,7 @@ fn stopped_run(sink: &dyn Sink, rounds: usize) -> OrchestratorResult {
         rounds,
         message: "stopped by user".into(),
         answer: None,
+        writer_notes: None,
     }
 }
 

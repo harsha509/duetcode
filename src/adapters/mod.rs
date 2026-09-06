@@ -42,6 +42,13 @@ pub(crate) fn interrupted_error() -> anyhow::Error {
     anyhow::anyhow!("stopped by user")
 }
 
+/// Whether a failed CLI call may be retried over the API: only in `auto` mode,
+/// with a key, and with no session to lose — the API cannot continue one, and
+/// a retry resumes it. An explicit `mode = "cli"` fails loudly instead.
+pub(crate) fn should_fall_back_to_api(mode: &str, has_key: bool, has_session: bool) -> bool {
+    mode.eq_ignore_ascii_case("auto") && has_key && !has_session
+}
+
 /// Whether a CLI run died because the conversation outgrew the model's
 /// context. Matched against the CLI's own diagnostics — stderr or its typed
 /// error/result events — never the model's output, which quotes such phrases
@@ -285,6 +292,15 @@ mod tests {
         let mut history = vec![turn("user", "a"), turn("model", "b")];
         trim_history(&mut history);
         assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn the_api_fallback_needs_auto_mode_a_key_and_no_session_to_lose() {
+        assert!(should_fall_back_to_api("auto", true, false));
+        assert!(should_fall_back_to_api("AUTO", true, false));
+        assert!(!should_fall_back_to_api("cli", true, false));
+        assert!(!should_fall_back_to_api("auto", false, false));
+        assert!(!should_fall_back_to_api("auto", true, true));
     }
 
     #[test]

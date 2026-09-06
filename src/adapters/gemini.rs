@@ -103,6 +103,12 @@ fn should_restart_session(was_resuming: bool, connected: bool) -> bool {
     was_resuming && !connected
 }
 
+/// Images switch transports only when nothing is lost by it: a key to send
+/// them with, and no CLI session that the API turn would fork away from.
+fn images_go_over_api(has_key: bool, has_session: bool) -> bool {
+    has_key && !has_session
+}
+
 /// Tools whose implementation enumerates the whole workspace in memory before
 /// filtering, which is what dies on a checkout carrying a large dependency
 /// tree. Disabled only for the retry after an out-of-memory death: a reviewer
@@ -371,11 +377,20 @@ impl GeminiAdapter {
             .unwrap_or(false)
     }
 
-    /// True when a failed CLI call may be retried over the API: only in `auto`
-    /// mode, and only with a key to retry with. An explicit `mode = "cli"` must
-    /// fail loudly rather than quietly downgrade to a reviewer that cannot read.
+    /// See [`super::should_fall_back_to_api`].
     fn can_fall_back_to_api(&self) -> bool {
-        self.config.mode.eq_ignore_ascii_case("auto") && self.api_key.is_some()
+        super::should_fall_back_to_api(
+            &self.config.mode,
+            self.api_key.is_some(),
+            self.current_session().is_some(),
+        )
+    }
+
+    /// Whether this turn's images go over the API, which the CLI cannot take:
+    /// only with a key, and only with no session to lose. Otherwise they are
+    /// dropped with a warning and the session stays whole.
+    fn images_go_over_api(&self) -> bool {
+        images_go_over_api(self.api_key.is_some(), self.current_session().is_some())
     }
 
     /// The stored session for the checkout the adapter currently points at.
@@ -1076,19 +1091,23 @@ impl ModelAdapter for GeminiAdapter {
             return self.stream_generate(prompt, images);
         }
 
-        // `-p` carries text only. Images are rare here — the reviewer never
-        // sends any — so rather than dropping them silently, hand the call to
-        // the API transport, which does support them.
-        if !images.is_empty() && self.api_key.is_some() {
+        // The CLI takes text only. Images are rare here — the reviewer never
+        // sends any — so they go over the API when that costs nothing, and
+        // are dropped with a warning when it would cost the session.
+        if !images.is_empty() && self.images_go_over_api() {
             return self.stream_generate(prompt, images);
         }
         if !images.is_empty() {
+            let reason = if self.api_key.is_some() {
+                "sending them over the API would abandon the session in progress".to_string()
+            } else {
+                format!("no {} is set to send them over the API instead", self.config.api_key_env)
+            };
             self.sink.event(Event::Warn {
                 text: format!(
-                    "{} image(s) dropped — the gemini CLI takes text prompts only, and no {} \
-                     is set to send them over the API instead",
+                    "{} image(s) dropped — the gemini CLI takes text prompts only, and {}",
                     images.len(),
-                    self.config.api_key_env
+                    reason
                 ),
             });
         }
@@ -1551,6 +1570,14 @@ mod tests {
         assert!(should_restart_session(true, false));
         assert!(!should_restart_session(true, true));
         assert!(!should_restart_session(false, false));
+    }
+
+    /// An image must not be the thing that forks a session in progress.
+    #[test]
+    fn images_take_the_api_only_when_no_session_would_be_lost() {
+        assert!(images_go_over_api(true, false));
+        assert!(!images_go_over_api(true, true));
+        assert!(!images_go_over_api(false, false));
     }
 
     /// A truncated tool argument must not slice a multi-byte character in half:

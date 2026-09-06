@@ -144,10 +144,9 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
     // was started in — which is exactly how the plain CLI behaves.
     let mut workspace: Vec<PathBuf> = vec![dir.to_path_buf()];
 
-    // Answers still waiting for a review, per project. A task that answers
-    // instead of writing code leaves no diff, so the review command would have
-    // nothing to judge unless the answer is kept here until it is reviewed.
-    let mut pending_answers: HashMap<PathBuf, PendingAnswer> = HashMap::new();
+    // Work still waiting for a review, per project: an answer, which leaves no
+    // diff to judge, or changes with the notes the writer left about them.
+    let mut pending_reviews: HashMap<PathBuf, Pending> = HashMap::new();
 
     // Tracks whether the user has consented to run checks defined in each
     // project's own .duet/config.toml. Asked once per project per session.
@@ -231,19 +230,13 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
 
                 match orchestrator::run(&opts, writer.as_mut(), reviewer.as_mut(), sink.as_ref()) {
                     Ok(r) => {
-                        // A reviewed run, or one that changed code, leaves
-                        // nothing pending — the diff is what a later review
-                        // should judge, not an answer from a task ago.
-                        match r.answer {
-                            Some(answer) => {
-                                let pending =
-                                    PendingAnswer { task: task.to_string(), answer };
-                                pending_answers.insert(project_key(&target.dir), pending);
-                            }
-                            None => {
-                                pending_answers.remove(&project_key(&target.dir));
-                            }
-                        }
+                        // A reviewed run leaves nothing pending: whatever a
+                        // task ago left is not what a later review should judge.
+                        let key = project_key(&target.dir);
+                        match pending_work(task, r.answer, r.writer_notes) {
+                            Some(work) => pending_reviews.insert(key, work),
+                            None => pending_reviews.remove(&key),
+                        };
                         sink.event(Event::TaskDone {
                             outcome: r.outcome,
                             rounds: r.rounds,
@@ -259,7 +252,7 @@ pub fn run(dir: &Path, writer_name: &str, overrides: cli::ModelOverrides) -> Res
                     reviewer.as_mut(),
                     &workspace,
                     &cmd,
-                    &pending_answers,
+                    &pending_reviews,
                     &mut checks_consents,
                     dir,
                     sink.as_ref(),
@@ -427,6 +420,29 @@ struct PendingAnswer {
     answer: String,
 }
 
+/// Changes a task made that no reviewer has judged yet, with the task and the
+/// writer's notes on them — what an in-loop review would have been handed.
+struct PendingChanges {
+    task: String,
+    notes: String,
+}
+
+/// What a project's last task left for the review button to judge.
+enum Pending {
+    Answer(PendingAnswer),
+    Changes(PendingChanges),
+}
+
+/// What a finished task leaves for the review button, if anything.
+fn pending_work(task: &str, answer: Option<String>, notes: Option<String>) -> Option<Pending> {
+    let task = task.to_string();
+    match (answer, notes) {
+        (Some(answer), _) => Some(Pending::Answer(PendingAnswer { task, answer })),
+        (None, Some(notes)) => Some(Pending::Changes(PendingChanges { task, notes })),
+        (None, None) => None,
+    }
+}
+
 /// Keys a pending answer by a path that compares equal however a frontend
 /// spells it: `/w/api` and `/w/api/` are one project, and a lookup that missed
 /// would silently review the diff instead of the answer waiting on it.
@@ -513,7 +529,7 @@ fn run_review(
     reviewer: &mut dyn ModelAdapter,
     workspace: &[PathBuf],
     cmd: &Command,
-    pending_answers: &HashMap<PathBuf, PendingAnswer>,
+    pending_reviews: &HashMap<PathBuf, Pending>,
     checks_consents: &mut HashMap<PathBuf, bool>,
     session_dir: &Path,
     sink: &dyn Sink,
@@ -534,8 +550,9 @@ fn run_review(
             break;
         }
         let pending =
-            if pr_task { None } else { pending_answers.get(&project_key(&target.dir)) };
-        if !pr_task && pending.is_none() && !has_changes_to_review(target, multi, sink) {
+            if pr_task { None } else { pending_reviews.get(&project_key(&target.dir)) };
+        let answer_pending = matches!(pending, Some(Pending::Answer(_)));
+        if !pr_task && !answer_pending && !has_changes_to_review(target, multi, sink) {
             continue;
         }
 
@@ -558,11 +575,20 @@ fn run_review(
             effective_config(&own_config, session_config, target, session_dir, checks_consents, sink);
 
         let review = match pending {
-            Some(p) => orchestrator::answer_review_only(
+            Some(Pending::Answer(p)) => orchestrator::answer_review_only(
                 reviewer,
                 &target.dir,
                 &p.task,
                 &p.answer,
+                cmd.task.as_deref(),
+                sink,
+            ),
+            Some(Pending::Changes(p)) => orchestrator::changes_review_only(
+                &config,
+                reviewer,
+                &target.dir,
+                &p.task,
+                &p.notes,
                 cmd.task.as_deref(),
                 sink,
             ),
@@ -581,7 +607,7 @@ fn run_review(
             }
             Ok(result) => {
                 tally.reviewed += 1;
-                if pending.is_some() {
+                if answer_pending {
                     tally.answers += 1;
                 }
                 if result.outcome == Outcome::Approved {
@@ -873,6 +899,21 @@ mod tests {
         );
         assert!(pending.contains_key(&project_key(Path::new("/w/api/"))));
         assert!(!pending.contains_key(&project_key(Path::new("/w/web"))));
+    }
+
+    /// The review button judges what the last task left: an answer as an
+    /// answer, changed code with the writer's notes, and a reviewed run nothing.
+    #[test]
+    fn a_finished_task_leaves_its_answer_or_its_notes_for_the_review_button() {
+        assert!(matches!(
+            pending_work("t", Some("a".into()), None),
+            Some(Pending::Answer(PendingAnswer { task, answer })) if task == "t" && answer == "a"
+        ));
+        assert!(matches!(
+            pending_work("t", None, Some("n".into())),
+            Some(Pending::Changes(PendingChanges { task, notes })) if task == "t" && notes == "n"
+        ));
+        assert!(pending_work("t", None, None).is_none());
     }
 
     #[test]
