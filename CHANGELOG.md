@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.3.3 - 2026-09-06
+
+Context stops leaking between the writer and the reviewer: an on-demand
+review hears what the task was and what the writer said, a model that
+forgets says so, and neither transport forks the conversation.
+
+### Fixed
+
+- **The panel's review button knows the task.** A review of code a task
+  left unreviewed now carries that task and the writer's own notes, as an
+  in-loop review always did; anything typed into the composer becomes an
+  instruction on top, instead of replacing the task. Before, the reviewer
+  was handed the diff alone under a generic "review the changes" prompt.
+- **Claude's fresh starts are announced.** "Could not resume session",
+  "session outgrew its context" and "falling back to the API" now go
+  through the event stream, so the panel shows them; they were written to
+  stderr, which the extension discards.
+- **No API fallback with a session to lose.** A CLI failure mid-task no
+  longer falls back to the API, whose empty history would fork the
+  conversation; the error surfaces and a retry resumes the session. The
+  fallback still runs when there is no session yet. Gemini applies the same
+  rule to images, which its CLI cannot take: they go over the API only when
+  no session exists, and are dropped with a warning otherwise.
+- **The reviewer starts each task clean.** In a `dt` session or under the
+  panel, a new task's first review resumed the previous task's session,
+  anchoring it to stale conclusions; the reviewer now resets per task.
+
 ## 0.3.2 - 2026-08-28
 
 No CLI changes: the version moves in lockstep with the VS Code extension,

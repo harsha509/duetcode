@@ -5,6 +5,12 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.3.3 - 2026-09-06
+
+Requires `dt` 0.3.3. No extension changes: the version moves in lockstep with
+the CLI, whose review button now carries the task and the writer's notes, and
+whose Claude notices reach the panel instead of a discarded stderr.
+
 ## 0.3.2 - 2026-08-28
 
 Requires `dt` 0.3.2. Tool calls stop stacking: a run of thirty greps leaves
