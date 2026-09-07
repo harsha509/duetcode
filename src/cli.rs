@@ -5,13 +5,13 @@ use crate::adapters::{ImageInput, ModelAdapter};
 use crate::config::Config;
 use crate::events::{Sink, TerminalSink};
 use crate::git;
-use crate::orchestrator::{self, TaskOptions};
+use crate::orchestrator::{self, Outcome, TaskOptions};
 use crate::repl;
 use crate::serve;
 use crate::ui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use colored::Colorize;
+use colored::{ColoredString, Colorize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -375,14 +375,22 @@ fn cmd_review(dir: &Path, reviewer_name: &str, task: Option<&str>, verbose: bool
 
     let result = orchestrator::review_only(&config, reviewer.as_mut(), dir, task, sink.as_ref())?;
 
-    if result.outcome.success() {
-        println!("\n{}", "Final Result: APPROVED".green().bold());
-    } else {
-        println!("\n{}", "Final Result: CHANGES NEEDED".red().bold());
+    println!("\n{}", review_final_line(result.outcome));
+    if result.outcome != Outcome::Approved {
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+/// Closing line of `dt review`. Only an approval reads as one: a review the
+/// reviewer refused says so, and exits non-zero like a rejection.
+fn review_final_line(outcome: Outcome) -> ColoredString {
+    match outcome {
+        Outcome::Approved => "Final Result: APPROVED".green().bold(),
+        Outcome::Unreviewed => "Final Result: NO REVIEW".bold(),
+        Outcome::Stopped => "Final Result: CHANGES NEEDED".red().bold(),
+    }
 }
 
 fn cmd_init(dir: &Path) -> Result<()> {
@@ -797,5 +805,15 @@ mod tests {
     fn exact_name_beats_the_longer_session_it_prefixes() {
         let names = vec!["20260805-1936-fix".to_string(), "20260805-1936-fix-2".to_string()];
         assert_eq!(resolve_session(&names, "20260805-1936-fix").unwrap(), "20260805-1936-fix");
+    }
+
+    /// The reported bug: a refused review printed APPROVED, because "not a
+    /// failure" was read as "approved". Only an approval may say so.
+    #[test]
+    fn a_refused_review_is_never_reported_as_approved() {
+        let line = review_final_line(Outcome::Unreviewed).to_string();
+        assert!(line.contains("NO REVIEW"), "{line}");
+        assert!(!line.contains("APPROVED"), "{line}");
+        assert!(review_final_line(Outcome::Approved).to_string().contains("APPROVED"));
     }
 }

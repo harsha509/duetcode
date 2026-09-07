@@ -301,6 +301,8 @@ fn working_tree_review(
     let review_template =
         load_prompt_template(&config.prompts.review, prompts::DEFAULT_REVIEW_TEMPLATE, repo_dir)?;
 
+    let check_results = announced_checks(config, repo_dir, sink);
+    let checks_summary = checks::format_check_results(&check_results);
     let (review_diff, diff_truncated) = capped_review_diff(&diff, &*reviewer);
 
     let mut review_prompt = prompts::build_review_prompt(
@@ -308,7 +310,7 @@ fn working_tree_review(
         task,
         &review_repo_block(repo_dir),
         &review_diff,
-        "",
+        &checks_summary,
         writer_notes,
     );
     if let Some(text) = instruction.map(str::trim).filter(|t| !t.is_empty()) {
@@ -340,14 +342,42 @@ fn working_tree_review(
     emit_verdict(sink, VerdictKind::Code, &verdict);
     costs.summary();
 
-    let approved = verdict.verdict == Verdict::Approved;
+    let ai_approved = verdict.verdict == Verdict::Approved;
+    let checks_passed = checks::all_passed(&check_results);
+    if ai_approved && !checks_passed {
+        sink.event(Event::Warn { text: "AI approved, but checks failed".into() });
+    }
+    let approved = ai_approved && checks_passed;
     Ok(OrchestratorResult {
         outcome: if approved { Outcome::Approved } else { Outcome::Stopped },
         rounds: 1,
-        message: if approved { "approved".into() } else { "changes requested by AI".into() },
+        message: standalone_review_message(ai_approved, checks_passed).into(),
         answer: None,
         writer_notes: None,
     })
+}
+
+/// How a standalone review ended, in the words the CLI and the panel print.
+fn standalone_review_message(ai_approved: bool, checks_passed: bool) -> &'static str {
+    match (ai_approved, checks_passed) {
+        (true, true) => "approved",
+        (true, false) => "approved by AI, but checks failed",
+        (false, _) => "changes requested by AI",
+    }
+}
+
+/// Runs the configured checks and reports each one, as every review of the
+/// working tree must: the reviewer is shown the results, and approval needs them.
+fn announced_checks(config: &Config, repo_dir: &Path, sink: &dyn Sink) -> Vec<checks::CheckResult> {
+    sink.event(Event::Working { actor: "checks".into(), action: "running configured checks…".into() });
+    let results = checks::run_checks(&config.checks, repo_dir);
+    if results.is_empty() {
+        sink.event(Event::Info { text: "no checks configured (.duet/config.toml [checks])".into() });
+    }
+    for cr in &results {
+        sink.event(Event::Check { name: cr.name.clone(), passed: cr.passed });
+    }
+    results
 }
 
 /// The review a task gets when it names a change that is not in this checkout:
@@ -1027,16 +1057,8 @@ fn run_review(
     diff: &str,
     sink: &dyn Sink,
 ) -> Result<ReviewOutcome> {
-    sink.event(Event::Working { actor: "checks".into(), action: "running configured checks…".into() });
-    let check_results = checks::run_checks(&opts.config.checks, opts.repo_dir);
+    let check_results = announced_checks(opts.config, opts.repo_dir, sink);
     session.log.write_checks(input.round, &check_results)?;
-
-    if check_results.is_empty() {
-        sink.event(Event::Info { text: "no checks configured (.duet/config.toml [checks])".into() });
-    }
-    for cr in &check_results {
-        sink.event(Event::Check { name: cr.name.clone(), passed: cr.passed });
-    }
 
     let checks_summary = checks::format_check_results(&check_results);
     let (review_diff, diff_truncated) = capped_review_diff(diff, reviewer);
@@ -2373,5 +2395,89 @@ mod tests {
     #[test]
     fn revert_back_to_clean_is_not_reviewable() {
         assert!(!wrote_reviewable_code(STALE, ""));
+    }
+
+    /// A reviewer that approves whatever it is shown.
+    struct Approver;
+
+    impl ModelAdapter for Approver {
+        fn generate(&mut self, _: &str, _: &[ImageInput]) -> Result<(String, UsageStats)> {
+            Ok(("VERDICT: APPROVED".into(), UsageStats::default()))
+        }
+
+        fn name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    /// Records every event, so a test can see what the run reported.
+    struct Recorder(std::sync::Mutex<Vec<String>>);
+
+    impl Sink for Recorder {
+        fn event(&self, event: Event) {
+            self.0.lock().unwrap().push(format!("{:?}", event));
+        }
+
+        fn ask(&self, _kind: AskKind, _question: &str) -> String {
+            "y".into()
+        }
+    }
+
+    /// A throwaway git repository with one modified tracked file.
+    fn repo_with_uncommitted_change(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dt-standalone-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {:?}", args);
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("lib.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "lib.rs"]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("lib.rs"), "fn main() { let x = 1; }\n").unwrap();
+        dir
+    }
+
+    /// The reported bug: a standalone review approved over a failing check
+    /// because it never ran any. It runs them and holds approval, as the
+    /// in-loop review does.
+    #[test]
+    fn a_standalone_review_does_not_approve_over_a_failing_check() {
+        let mut config = Config::default();
+        config.checks.test = Some("false".into());
+        let repo = repo_with_uncommitted_change("failing");
+        let sink = Recorder(std::sync::Mutex::new(Vec::new()));
+        let result = working_tree_review(&config, &mut Approver, &repo, "review", "(not provided)", None, &sink)
+            .expect("review runs");
+        let _ = std::fs::remove_dir_all(&repo);
+        let events = sink.0.lock().unwrap().join("\n");
+        assert!(events.contains("running configured checks"), "checks never ran; events:\n{}", events);
+        assert!(events.contains("AI approved, but checks failed"), "events:\n{}", events);
+        assert_eq!(result.outcome, Outcome::Stopped);
+        assert_eq!(result.message, "approved by AI, but checks failed");
+    }
+
+    /// With every check passing, the approval stands.
+    #[test]
+    fn a_standalone_review_approves_when_checks_pass() {
+        let mut config = Config::default();
+        config.checks.test = Some("true".into());
+        let repo = repo_with_uncommitted_change("passing");
+        let sink = Recorder(std::sync::Mutex::new(Vec::new()));
+        let result = working_tree_review(&config, &mut Approver, &repo, "review", "(not provided)", None, &sink)
+            .expect("review runs");
+        let _ = std::fs::remove_dir_all(&repo);
+        assert_eq!(result.outcome, Outcome::Approved);
+        assert_eq!(result.message, "approved");
     }
 }
