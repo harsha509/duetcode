@@ -62,7 +62,7 @@
   // Columns are created on first use, so a round only shows the blocks that
   // actually have content (no empty reviewer box while the writer streams).
   function colForSide(side) {
-    if (!currentRound) newRound('•', '');
+    if (!currentRound) newRound(NO_ROUND, '');
     // Recreated after a full-width row split the round, so later column
     // content lands below that row instead of above it.
     if (!currentRound.cols) {
@@ -72,10 +72,16 @@
     const key = side + 'Col';
     if (!currentRound[key]) {
       const col = el('div', 'col ' + side);
-      // Bare role when no model is known: a session that recorded none is not
-      // evidence that today's models ran it.
-      const name = labels[side];
-      col.appendChild(el('div', 'col-head', name ? name + ' · ' + side : side));
+      // Once per round, not once per column: after a split the seat is already
+      // named above, and a second head reads as a second speaker when it is the
+      // same one continuing. The rail and its colour still mark the seat.
+      if (!currentRound.named[side]) {
+        // Bare role when no model is known: a session that recorded none is not
+        // evidence that today's models ran it.
+        const name = labels[side];
+        col.appendChild(el('div', 'col-head', name ? name + ' · ' + side : side));
+        currentRound.named[side] = true;
+      }
       currentRound.cols.appendChild(col);
       currentRound[key] = col;
     }
@@ -157,13 +163,19 @@
     for (const model of Object.keys(activities)) settleActivity(model);
   }
 
+  // The round a stray event opens when nothing declared one — a standalone
+  // review runs no rounds at all. Nothing to number, so it prints no head.
+  const NO_ROUND = '\u2022';
+
   function newRound(label, budget) {
     settleAllActivities();
     const block = el('section', 'round');
-    const head = el('div', 'round-head', budget ? `round ${label}/${budget}` : String(label));
-    block.appendChild(head);
+    if (label !== NO_ROUND) {
+      block.appendChild(
+        el('div', 'round-head', budget ? `round ${label}/${budget}` : String(label)));
+    }
     timeline.appendChild(block);
-    currentRound = { block, cols: null, writerCol: null, reviewerCol: null };
+    currentRound = { block, cols: null, writerCol: null, reviewerCol: null, named: {} };
     streams = {};
     scrollDown();
   }

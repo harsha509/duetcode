@@ -67,3 +67,30 @@ test('an answer that does not open with the line is left alone', () => {
   assert.ok(find(timeline, 'block').textContent.includes('2 file(s): a.py, b.py'));
 });
 
+/** The panel after the given events, in order. */
+function panel(events) {
+  const w = loadWebview();
+  for (const ev of events) w.send({ type: 'event', ev });
+  return w.byId.timeline;
+}
+
+test('a seat is named once per round, not again after a full-width row splits it', () => {
+  const timeline = panel([
+    { event: 'ready', writer: 'claude', reviewer: 'gemini' },
+    { event: 'working', actor: 'gemini', action: 'reviewing uncommitted changes…' },
+    { event: 'info', text: 'no checks configured (.duet/config.toml [checks])' },
+    { event: 'working', actor: 'gemini', action: 'reviewing uncommitted changes…' },
+  ]);
+  assert.deepEqual(findAll(timeline, 'col-head').map((h) => h.textContent), ['gemini · reviewer']);
+});
+
+test('a standalone review prints no round head, a real round still does', () => {
+  const review = panel([{ event: 'working', actor: 'gemini', action: 'reviewing…' }]);
+  assert.deepEqual(findAll(review, 'round-head'), []);
+
+  const round = panel([
+    { event: 'round_started', round: 1, budget: 3 },
+    { event: 'working', actor: 'claude', action: 'writing…' },
+  ]);
+  assert.deepEqual(findAll(round, 'round-head').map((h) => h.textContent), ['round 1/3']);
+});

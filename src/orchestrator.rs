@@ -369,11 +369,14 @@ fn standalone_review_message(ai_approved: bool, checks_passed: bool) -> &'static
 /// Runs the configured checks and reports each one, as every review of the
 /// working tree must: the reviewer is shown the results, and approval needs them.
 fn announced_checks(config: &Config, repo_dir: &Path, sink: &dyn Sink) -> Vec<checks::CheckResult> {
+    // Nothing to announce when nothing is configured: the row and the line
+    // beneath it said the same thing twice, at the top of every review.
+    if config.checks.defined().is_empty() {
+        sink.event(Event::Info { text: "no checks configured (.duet/config.toml [checks])".into() });
+        return Vec::new();
+    }
     sink.event(Event::Working { actor: "checks".into(), action: "running configured checks…".into() });
     let results = checks::run_checks(&config.checks, repo_dir);
-    if results.is_empty() {
-        sink.event(Event::Info { text: "no checks configured (.duet/config.toml [checks])".into() });
-    }
     for cr in &results {
         sink.event(Event::Check { name: cr.name.clone(), passed: cr.passed });
     }
@@ -2479,5 +2482,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
         assert_eq!(result.outcome, Outcome::Approved);
         assert_eq!(result.message, "approved");
+    }
+
+    /// The panel opened every unconfigured review with a check row and a line
+    /// under it saying there was nothing to check. Only the line survives.
+    #[test]
+    fn no_configured_checks_announces_the_gap_without_a_check_run() {
+        let config = Config::default();
+        let repo = repo_with_uncommitted_change("unchecked");
+        let sink = Recorder(std::sync::Mutex::new(Vec::new()));
+        working_tree_review(&config, &mut Approver, &repo, "review", "(not provided)", None, &sink)
+            .expect("review runs");
+        let _ = std::fs::remove_dir_all(&repo);
+        let events = sink.0.lock().unwrap().join("\n");
+        assert!(!events.contains("running configured checks"), "events:\n{}", events);
+        assert!(events.contains("no checks configured"), "events:\n{}", events);
     }
 }
