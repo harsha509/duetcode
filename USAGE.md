@@ -112,7 +112,7 @@ dt review --reviewer claude
 
 ### `dt init`
 
-Creates `.duet/config.toml` (checks, models, policy) and `.duet/prompts/` (editable prompt templates), and gitignores `.duet/sessions/`.
+Creates `.duet/config.toml` (checks, models, policy) and gitignores `.duet/sessions/`. Prompts stay inside `dt` — run `dt prompts eject` to edit one here.
 
 ### `dt doctor`
 
@@ -176,4 +176,4 @@ skip_permissions = true   # let the writer edit files without interactive prompt
 
 ### Customizing prompts
 
-Edit the files in `.duet/prompts/` to add project rules (e.g. "always use Tailwind utilities"). Available variables: `implement.txt` — `{task}`, `{context}` · `review.txt` — `{task}`, `{diff}`, `{checks}`, `{writer_notes}` · `fix.txt` — `{task}`, `{review_feedback}` · `plan.txt` — `{task}`, `{context}`.
+Run `dt prompts eject review` to copy a built-in template into `.duet/prompts/`, then edit it to add project rules (e.g. "always use Tailwind utilities"). `dt` prefers the ejected file; delete it to go back to the built-in. Available variables: `implement.txt` — `{task}`, `{context}` · `review.txt` — `{task}`, `{diff}`, `{checks}`, `{writer_notes}` · `fix.txt` — `{task}`, `{review_feedback}`.

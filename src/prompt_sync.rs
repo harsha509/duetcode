@@ -15,8 +15,8 @@
 //!
 //! A manifest records the fingerprint of what was written, so "edited" means
 //! edited rather than merely "unlike today's template". Nothing is created in a
-//! project that has no `.duet/prompts/`: adopting duet is `dt init`'s decision
-//! to make, not this module's.
+//! project that has no `.duet/prompts/`: prompts live in the binary, and the
+//! directory exists only where `dt prompts eject` was asked for one.
 
 use crate::events::{Event, Sink};
 use crate::prompts;
@@ -27,12 +27,12 @@ use std::path::{Path, PathBuf};
 const MANIFEST_FILE: &str = ".manifest.json";
 const MAX_BACKUPS: u32 = 50;
 
-/// The prompts a project keeps its own copy of, with the text that ships now.
-const MANAGED: [(&str, &str); 4] = [
+/// The prompts a project may keep its own copy of, with the text that ships now.
+/// Also the set `dt prompts eject` can write.
+pub const MANAGED: [(&str, &str); 3] = [
     ("implement.txt", prompts::DEFAULT_IMPLEMENT_TEMPLATE),
     ("review.txt", prompts::DEFAULT_REVIEW_TEMPLATE),
     ("fix.txt", prompts::DEFAULT_FIX_TEMPLATE),
-    ("plan.txt", prompts::DEFAULT_PLAN_TEMPLATE),
 ];
 
 #[derive(Serialize, Deserialize, Default)]
@@ -220,6 +220,28 @@ mod tests {
 
     const OLD: &str = "an older built-in prompt\n";
     const NEW: &str = "the current built-in prompt\n";
+
+    /// Prompts ship in the binary, so a project that never ejected one must
+    /// not acquire a `.duet/prompts/` directory by being run.
+    #[test]
+    fn a_project_that_ejected_nothing_is_left_alone() {
+        struct Silent;
+
+        impl Sink for Silent {
+            fn event(&self, _: Event) {}
+
+            fn ask(&self, _: crate::events::AskKind, _: &str) -> String {
+                String::new()
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("dt-nosync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".duet")).unwrap();
+        sync(&dir, &Silent);
+        assert!(!dir.join(".duet").join("prompts").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn missing_file_is_created() {

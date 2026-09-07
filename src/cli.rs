@@ -154,6 +154,21 @@ pub enum Commands {
         #[arg(long)]
         gemini_model: Option<String>,
     },
+
+    /// Work with the prompt templates dt reviews and writes with
+    Prompts {
+        #[command(subcommand)]
+        action: PromptsAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PromptsAction {
+    /// Copy a built-in template into .duet/prompts/ so this project can edit it
+    Eject {
+        /// implement, review, or fix. Omitted ejects all three.
+        name: Option<String>,
+    },
 }
 
 /// Model overrides that take precedence over .duet/config.toml.
@@ -210,6 +225,7 @@ pub fn run() -> Result<()> {
         Some(Commands::Serve { writer, claude_model, gemini_model }) => {
             serve::run(&cwd, &writer, ModelOverrides { claude: claude_model, gemini: gemini_model })
         }
+        Some(Commands::Prompts { action }) => cmd_prompts(&cwd, action),
 
         None => match cli.task {
             Some(task) => cmd_task(&cwd, TaskArgs {
@@ -263,6 +279,7 @@ fn print_usage() {
     println!("  {} review --task \"add login\"       review changes against a specific task", "dt".green());
     println!("  {} clear                           clear all past session logs", "dt".green());
     println!("  {} clear 20260805-193600           delete one session (name or unique prefix)", "dt".green());
+    println!("  {} prompts eject review             copy a built-in prompt into .duet/prompts/ to edit", "dt".green());
     println!("\nRun {} for all options.", "dt --help".cyan());
 }
 
@@ -408,16 +425,6 @@ fn cmd_init(dir: &Path) -> Result<()> {
         println!("  {} created .duet/config.toml", "✓".green());
     }
 
-    let prompts_dir = dir.join(".duet").join("prompts");
-    if !prompts_dir.exists() {
-        std::fs::create_dir_all(&prompts_dir).context("failed to create .duet/prompts/")?;
-    }
-
-    write_default_prompt(&prompts_dir, "implement.txt", crate::prompts::DEFAULT_IMPLEMENT_TEMPLATE)?;
-    write_default_prompt(&prompts_dir, "review.txt", crate::prompts::DEFAULT_REVIEW_TEMPLATE)?;
-    write_default_prompt(&prompts_dir, "fix.txt", crate::prompts::DEFAULT_FIX_TEMPLATE)?;
-    write_default_prompt(&prompts_dir, "plan.txt", crate::prompts::DEFAULT_PLAN_TEMPLATE)?;
-
     let gitignore_path = dir.join(".gitignore");
     let ignore_entry = "\n# duetcode sessions\n.duet/sessions/\n";
 
@@ -438,6 +445,7 @@ fn cmd_init(dir: &Path) -> Result<()> {
     }
 
     println!("\n{}", "dt initialized! Edit .duet/config.toml to customize.".green().bold());
+    println!("Prompts are built into dt — run {} to edit one here.", "dt prompts eject".cyan());
     println!("Run {} to verify your setup.", "dt doctor".cyan());
 
     Ok(())
@@ -452,6 +460,56 @@ fn needs_sessions_ignore_entry(content: &str) -> bool {
         let rule = line.split('#').next().unwrap_or_default().trim();
         matches!(rule, ".duet" | ".duet/" | ".duet/sessions" | ".duet/sessions/")
     })
+}
+
+/// `dt prompts eject`: writes a built-in template into `.duet/prompts/`, which
+/// the loader prefers once it exists. Nothing is overwritten — an ejected prompt
+/// is the project's, and re-ejecting is not how you discard an edit.
+fn cmd_prompts(dir: &Path, action: PromptsAction) -> Result<()> {
+    let PromptsAction::Eject { name } = action;
+    let wanted: Vec<(&str, &str)> = match name.as_deref() {
+        None => crate::prompt_sync::MANAGED.to_vec(),
+        Some(asked) => vec![*crate::prompt_sync::MANAGED
+            .iter()
+            .find(|(file, _)| file.trim_end_matches(".txt") == asked)
+            .with_context(|| format!("unknown prompt {asked:?} — expected implement, review, or fix"))?],
+    };
+
+    let prompts_dir = dir.join(".duet").join("prompts");
+    std::fs::create_dir_all(&prompts_dir).context("failed to create .duet/prompts/")?;
+    for (file, template) in wanted {
+        eject_prompt(&prompts_dir, file, template)?;
+    }
+    println!("\ndt uses these instead of its built-in prompts. Delete one to go back.");
+    Ok(())
+}
+
+fn eject_prompt(prompts_dir: &Path, name: &str, template: &str) -> Result<()> {
+    let path = prompts_dir.join(name);
+    if path.exists() {
+        println!("  {} .duet/prompts/{} already exists — left as it is", "✓".green(), name);
+        return Ok(());
+    }
+    std::fs::write(&path, template)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    println!("  {} wrote .duet/prompts/{}", "✓".green(), name);
+    Ok(())
+}
+
+/// Where doctor says the prompts come from. Built-in is the normal case, so a
+/// project with none of its own is reported as fine rather than as missing files.
+fn report_prompt_sources(dir: &Path) {
+    let prompts_dir = dir.join(".duet").join("prompts");
+    let ejected: Vec<&str> = crate::prompt_sync::MANAGED
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| prompts_dir.join(name).exists())
+        .collect();
+    if ejected.is_empty() {
+        println!("  {} prompts: built-in", "ℹ".cyan());
+    } else {
+        println!("  {} prompts: built-in, overridden by .duet/prompts/{}", "ℹ".cyan(), ejected.join(", "));
+    }
 }
 
 fn cmd_doctor(dir: &Path, verbose: bool) -> Result<()> {
@@ -613,19 +671,7 @@ fn cmd_doctor(dir: &Path, verbose: bool) -> Result<()> {
         }
     );
 
-    let prompts_dir = dir.join(".duet").join("prompts");
-    for name in &["implement.txt", "review.txt", "fix.txt"] {
-        let path = prompts_dir.join(name);
-        if path.exists() {
-            println!("  {} .duet/prompts/{}", "✓".green(), name);
-        } else {
-            println!(
-                "  {} .duet/prompts/{} — not found (will use built-in defaults)",
-                "~".yellow(),
-                name
-            );
-        }
-    }
+    report_prompt_sources(dir);
 
     println!();
     if all_ok {
@@ -713,21 +759,78 @@ fn resolve_session(names: &[String], name: &str) -> Result<String> {
     }
 }
 
-fn write_default_prompt(dir: &Path, name: &str, content: &str) -> Result<()> {
-    let path = dir.join(name);
-    if path.exists() {
-        println!("  {} prompts/{} already exists", "✓".green(), name);
-    } else {
-        std::fs::write(&path, content)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        println!("  {} created prompts/{}", "✓".green(), name);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway git repository for the commands that require one.
+    fn scratch_repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dt-cli-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        dir
+    }
+
+    /// Prompts live in the binary, so init leaves nothing to go stale.
+    #[test]
+    fn init_writes_config_and_no_prompts() {
+        let dir = scratch_repo("init");
+        cmd_init(&dir).expect("init runs");
+        assert!(dir.join(".duet").join("config.toml").exists());
+        assert!(!dir.join(".duet").join("prompts").exists(), "init dumped prompts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ejecting is the only way a project gets a prompt file, and it gets the
+    /// text this binary actually reviews with.
+    #[test]
+    fn eject_writes_the_built_in_template() {
+        let dir = scratch_repo("eject");
+        cmd_prompts(&dir, PromptsAction::Eject { name: Some("review".into()) }).expect("eject runs");
+        let path = dir.join(".duet").join("prompts").join("review.txt");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), crate::prompts::DEFAULT_REVIEW_TEMPLATE);
+        assert!(!dir.join(".duet").join("prompts").join("fix.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-ejecting must never be a way to lose the edit that ejecting was for.
+    #[test]
+    fn eject_never_overwrites_an_edited_prompt() {
+        let dir = scratch_repo("eject-twice");
+        cmd_prompts(&dir, PromptsAction::Eject { name: None }).expect("eject runs");
+        let path = dir.join(".duet").join("prompts").join("fix.txt");
+        std::fs::write(&path, "our own fix prompt\n").unwrap();
+        cmd_prompts(&dir, PromptsAction::Eject { name: None }).expect("eject runs again");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "our own fix prompt\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ejecting is only useful if it writes where the loader looks: the config
+    /// defaults are the paths `load_prompt_template` resolves against the repo.
+    #[test]
+    fn an_ejected_prompt_lands_where_the_config_reads_it() {
+        let dir = scratch_repo("eject-path");
+        cmd_prompts(&dir, PromptsAction::Eject { name: None }).expect("eject runs");
+        let prompts = Config::default().prompts;
+        for path in [&prompts.implementation, &prompts.review, &prompts.fix] {
+            assert!(dir.join(path).exists(), "{} was not ejected", path.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eject_rejects_an_unknown_prompt() {
+        let dir = scratch_repo("eject-unknown");
+        let err = cmd_prompts(&dir, PromptsAction::Eject { name: Some("plan".into()) }).unwrap_err();
+        assert!(err.to_string().contains("unknown prompt"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn broader_duet_rule_already_covers_sessions() {

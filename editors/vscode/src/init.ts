@@ -35,14 +35,13 @@ function promptText(pending: Candidate[]): string {
   if (pending.length === 1) {
     return (
       `'${pending[0].name}' is not set up for DT Duet. Initialize it? ` +
-      'This creates .duet/config.toml with the default prompts, and ignores .duet/sessions/.'
+      'This creates .duet/config.toml and ignores .duet/sessions/.'
     );
   }
   const names = pending.map((p) => p.name).join(', ');
   return (
     `${pending.length} workspace projects are not set up for DT Duet (${names}). ` +
-    'Initialize them? This creates .duet/config.toml with the default prompts, ' +
-    'and ignores .duet/sessions/.'
+    'Initialize them? This creates .duet/config.toml and ignores .duet/sessions/.'
   );
 }
 

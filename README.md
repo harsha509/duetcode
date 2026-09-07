@@ -81,9 +81,9 @@ cargo install --git https://github.com/harsha509/duetcode --tag <version> --forc
 `--force` is required. Without it cargo sees that `dt` is already installed and
 stops, so the upgrade silently does nothing.
 
-The first `dt` run in a project after an upgrade brings its `.duet/prompts/`
-up to date with the new binary — replacing copies you have not edited, and
-leaving the ones you have.
+Prompts ship inside the binary, so an upgrade brings the new ones with it. A
+project that ejected a prompt keeps its copy: the first `dt` run after an
+upgrade refreshes the ones you have not edited and leaves the ones you have.
 
 ### From source
 
@@ -107,7 +107,7 @@ For the full command reference see the [Usage Guide (USAGE.md)](USAGE.md).
 
 ```bash
 cd your-project
-dt init      # creates .duet/config.toml and .duet/prompts/
+dt init      # creates .duet/config.toml
 dt doctor    # checks git, claude CLI, gemini CLI / GEMINI_API_KEY, config
 ```
 
@@ -207,7 +207,7 @@ max_rounds = 4
 auto = false                 # true = --auto by default
 allow_dirty_worktree = true
 
-[prompts]
+[prompts]                    # only consulted if the file exists
 implementation = ".duet/prompts/implement.txt"
 review = ".duet/prompts/review.txt"
 fix = ".duet/prompts/fix.txt"
@@ -234,7 +234,7 @@ fix = ".duet/prompts/fix.txt"
 | `policy` | `max_rounds` | Round budget (auto mode may extend once, to 2×, after your clarification) | `4` |
 | `policy` | `auto` | Run autonomously by default | `false` |
 | `policy` | `allow_dirty_worktree` | Allow starting with uncommitted changes | `true` |
-| `prompts` | `implementation` / `review` / `fix` | Template paths | `.duet/prompts/…` |
+| `prompts` | `implementation` / `review` / `fix` | Where an ejected template is read from, when it exists | `.duet/prompts/…` |
 
 ### Setting up checks for your project
 
@@ -257,16 +257,23 @@ typecheck = "go vet ./..."    typecheck = "cargo check"
 
 ## Prompt templates
 
-`.duet/prompts/` contains editable templates (built-in defaults are used if a
-file is missing):
+Prompts are built into `dt`; nothing is written to your project. To edit one,
+eject it first:
+
+```bash
+dt prompts eject review     # writes .duet/prompts/review.txt
+dt prompts eject            # all three
+```
+
+`dt` reads an ejected file instead of its built-in version. Delete it to go
+back. The three you can eject:
 
 - **`implement.txt`** — writer, round 1. Variables: `{task}`, `{context}`
 - **`review.txt`** — reviewer, every code round. Variables: `{task}`, `{diff}`, `{checks}`, `{writer_notes}`
 - **`fix.txt`** — writer, rounds 2+. Variables: `{task}`, `{review_feedback}`
-- **`plan.txt`** — writer, plan mode. Variables: `{task}`, `{context}`
 
-Plan review and answer review (second opinions on plans and on text answers)
-use built-in templates. All prompts forbid the models from running `git add`,
+Plan mode, plan review, and answer review (second opinions on plans and on text
+answers) always use built-in templates and cannot be ejected. All prompts forbid the models from running `git add`,
 `git commit`, or `git push` — changes stay uncommitted for you to inspect.
 
 The reviewer ends every review with machine-parsed sections:
