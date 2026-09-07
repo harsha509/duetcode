@@ -279,21 +279,25 @@ answers) always use built-in templates and cannot be ejected. All prompts forbid
 The reviewer ends every review with machine-parsed sections:
 
 ```
-FILES READ: <paths>, or none
+FILES READ (beyond the diff): <paths>, or none
 
 BLOCKERS:
-- <defect that has to be fixed before this can merge>
+- <location> | <quote> | <trigger → failure> | <evidence> | <smallest fix>
 
 SUGGESTIONS:
-- <improvement>
-- Nit: <optional — taste or polish, raised freely and never blocking>
+- Nit: <location> | <quote> | <improvement and why>
 
 VERDICT: APPROVED | CHANGES_REQUESTED
 ```
 
+Each finding is one physical line, ordered by impact; an empty list is exactly
+`- none`. A blocker's evidence is either observed check output or a reasoned
+path through the code, which must say so — `Static trace (not executed)`. `Nit:`
+marks a suggestion as optional; suggestions never block.
+
 A review of an *answer* ends `VERDICT: SOUND | UNSOUND` instead.
 
-`FILES READ:` is checked, not taken on trust. dt records the files the reviewer
+The files-read line is checked, not taken on trust. dt records the files the reviewer
 actually opened from its own tool calls, and warns when a review names one it
 never read:
 
