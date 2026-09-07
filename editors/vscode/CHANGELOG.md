@@ -5,6 +5,28 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.3.4 - 2026-09-07
+
+Requires `dt` 0.3.4. A run is visible while it happens and can be ended without
+taking both models' context with it.
+
+### Added
+
+- **A stop button in the panel header.** It appears beside "running…" while a
+  task or a review is in flight, and goes when the run does.
+- **The run in progress is listed in the Sessions view.** A "running…" row
+  appears the moment a task or a review starts — driven by the server's events,
+  not by what is on disk — carries its own inline stop, and opens the panel when
+  clicked. The run's own session log is held back until it has a summary, so it
+  is not listed twice.
+
+### Changed
+
+- **Stopping keeps both models' context.** The extension stopped a run by
+  killing the server, which took the writer's and the reviewer's accumulated
+  context with it. It now sends the server a stop command: the turn is
+  cancelled, the model it was waiting on is killed, and the session survives.
+
 ## 0.3.3 - 2026-09-06
 
 Requires `dt` 0.3.3. No extension changes: the version moves in lockstep with

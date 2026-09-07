@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.3.4 - 2026-09-07
+
+A review on its own is held to the standard an in-loop review already met: it
+runs the configured checks, and neither a failing check nor a refusal is
+reported as an approval.
+
+### Fixed
+
+- **A review on its own runs the configured checks.** `dt review` and the
+  panel's review button ran none, so an approval rested on the reviewer's word
+  alone. The checks now run, their results reach the review prompt as they do
+  in a task, and a failing one withholds the approval — "approved by AI, but
+  checks failed".
+- **A refused review no longer prints APPROVED.** `dt review` read "not a
+  failure" as approved, so a reviewer that declined to review still closed with
+  `Final Result: APPROVED`. Only an approval says so; a refusal prints
+  `NO REVIEW` and exits non-zero, as a rejection does.
+- **A stopped review reports the stop.** Ending a review mid-run summarised it
+  with whatever the reviewer had decided before the stop, rather than saying it
+  was stopped.
+
 ## 0.3.3 - 2026-09-06
 
 Context stops leaking between the writer and the reviewer: an on-demand
