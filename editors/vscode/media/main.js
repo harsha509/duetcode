@@ -633,13 +633,65 @@
     return card;
   }
 
+  // ── changed-files header ───────────────────────────────────
+
+  // The reviewer's required opening line names every changed file inline, which
+  // at nineteen paths is a paragraph of commas before the review starts.
+  const FILES_HEAD = /^Reviewing\s+(.+?)\s+[\u2014\u2013-]+\s+\d+\s+(?:file\(s\)|files?)\s*:\s*(.+)$/i;
+
   /**
-   * An answer as nodes: its verdict card, when it opens with one, then the
-   * prose. Shared so a streamed answer, a whole one, and a replayed session all
-   * render the same.
+   * Lifts the reviewer's opening changed-files line off the front of an answer.
+   *
+   * Only a *leading* line counts, for the reason `takeVerdict` gives: the same
+   * shape written mid-review is prose about the change, not the announcement.
+   * Returns null when the answer does not open with one.
+   */
+  function takeFilesHead(text) {
+    const lines = text.split('\n');
+    let i = 0;
+    while (i < lines.length && !lines[i].trim()) i++;
+    const bare = (lines[i] || '').trim().replace(/^#{1,6}\s*/, '').replace(/\*\*/g, '');
+    const head = FILES_HEAD.exec(bare);
+    if (!head) {
+      return null;
+    }
+    const paths = head[2].split(',').map((p) => p.trim()).filter(Boolean);
+    return { subject: head[1], paths, rest: lines.slice(i + 1).join('\n') };
+  }
+
+  /** The header as one line, with the paths behind a toggle, collapsed. */
+  function filesHeadCard(h) {
+    const card = el('div', 'files-read');
+    const list = el('div', 'files-list hidden');
+    for (const p of h.paths) {
+      list.appendChild(el('div', 'files-item', p));
+    }
+    const caret = el('span', 'files-caret', '\u25b8');
+    const btn = el('button', 'files-head');
+    btn.appendChild(caret);
+    btn.appendChild(el('span', null,
+      `Reviewing ${h.subject} \u2014 ${countLabel(h.paths.length, 'file')} read`));
+    btn.onclick = () => {
+      caret.textContent = list.classList.toggle('hidden') ? '\u25b8' : '\u25be';
+      scrollDown();
+    };
+    card.appendChild(btn);
+    card.appendChild(list);
+    return card;
+  }
+
+  /**
+   * An answer as nodes: the cards it opens with — changed files, then a
+   * verdict — and the prose. Shared so a streamed answer, a whole one, and a
+   * replayed session all render the same.
    */
   function answerNodes(text) {
     const nodes = [];
+    const files = takeFilesHead(text);
+    if (files) {
+      nodes.push(filesHeadCard(files));
+      text = files.rest;
+    }
     const v = takeVerdict(text);
     if (v) {
       nodes.push(verdictCard(v));

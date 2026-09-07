@@ -320,6 +320,37 @@ pre.prose strong.bold { font-weight: 600; }
 .row.changes:hover button.link,
 .row.changes:focus-within button.link { opacity: 1; }
 
+/* The reviewer opens by naming every changed file inline, which at nineteen
+   paths is a paragraph of commas ahead of the review. One line, paths on
+   demand. */
+.files-read { margin: 6px 0; }
+
+.files-read button.files-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.files-read button.files-head:hover { color: var(--text); }
+.files-caret { width: 9px; flex: none; }
+
+.files-list {
+  margin: 4px 0 0 15px;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.files-list.hidden { display: none; }
+.files-item { padding: 1px 0; }
+
 #askbar {
   display: flex;
   gap: 8px;
