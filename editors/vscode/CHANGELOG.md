@@ -5,6 +5,22 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.3.6 - 2026-09-07
+
+Requires `dt` 0.3.6. The review preamble stops repeating itself, and a long
+changed-file list no longer pushes the review off the screen.
+
+### Changed
+
+- **The reviewer's changed-file list is one line with the paths behind it.**
+  A nineteen-file review opened with nineteen comma-separated paths; it now
+  opens with the count, and expands to one path per line on click.
+- **A seat is named once per round.** `gemini · reviewer` was printed again
+  whenever a full-width row split the round; the column's coloured rail
+  carries the seat instead.
+- **No round marker on a standalone review, and no check row when no checks
+  are configured.** Both said nothing, at the top of every review.
+
 ## 0.3.5 - 2026-09-07
 
 Requires `dt` 0.3.5. No panel changes: the version moves in lockstep with the

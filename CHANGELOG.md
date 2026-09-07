@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.3.6 - 2026-09-07
+
+The panel says less about itself and more about the review. Three lines that
+restated each other are gone, and the reviewer's changed-file list stops
+opening every review with a paragraph of commas.
+
+### Changed
+
+- **The reviewer's opening file list collapses to one line.** `Reviewing
+  <repo> (<branch>) — 19 file(s): …` rendered as an unbroken run of commas
+  before the review started. The panel now shows one sentence with the count,
+  and the paths one per line behind a disclosure. Live streams, whole
+  responses and replayed sessions all lay it out the same way; the terminal
+  still prints the line as the reviewer wrote it.
+- **A seat is named once per round.** A full-width row — an info line, a
+  diffstat — deliberately splits a round so later output lands below it, and
+  the rebuilt column used to reprint its `gemini · reviewer` head. The
+  coloured rail already carries the seat; the head now appears once.
+- **A review with no checks configured stops announcing a check run.**
+  `running configured checks…` was emitted before the config was consulted,
+  so every unconfigured review opened with that row and a line underneath
+  saying there was nothing to check. Only the line remains.
+- **A standalone review prints no round marker.** It runs no rounds, so the
+  bare `•` above it named nothing.
+
 ## 0.3.5 - 2026-09-07
 
 Prompts stop being files in your repository. They ship inside `dt`, and a
