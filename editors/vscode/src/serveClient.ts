@@ -48,6 +48,23 @@ export interface ServeOptions {
   geminiModel: string;
 }
 
+/** What the server is busy with, for the sessions tree. */
+export interface Activity {
+  /** The task text, or 'review' for a standalone review. */
+  label: string;
+  /** Absolute path of the project the work runs in. */
+  project: string;
+  /** When the run started, in epoch ms. */
+  since: number;
+}
+
+/** The fields of a server event the client itself reads. */
+interface ServeEvent {
+  event?: string;
+  task?: string;
+  path?: string;
+}
+
 /**
  * Thin client for `dt serve`: spawns the binary once, sends JSON-line
  * commands on stdin, and emits parsed JSON events from stdout.
@@ -60,15 +77,30 @@ export class ServeClient implements vscode.Disposable {
   private readonly _onExit = new vscode.EventEmitter<number | null>();
   readonly onExit = this._onExit.event;
 
-  /** Whether a task is holding the server. See `trackRunning`. */
+  /** Whether a task or review is holding the server. See `trackRunning`. */
   private running = false;
   private readonly _onRunningChanged = new vscode.EventEmitter<boolean>();
   readonly onRunningChanged = this._onRunningChanged.event;
+
+  /** What is holding it, while something is. See `trackRunning`. */
+  private activity?: Activity;
+  private readonly _onActivityChanged = new vscode.EventEmitter<Activity | undefined>();
+  readonly onActivityChanged = this._onActivityChanged.event;
 
   private starting?: Promise<void>;
 
   get isRunning(): boolean {
     return this.running;
+  }
+
+  get currentActivity(): Activity | undefined {
+    return this.activity;
+  }
+
+  private setActivity(activity: Activity | undefined): void {
+    this.activity = activity;
+    this._onActivityChanged.fire(activity);
+    this.setRunning(activity !== undefined);
   }
 
   private setRunning(running: boolean): void {
@@ -80,39 +112,34 @@ export class ServeClient implements vscode.Disposable {
   }
 
   /**
-   * Follows a task's life through the event stream, which is the only place it
-   * is visible: the serve loop is busy from `task_started` until it reports an
-   * outcome, and an `error` ends the task that raised it — the server emits one
-   * and moves to the next command rather than carrying on with the same task.
+   * Follows a run's life through the event stream, which is the only place it
+   * is visible: the serve loop is busy from `project_started` — sent for a task
+   * and for each project a review covers — until it reports an outcome, and an
+   * `error` ends the run that raised it. A task's `task_started` follows and
+   * names it; a review has no such event, so it is labelled as one here.
    */
-  private trackRunning(event: { event?: string }): void {
-    if (event.event === 'task_started') {
-      this.setRunning(true);
+  private trackRunning(event: ServeEvent): void {
+    if (event.event === 'project_started') {
+      this.setActivity({ label: 'review', project: event.path ?? '', since: Date.now() });
+    } else if (event.event === 'task_started') {
+      const running = this.activity;
+      this.setActivity({
+        label: event.task ?? '',
+        project: running?.project ?? '',
+        since: running?.since ?? Date.now(),
+      });
     } else if (event.event === 'task_done' || event.event === 'error') {
-      this.setRunning(false);
+      this.setActivity(undefined);
     }
   }
 
   /**
-   * Ends the running task by taking the server down with it.
-   *
-   * The protocol has no cancel — a task owns the serve loop until it finishes —
-   * so stopping means killing the process. The panel is told the task is over
-   * here, because the exit that would otherwise say so is deliberately silenced
-   * by `restart()`.
+   * Asks the server to stop the running task or review. It cancels the turn,
+   * kills the model it was waiting on, and reports `task_done` — the models'
+   * context survives, unlike a restart.
    */
   stop(): void {
-    if (!this.proc) {
-      return;
-    }
-    this.restart();
-    this._onEvent.fire({
-      event: 'task_done',
-      outcome: 'stopped',
-      rounds: 0,
-      // The panel prefixes this with the outcome, so it must not repeat it.
-      message: "ended at your request — both models' context went with the server",
-    });
+    this.notify({ cmd: 'stop' });
   }
 
   constructor(
@@ -137,7 +164,7 @@ export class ServeClient implements vscode.Disposable {
     this.proc = undefined;
     // Whatever was running died with the process. Cleared before the early
     // return so a client that never spawned cannot be left claiming otherwise.
-    this.setRunning(false);
+    this.setActivity(undefined);
     // A partial line from the dead server would otherwise prefix — and
     // invalidate — the first event the next one writes.
     this.buffer = '';
@@ -197,7 +224,7 @@ export class ServeClient implements vscode.Disposable {
         if (!line) {
           continue;
         }
-        let event: { event?: string };
+        let event: ServeEvent;
         try {
           event = JSON.parse(line);
         } catch {
@@ -214,7 +241,7 @@ export class ServeClient implements vscode.Disposable {
 
     proc.on('error', (err: NodeJS.ErrnoException) => {
       this.proc = undefined;
-      this.setRunning(false);
+      this.setActivity(undefined);
       this._onEvent.fire({
         event: 'error',
         message: startupErrorMessage(err, opts.binPath),
@@ -227,7 +254,7 @@ export class ServeClient implements vscode.Disposable {
       this.proc = undefined;
       // A crash mid-task ends the task, and leaving `running` set would lock
       // out the new-session button with nothing left to be running.
-      this.setRunning(false);
+      this.setActivity(undefined);
       this._onExit.fire(code);
     });
 

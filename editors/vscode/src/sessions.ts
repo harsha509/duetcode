@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { Activity } from './serveClient';
 
 export interface SessionInfo {
   kind: 'session';
@@ -16,9 +17,16 @@ export interface ProjectNode {
   kind: 'project';
   name: string;
   sessions: SessionInfo[];
+  /** The run in progress in this folder, listed ahead of its sessions. */
+  running?: RunningNode;
 }
 
-export type SessionNode = ProjectNode | SessionInfo;
+/** The task or review in progress, shown until the server reports its outcome. */
+export interface RunningNode extends Activity {
+  kind: 'running';
+}
+
+export type SessionNode = ProjectNode | SessionInfo | RunningNode;
 
 interface SessionState {
   task?: string;
@@ -40,28 +48,63 @@ export class SessionsProvider implements vscode.TreeDataProvider<SessionNode> {
   private readonly _onDidChange = new vscode.EventEmitter<SessionNode | undefined>();
   readonly onDidChangeTreeData = this._onDidChange.event;
 
+  /** `activity` reports what the server is running, or nothing when idle. */
+  constructor(private readonly activity: () => Activity | undefined = () => undefined) {}
+
   refresh(): void {
     this._onDidChange.fire(undefined);
   }
 
   getTreeItem(el: SessionNode): vscode.TreeItem {
-    return el.kind === 'project' ? projectTreeItem(el) : sessionTreeItem(el);
+    switch (el.kind) {
+      case 'project':
+        return projectTreeItem(el);
+      case 'running':
+        return runningTreeItem(el);
+      default:
+        return sessionTreeItem(el);
+    }
   }
 
   getChildren(el?: SessionNode): SessionNode[] {
     if (el) {
-      return el.kind === 'project' ? el.sessions : [];
+      return el.kind === 'project' ? withRunning(el.running, el.sessions) : [];
     }
 
+    const running = runningNode(this.activity());
     const folders = vscode.workspace.workspaceFolders ?? [];
     const projects = folders
-      .map((folder) => readProject(folder))
-      .filter((project) => project.sessions.length > 0);
+      .map((folder) => readProject(folder, running))
+      .filter((project) => project.sessions.length > 0 || project.running);
 
     // One folder needs no grouping node — it would hold every session behind
     // an extra click and name a repo the user already knows.
-    return folders.length > 1 ? projects : projects[0]?.sessions ?? [];
+    if (folders.length <= 1) {
+      return withRunning(running, projects[0]?.sessions ?? []);
+    }
+    // A run in a folder outside the workspace still shows, ahead of the groups.
+    const placed = projects.some((project) => project.running);
+    return placed ? projects : withRunning(running, projects);
   }
+}
+
+function withRunning(running: RunningNode | undefined, rest: SessionNode[]): SessionNode[] {
+  return running ? [running, ...rest] : rest;
+}
+
+/** The tree row for a run, labelled by its first line. */
+function runningNode(activity: Activity | undefined): RunningNode | undefined {
+  return activity && { kind: 'running', ...activity, label: activity.label.split('\n')[0] };
+}
+
+function runningTreeItem(el: RunningNode): vscode.TreeItem {
+  const item = new vscode.TreeItem(el.label || 'task', vscode.TreeItemCollapsibleState.None);
+  item.description = 'running…';
+  item.tooltip = `${el.project}\n${el.label}`;
+  item.iconPath = new vscode.ThemeIcon('loading~spin');
+  item.contextValue = 'dtRunning';
+  item.command = { command: 'dt.showPanel', title: 'Show Duet Panel' };
+  return item;
 }
 
 function projectTreeItem(el: ProjectNode): vscode.TreeItem {
@@ -129,15 +172,22 @@ export async function deleteSessions(sessions: SessionInfo[]): Promise<string[]>
   return failed;
 }
 
-function readProject(folder: vscode.WorkspaceFolder): ProjectNode {
+function readProject(folder: vscode.WorkspaceFolder, running?: RunningNode): ProjectNode {
+  const root = folder.uri.fsPath;
+  const mine = running && sameDir(running.project, root) ? running : undefined;
   return {
     kind: 'project',
     name: folder.name,
-    sessions: readSessions(folder.uri.fsPath, folder.name),
+    sessions: readSessions(root, folder.name, mine?.since),
+    running: mine,
   };
 }
 
-function readSessions(root: string, project: string): SessionInfo[] {
+function sameDir(a: string, b: string): boolean {
+  return path.resolve(a) === path.resolve(b);
+}
+
+function readSessions(root: string, project: string, runningSince?: number): SessionInfo[] {
   const dir = path.join(root, '.duet', 'sessions');
   if (!fs.existsSync(dir)) {
     return [];
@@ -155,7 +205,27 @@ function readSessions(root: string, project: string): SessionInfo[] {
       }
       return { kind: 'session' as const, dir: full, name: d.name, project, state };
     })
+    .filter((session) => !isRunLog(session, runningSince))
     .sort((a, b) => b.name.localeCompare(a.name));
+}
+
+/**
+ * Whether a session with no summary yet is the run in progress: the server
+ * creates the directory once the run has started, so one stamped from that
+ * moment on is the run's own log — already shown as the running row.
+ */
+function isRunLog(session: SessionInfo, runningSince: number | undefined): boolean {
+  if (runningSince === undefined || session.state) {
+    return false;
+  }
+  const stamped = sessionTime(session.name);
+  return stamped !== undefined && stamped >= runningSince - 1000;
+}
+
+/** When the session started, from its directory name, as local epoch ms. */
+function sessionTime(name: string): number | undefined {
+  const m = name.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);
+  return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() : undefined;
 }
 
 /** Session dirs are named YYYYMMDD-HHMMSS-task-slug. */

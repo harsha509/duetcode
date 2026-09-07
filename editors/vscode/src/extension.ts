@@ -86,9 +86,6 @@ async function removeSessions(
 }
 
 export function activate(ctx: vscode.ExtensionContext): void {
-  const provider = new SessionsProvider();
-  ctx.subscriptions.push(vscode.window.registerTreeDataProvider('dtSessions', provider));
-
   const client = new ServeClient(
     () => {
       const cfg = vscode.workspace.getConfiguration('dt');
@@ -105,6 +102,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
     () => [{ cmd: 'workspace', projects: workspaceProjects() }],
   );
   ctx.subscriptions.push(client);
+
+  const provider = new SessionsProvider(() => client.currentActivity);
+  ctx.subscriptions.push(
+    vscode.window.registerTreeDataProvider('dtSessions', provider),
+    // The running row comes from the server's events, not from disk, so a task
+    // or review is listed the moment it starts rather than once it is logged.
+    client.onActivityChanged(() => provider.refresh()),
+  );
 
   // A folder added or removed changes which projects a task may read and write.
   // Sent to the running server rather than restarting it: a respawn would drop
@@ -151,6 +156,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
       client.stop();
     }),
+    vscode.commands.registerCommand('dt.showPanel', () => DuetPanel.createOrShow(ctx, client)),
     vscode.commands.registerCommand('dt.refreshSessions', () => provider.refresh()),
     vscode.commands.registerCommand('dt.openSession', (dir: string) => {
       DuetPanel.createOrShow(ctx, client).showHistory(dir);

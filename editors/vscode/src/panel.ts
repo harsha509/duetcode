@@ -144,6 +144,9 @@ export class DuetPanel {
       case 'answer':
         this.client.send({ cmd: 'answer', id: msg.id, value: msg.value });
         break;
+      case 'stop':
+        this.client.stop();
+        break;
       case 'attach':
         void this.pickImages();
         break;
@@ -208,6 +211,7 @@ export class DuetPanel {
     <span id="title">DT Duet</span>
     <span id="models"></span>
     <span id="status"></span>
+    <button id="stop" class="hidden" title="Stop the running task or review">stop</button>
   </header>
   <main id="timeline"></main>
   <div id="askbar" class="hidden"></div>

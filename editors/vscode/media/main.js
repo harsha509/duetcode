@@ -6,6 +6,7 @@
   const timeline = document.getElementById('timeline');
   const modelsEl = document.getElementById('models');
   const statusEl = document.getElementById('status');
+  const stopBtn = document.getElementById('stop');
   const askbar = document.getElementById('askbar');
   const chips = document.getElementById('chips');
   const input = document.getElementById('input');
@@ -171,6 +172,10 @@
     busy = b;
     document.getElementById('send').disabled = b;
     statusEl.textContent = b ? 'running…' : '';
+    if (stopBtn) {
+      stopBtn.classList.toggle('hidden', !b);
+      stopBtn.disabled = false;
+    }
   }
 
   function showAsk(id, kind, question) {
@@ -924,6 +929,12 @@
   document.getElementById('send').onclick = submitTask;
   document.getElementById('attach').onclick = () => vscode.postMessage({ type: 'attach' });
   document.getElementById('settings').onclick = () => vscode.postMessage({ type: 'settings' });
+  if (stopBtn) {
+    stopBtn.onclick = () => {
+      stopBtn.disabled = true;
+      vscode.postMessage({ type: 'stop' });
+    };
+  }
   document.getElementById('review').onclick = () => {
     if (!busy) {
       vscode.postMessage({ type: 'review', text: input.value.trim() });

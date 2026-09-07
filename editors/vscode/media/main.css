@@ -40,6 +40,17 @@ body {
 #title { font-weight: 600; }
 #models { color: var(--text-faint); }
 #status { margin-left: auto; color: var(--text-faint); font-size: 12px; }
+#stop {
+  font-family: inherit;
+  font-size: 11px;
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  cursor: pointer;
+}
+#stop.hidden { display: none; }
 
 #timeline {
   flex: 1;

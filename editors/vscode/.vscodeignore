@@ -7,3 +7,4 @@ tsconfig.json
 package-lock.json
 RELEASING.md
 *.vsix
+test/**

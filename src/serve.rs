@@ -626,7 +626,7 @@ fn run_review(
         }
     }
 
-    emit_review_outcome(&targets, &tally, sink);
+    emit_review_outcome(&targets, &tally, crate::process::is_cancelled(), sink);
 }
 
 /// The one checkout a pull-request review runs from. Which one barely matters
@@ -671,7 +671,17 @@ fn has_changes_to_review(target: &ReviewTarget, multi: bool, sink: &dyn Sink) ->
     }
 }
 
-fn emit_review_outcome(targets: &[ReviewTarget], tally: &ReviewTally, sink: &dyn Sink) {
+/// `stopped` is whether the user ended the run: whatever it had decided before
+/// that is not its outcome, so the summary says it stopped, not what it found.
+fn emit_review_outcome(targets: &[ReviewTarget], tally: &ReviewTally, stopped: bool, sink: &dyn Sink) {
+    if stopped {
+        sink.event(Event::TaskDone {
+            outcome: Outcome::Stopped,
+            rounds: tally.reviewed,
+            message: "stopped by user".into(),
+        });
+        return;
+    }
     if tally.reviewed == 0 {
         // Refusing a review that could not check anything is neither a failure
         // nor "nothing to review" — there was something, and it was declined.
@@ -1020,5 +1030,35 @@ mod tests {
         let config = Config::default();
         let target = ReviewTarget::new(PathBuf::from("/w/web"));
         assert!(checks_consent(&target, &config, Path::new("/w/api"), &mut consents, &StubSink("n")));
+    }
+
+    /// A review the user stopped must not be summarised by whatever the
+    /// reviewer had decided before the stop.
+    #[test]
+    fn a_stopped_review_reports_that_it_was_stopped() {
+        struct Recorder(std::sync::Mutex<Vec<Event>>);
+
+        impl Sink for Recorder {
+            fn event(&self, event: Event) {
+                self.0.lock().unwrap().push(event);
+            }
+
+            fn ask(&self, _kind: crate::events::AskKind, _question: &str) -> String {
+                String::new()
+            }
+        }
+
+        let tally = ReviewTally { reviewed: 1, ..ReviewTally::default() };
+        let sink = Recorder(std::sync::Mutex::new(Vec::new()));
+        emit_review_outcome(&[], &tally, true, &sink);
+        let events = sink.0.lock().unwrap();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::TaskDone { outcome: Outcome::Stopped, message, .. }] if message == "stopped by user"
+            ),
+            "{:?}",
+            events
+        );
     }
 }

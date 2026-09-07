@@ -51,8 +51,12 @@
       },
       {
         "command": "dt.stopTask",
-        "title": "DT: Stop Running Task",
+        "title": "DT: Stop Running Task or Review",
         "icon": "$(debug-stop)"
+      },
+      {
+        "command": "dt.showPanel",
+        "title": "DT: Show Duet Panel"
       },
       {
         "command": "dt.refreshSessions",
@@ -107,6 +111,11 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "dt.stopTask",
+          "when": "view == dtSessions && viewItem == dtRunning",
+          "group": "inline"
+        },
         {
           "command": "dt.deleteSession",
           "when": "view == dtSessions && viewItem == dtSession",
@@ -163,7 +172,8 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -w -p ./"
+    "watch": "tsc -w -p ./",
+    "test": "npm run compile && node --test test/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
