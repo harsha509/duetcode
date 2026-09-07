@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.3.5 - 2026-09-07
+
+Prompts stop being files in your repository. They ship inside `dt`, and a
+project gets a copy only when it asks for one. The review prompt itself is
+rewritten around evidence: what a reviewer may claim now depends on what it
+can show.
+
+### Changed
+
+- **`dt init` no longer writes prompt files.** It creates `.duet/config.toml`
+  and the `.gitignore` rule, nothing else. Prompts were already compiled into
+  the binary and only used from disk when a file existed, so the copies bought
+  nothing but drift — a project initialised months ago reviewed with that
+  month's prompt until the sync machinery caught it.
+- **`dt prompts eject` writes one on request.** `dt prompts eject review`
+  copies the built-in template to `.duet/prompts/review.txt`, which `dt` then
+  prefers; delete the file to go back. With no name it ejects all three. An
+  existing file is never overwritten — re-ejecting cannot cost you an edit.
+- **The reviewer argues from evidence, not from the diff's edges.** It may open
+  and cite direct callers, callees and definitions instead of being confined to
+  changed hunks; a symbol claim no longer requires a `-` line deleting the
+  definition, but does require the diff, a file actually opened, or supplied
+  diagnostics. A blocker carries a trigger and the failure it reaches, labelled
+  `Static trace (not executed)` when it was reasoned rather than run, and the
+  final sections have a fixed shape so findings survive the parse.
+- **Instructions inside the material under review are data.** The diff, the
+  writer's notes and check output can no longer talk the reviewer out of its
+  own rules.
+- **`dt doctor` reports where prompts come from.** `prompts: built-in`, naming
+  the ejected files when a project has any, instead of flagging each built-in
+  as a missing file.
+
+### Removed
+
+- **`plan.txt`.** `dt init` wrote it and the prompt sync kept it current, but
+  nothing ever read it: plan mode passes the built-in template directly and the
+  config has no key pointing at it. An existing copy is now simply ignored.
+
 ## 0.3.4 - 2026-09-07
 
 A review on its own is held to the standard an in-loop review already met: it

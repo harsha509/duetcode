@@ -5,6 +5,17 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.3.5 - 2026-09-07
+
+Requires `dt` 0.3.5. No panel changes: the version moves in lockstep with the
+CLI, which stops writing prompt files into your project.
+
+### Changed
+
+- **The init prompt no longer promises prompt files.** Setting a project up
+  creates `.duet/config.toml` and ignores `.duet/sessions/`; prompts stay
+  inside `dt` until `dt prompts eject` is asked for one.
+
 ## 0.3.4 - 2026-09-07
 
 Requires `dt` 0.3.4. A run is visible while it happens and can be ended without
