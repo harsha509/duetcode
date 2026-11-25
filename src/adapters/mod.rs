@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// Cap on remembered conversation turns (user + model messages).
 pub(crate) const MAX_HISTORY_TURNS: usize = 12;
@@ -110,6 +111,33 @@ pub(crate) fn drain_stderr(child: &mut Child) -> Option<JoinHandle<String>> {
 /// workspace entry must not make every spawn fail.
 pub(crate) fn readable_extras<'a>(readable: &'a [PathBuf], working_dir: &Path) -> Vec<&'a PathBuf> {
     readable.iter().filter(|dir| dir.as_path() != working_dir && dir.is_dir()).collect()
+}
+
+/// How both API adapters talk HTTP. `read_timeout` bounds each read rather
+/// than the whole response, so a stream runs for as long as it keeps
+/// producing and only a stalled one is cut off. A 4xx or 5xx comes back as a
+/// response instead of an error: its body is where the provider says why.
+fn api_config(read_timeout: Duration) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_per_read(Some(read_timeout))
+        .http_status_as_error(false)
+}
+
+pub(crate) fn api_agent(timeout_secs: u64) -> ureq::Agent {
+    api_config(Duration::from_secs(timeout_secs)).build().into()
+}
+
+/// The response's stream, or the status and body of a 4xx or 5xx.
+pub(crate) fn api_stream(
+    response: ureq::http::Response<ureq::Body>,
+) -> std::result::Result<ureq::BodyReader<'static>, (u16, String)> {
+    let status = response.status();
+    let mut body = response.into_body();
+    if status.is_client_error() || status.is_server_error() {
+        return Err((status.as_u16(), body.read_to_string().unwrap_or_default()));
+    }
+    Ok(body.into_reader())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -323,5 +351,70 @@ mod tests {
         let message = format!("{:#}", error);
         assert!(message.contains("too large"), "got: {}", message);
         assert!(message.contains("max 10 MB"), "got: {}", message);
+    }
+
+    /// A one-connection HTTP server: waits for the request, then writes each
+    /// chunk `gap` apart and holds the socket open, as a stalled provider would.
+    fn serve(chunks: Vec<String>, gap: Duration) -> String {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let url = format!("http://{}/", listener.local_addr().expect("local address"));
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept the request");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && socket.read(&mut byte).unwrap_or(0) == 1 {
+                request.push(byte[0]);
+            }
+            for chunk in chunks {
+                socket.write_all(chunk.as_bytes()).expect("write a chunk");
+                std::thread::sleep(gap);
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        url
+    }
+
+    /// The agent the adapters use, minus any proxy the environment names: these
+    /// requests must reach the local server whatever machine runs them.
+    fn local_agent(read_timeout: Duration) -> ureq::Agent {
+        api_config(read_timeout).proxy(None).build().into()
+    }
+
+    #[test]
+    fn a_refused_request_keeps_the_body_that_explains_it() {
+        let body = r#"{"error":{"message":"slow down"}}"#;
+        let url = serve(
+            vec![format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )],
+            Duration::ZERO,
+        );
+        let response = local_agent(Duration::from_secs(5))
+            .get(&url)
+            .call()
+            .expect("a 429 is a response, not a transport error");
+        assert_eq!(api_stream(response).err(), Some((429, body.to_string())));
+    }
+
+    #[test]
+    fn the_timeout_bounds_each_read_not_the_whole_stream() {
+        use std::io::BufRead;
+        let lines = 8;
+        let mut chunks = vec!["HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string()];
+        chunks.extend((0..lines).map(|i| format!("data: {}\n", i)));
+        // 800ms of stream under a 500ms timeout: only a per-read bound lets it finish.
+        let url = serve(chunks, Duration::from_millis(100));
+        let response = local_agent(Duration::from_millis(500)).get(&url).call().expect("headers arrive");
+        let stream = api_stream(response).ok().expect("a 200 is a stream");
+        let mut read = std::io::BufReader::new(stream).lines();
+        for i in 0..lines {
+            let line = read.next().expect("the stream is still open").expect("a line inside the timeout");
+            assert_eq!(line, format!("data: {}", i));
+        }
+        // The server now holds the socket open and sends nothing.
+        assert!(read.next().expect("the stall surfaces").is_err(), "a stalled stream must end in an error");
     }
 }

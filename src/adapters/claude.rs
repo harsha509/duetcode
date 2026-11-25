@@ -245,10 +245,7 @@ impl ClaudeAdapter {
         };
 
         let agent = if use_api || mode == "auto" {
-            Some(ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(30))
-                .timeout_read(Duration::from_secs(config.timeout_secs))
-                .build())
+            Some(super::api_agent(config.timeout_secs))
         } else {
             None
         };
@@ -388,12 +385,13 @@ impl ClaudeAdapter {
 
             let turn = match agent
                 .post(ANTHROPIC_API_URL)
-                .set("x-api-key", &api_key)
-                .set("anthropic-version", ANTHROPIC_VERSION)
-                .set("content-type", "application/json")
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("content-type", "application/json")
                 .send_json(&body)
-                .map_err(map_api_error)
-                .and_then(|response| self.parse_sse_stream(response.into_reader()))
+                .map_err(api_unreachable)
+                .and_then(|response| super::api_stream(response).map_err(api_refused))
+                .and_then(|stream| self.parse_sse_stream(stream))
             {
                 Ok(turn) => turn,
                 Err(e) => {
@@ -1164,24 +1162,20 @@ fn stream_json_payload(prompt: &str, images: &[ImageInput]) -> Result<String> {
     serde_json::to_string(&message).context("failed to serialize prompt payload")
 }
 
-fn map_api_error(e: ureq::Error) -> anyhow::Error {
-    match e {
-        ureq::Error::Status(code, response) => {
-            let error_body = response.into_string().unwrap_or_default();
-            let error_msg = serde_json::from_str::<serde_json::Value>(&error_body)
-                .ok()
-                .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
-                .unwrap_or(error_body);
-            anyhow::anyhow!("Anthropic API returned {}: {}", code, error_msg)
-        }
-        ureq::Error::Transport(t) => {
-            anyhow::anyhow!(
-                "failed to reach Anthropic API: {} — \
-                 try increasing timeout_secs in .duet/config.toml [claude]",
-                t
-            )
-        }
-    }
+fn api_refused((code, error_body): (u16, String)) -> anyhow::Error {
+    let error_msg = serde_json::from_str::<serde_json::Value>(&error_body)
+        .ok()
+        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
+        .unwrap_or(error_body);
+    anyhow::anyhow!("Anthropic API returned {}: {}", code, error_msg)
+}
+
+fn api_unreachable(e: ureq::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "failed to reach Anthropic API: {} — \
+         try increasing timeout_secs in .duet/config.toml [claude]",
+        e
+    )
 }
 
 impl ModelAdapter for ClaudeAdapter {

@@ -330,10 +330,7 @@ impl GeminiAdapter {
             }
         }
 
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(30))
-            .timeout_read(Duration::from_secs(config.timeout_secs))
-            .build();
+        let agent = super::api_agent(config.timeout_secs);
 
         if verbose {
             if use_cli {
@@ -927,25 +924,22 @@ impl GeminiAdapter {
 
         // Key goes in a header so it never shows up in URLs or error output.
         let response = self.agent.post(url)
-            .set("x-goog-api-key", self.require_api_key()?)
+            .header("x-goog-api-key", self.require_api_key()?)
             .send_json(body)
-            .map_err(|e| match e {
-                ureq::Error::Status(code, response) => {
-                    let error_body = response.into_string().unwrap_or_default();
-                    let error_msg = extract_api_error(&error_body).unwrap_or(error_body);
-                    anyhow::anyhow!("Gemini API returned {}: {}", code, error_msg)
-                }
-                ureq::Error::Transport(t) => {
-                    anyhow::anyhow!(
-                        "failed to reach Gemini API: {} — \
-                         try increasing timeout_secs in .duet/config.toml [gemini] \
-                         or try a faster model like 'gemini-2.0-flash'",
-                        t
-                    )
-                }
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to reach Gemini API: {} — \
+                     try increasing timeout_secs in .duet/config.toml [gemini] \
+                     or try a faster model like 'gemini-2.0-flash'",
+                    e
+                )
             })?;
+        let stream = super::api_stream(response).map_err(|(code, error_body)| {
+            let error_msg = extract_api_error(&error_body).unwrap_or(error_body);
+            anyhow::anyhow!("Gemini API returned {}: {}", code, error_msg)
+        })?;
 
-        let reader = BufReader::new(response.into_reader());
+        let reader = BufReader::new(stream);
         let mut collected = String::new();
         let mut replay: Vec<serde_json::Value> = Vec::new();
         let mut pending_text = String::new();
