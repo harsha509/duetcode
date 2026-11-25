@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Releases before 0.1.3 predate this file; see the git history for those.
 
+## 0.3.7 - 2026-11-25
+
+A maintenance release. Every dependency is current, and a duet runs as it did
+before, with one difference in API mode.
+
+### Changed
+
+- **API mode goes through your proxy.** `dt` now reaches the Anthropic and
+  Gemini APIs with ureq 3, which reads `ALL_PROXY`, `HTTPS_PROXY`,
+  `HTTP_PROXY` and `NO_PROXY` from the environment; ureq 2 ignored them.
+  `timeout_secs` still bounds each read rather than the whole response, so a
+  long answer is not cut off while it keeps arriving.
+- **Dependencies are up to date.** ureq moves from 2 to 3, and the rest of the
+  tree to its newest compatible releases.
+
 ## 0.3.6 - 2026-09-07
 
 The panel says less about itself and more about the review. Three lines that

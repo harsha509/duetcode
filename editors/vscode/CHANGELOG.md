@@ -5,6 +5,17 @@ All notable changes to the DT Duet extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.3.7 - 2026-11-25
+
+Requires `dt` 0.3.7. No panel changes: a maintenance release that brings the
+build up to date.
+
+### Changed
+
+- **Built with TypeScript 7.** The extension compiles with TypeScript 7 and
+  current VS Code typings. The supported VS Code range is unchanged: 1.85 and
+  later.
+
 ## 0.3.6 - 2026-09-07
 
 Requires `dt` 0.3.6. The review preamble stops repeating itself, and a long
